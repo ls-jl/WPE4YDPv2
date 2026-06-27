@@ -1,0 +1,4 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+*.amr filter=lfs diff=lfs merge=lfs -text
+assets/wpe-drm2-runtime.tar.gz filter=lfs diff=lfs merge=lfs -text
