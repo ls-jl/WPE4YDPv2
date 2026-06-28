@@ -1,0 +1,27 @@
+{
+  "pages": {
+    "index": "pages/index/index.js",
+    "frame": "pages/frame/frame.vue"
+  },
+  "props": {
+    "page_rotation_sku": {
+      "y03": {
+        "index": 0,
+        "frame": 270
+      },
+      "y05": {
+        "index": 0,
+        "frame": 270
+      },
+      "y07": {
+        "index": 0,
+        "frame": 270
+      }
+    }
+  },
+  "options": {
+      "style": {
+          "lessPaths": ["styles"]
+      }
+  }
+}

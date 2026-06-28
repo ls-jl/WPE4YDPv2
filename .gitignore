@@ -1,0 +1,39 @@
+# macOS / editor noise
+.DS_Store
+.vscode/
+
+# Dependencies and build output
+node_modules/
+.falcon_/
+.falcon_tmp/
+.cache/
+dist/
+build/
+
+# MiniApp packaged artifacts
+*.amr
+!8001779591038449.1_0_0.amr
+
+# Device/runtime archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+tools/*.tar.bz2
+tools/*.zip
+!assets/wpe-drm2-runtime.tar.gz
+!debian-12-arm64_20260526.tar
+!tools/*.tar.bz2
+!tools/*.zip
+
+# Native build outputs
+*.so
+libs/**/*.so
+!libs/
+!libs/**
+!assets/mesa/
+!assets/mesa/**
+
+# Logs and crash dumps
+*.log
+*.dmp

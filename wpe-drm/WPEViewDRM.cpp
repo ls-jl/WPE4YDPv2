@@ -1,0 +1,2129 @@
+/*
+ * Copyright (C) 2023 Igalia S.L.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "config.h"
+#include "WPEViewDRM.h"
+
+#include "DRMUniquePtr.h"
+#include "WPEDisplayDRMPrivate.h"
+#include "WPEScreenDRMPrivate.h"
+#include "WPEToplevelDRM.h"
+#include "WPEBufferSHM.h"
+#include "WPEViewDRMPrivate.h"
+#include <drm_fourcc.h>
+#include <drm_mode.h>
+#include <glib-unix.h>
+#include <linux/dma-buf.h>
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <optional>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#include <wtf/FastMalloc.h>
+#include <wtf/OptionSet.h>
+#include <wtf/RunLoop.h>
+#include <wtf/SafeStrerror.h>
+#include <wtf/Seconds.h>
+#include <wtf/glib/GRefPtr.h>
+#include <wtf/glib/WTFGType.h>
+
+enum class UpdateFlags : uint8_t {
+    BufferUpdateRequested = 1 << 0,
+    CursorUpdateRequested = 1 << 1,
+    BufferUpdatePending = 1 << 2,
+    CursorUpdatePending = 1 << 3
+};
+
+enum class OutputRotation : uint16_t {
+    Rotate0 = 0,
+    Rotate90 = 90,
+    Rotate180 = 180,
+    Rotate270 = 270
+};
+
+struct PanelSize {
+    uint32_t width { 960 };
+    uint32_t height { 266 };
+};
+
+static bool parseSize(const char* value, uint32_t& width, uint32_t& height)
+{
+    if (!value || !*value)
+        return false;
+
+    int parsedWidth = 0;
+    int parsedHeight = 0;
+    char separator = 0;
+    if (sscanf(value, "%d%c%d", &parsedWidth, &separator, &parsedHeight) != 3)
+        return false;
+    if (separator != 'x' && separator != 'X' && separator != ',')
+        return false;
+    if (parsedWidth < 64 || parsedHeight < 64 || parsedWidth > 4096 || parsedHeight > 4096)
+        return false;
+
+    width = static_cast<uint32_t>(parsedWidth);
+    height = static_cast<uint32_t>(parsedHeight);
+    return true;
+}
+
+static PanelSize configuredPanelSize()
+{
+    PanelSize size;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (parseSize(getenv("WPE_PANEL_SIZE"), width, height)) {
+        size.width = width;
+        size.height = height;
+    }
+    return size;
+}
+
+static const char* drmFitMode()
+{
+    const char* fit = getenv("WPE_DRM_FIT");
+    return fit && *fit ? fit : "panel-native";
+}
+
+static uint32_t rotatedWidth(uint32_t width, uint32_t height, OutputRotation rotation)
+{
+    return rotation == OutputRotation::Rotate90 || rotation == OutputRotation::Rotate270 ? height : width;
+}
+
+static uint32_t rotatedHeight(uint32_t width, uint32_t height, OutputRotation rotation)
+{
+    return rotation == OutputRotation::Rotate90 || rotation == OutputRotation::Rotate270 ? width : height;
+}
+
+static bool parseRotation(const char* value, OutputRotation& rotation)
+{
+    if (!value || !*value)
+        return false;
+    char* end = nullptr;
+    auto degrees = strtol(value, &end, 10);
+    if (end == value)
+        return false;
+    switch (degrees) {
+    case 0:
+        rotation = OutputRotation::Rotate0;
+        return true;
+    case 90:
+        rotation = OutputRotation::Rotate90;
+        return true;
+    case 180:
+        rotation = OutputRotation::Rotate180;
+        return true;
+    case 270:
+    case -90:
+        rotation = OutputRotation::Rotate270;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static OutputRotation configuredOutputRotation()
+{
+    OutputRotation rotation = OutputRotation::Rotate0;
+    if (const char* value = getenv("WPE_DRM_ROTATION"))
+        parseRotation(value, rotation);
+
+    const char* path = getenv("WPE_DRM_ROTATION_FILE");
+    if (!path || !*path)
+        path = "/tmp/wpe-drm2-rotation";
+
+    char* contents = nullptr;
+    gsize length = 0;
+    if (g_file_get_contents(path, &contents, &length, nullptr)) {
+        auto* stripped = g_strstrip(contents);
+        OutputRotation fileRotation;
+        if (parseRotation(stripped, fileRotation))
+            rotation = fileRotation;
+        else if (*stripped)
+            g_warning("Ignoring invalid WPE DRM rotation '%s' from %s", stripped, path);
+    }
+    g_free(contents);
+    return rotation;
+}
+
+static uint32_t configuredMaxFPS()
+{
+    const char* value = getenv("WPE_DRM_MAX_FPS");
+    if (!value || !*value)
+        return 30;
+
+    char* end = nullptr;
+    auto fps = strtol(value, &end, 10);
+    if (end == value || fps < 0)
+        return 30;
+    if (!fps)
+        return 0;
+    return static_cast<uint32_t>(std::min<long>(fps, 240));
+}
+
+static uint64_t drmPlaneRotate0Value()
+{
+#ifdef DRM_MODE_ROTATE_0
+    return DRM_MODE_ROTATE_0;
+#else
+    return 1;
+#endif
+}
+
+static uint32_t chromeReservedTopInset(uint32_t panelHeight);
+
+static void setRotatedPanelPixel(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t x, uint32_t y, uint32_t color)
+{
+    if (x >= panelWidth || y >= panelHeight)
+        return;
+
+    uint32_t dx = x;
+    uint32_t dy = y;
+    switch (rotation) {
+    case OutputRotation::Rotate0:
+        break;
+    case OutputRotation::Rotate90:
+        dx = panelHeight - 1 - y;
+        dy = x;
+        break;
+    case OutputRotation::Rotate180:
+        dx = panelWidth - 1 - x;
+        dy = panelHeight - 1 - y;
+        break;
+    case OutputRotation::Rotate270:
+        dx = y;
+        dy = panelWidth - 1 - x;
+        break;
+    }
+
+    if (dx >= destinationWidth || dy >= destinationHeight)
+        return;
+
+    auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(dy) * destinationPitch);
+    row[dx] = color;
+}
+
+static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, uint8_t* destination, uint32_t destinationPitch, OutputRotation rotation)
+{
+    auto topInset = chromeReservedTopInset(sourceHeight);
+    if (topInset) {
+        auto destinationWidth = rotatedWidth(sourceWidth, sourceHeight, rotation);
+        auto destinationHeight = rotatedHeight(sourceWidth, sourceHeight, rotation);
+        for (uint32_t y = 0; y < destinationHeight; ++y)
+            memset(destination + static_cast<size_t>(y) * destinationPitch, 0xff, static_cast<size_t>(destinationWidth) * 4);
+
+        uint32_t copyHeight = sourceHeight > topInset ? sourceHeight - topInset : 0;
+        for (uint32_t sourceY = 0; sourceY < copyHeight; ++sourceY) {
+            const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
+            uint32_t panelY = sourceY + topInset;
+            for (uint32_t sourceX = 0; sourceX < sourceWidth; ++sourceX)
+                setRotatedPanelPixel(destination, destinationPitch, destinationWidth, destinationHeight, sourceWidth, sourceHeight, rotation, sourceX, panelY, sourceRow[sourceX]);
+        }
+        return;
+    }
+
+    switch (rotation) {
+    case OutputRotation::Rotate0: {
+        auto rowBytes = static_cast<size_t>(sourceWidth) * 4;
+        for (uint32_t y = 0; y < sourceHeight; ++y)
+            memcpy(destination + static_cast<size_t>(y) * destinationPitch, source + static_cast<size_t>(y) * sourceStride, rowBytes);
+        return;
+    }
+    case OutputRotation::Rotate90:
+        for (uint32_t destinationY = 0; destinationY < sourceWidth; ++destinationY) {
+            auto* destinationRow = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(destinationY) * destinationPitch);
+            for (uint32_t destinationX = 0; destinationX < sourceHeight; ++destinationX) {
+                auto sourceY = sourceHeight - 1 - destinationX;
+                auto sourceX = destinationY;
+                const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
+                destinationRow[destinationX] = sourceRow[sourceX];
+            }
+        }
+        return;
+    case OutputRotation::Rotate180:
+        for (uint32_t destinationY = 0; destinationY < sourceHeight; ++destinationY) {
+            auto sourceY = sourceHeight - 1 - destinationY;
+            const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
+            auto* destinationRow = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(destinationY) * destinationPitch);
+            for (uint32_t destinationX = 0; destinationX < sourceWidth; ++destinationX)
+                destinationRow[destinationX] = sourceRow[sourceWidth - 1 - destinationX];
+        }
+        return;
+    case OutputRotation::Rotate270:
+        for (uint32_t destinationY = 0; destinationY < sourceWidth; ++destinationY) {
+            auto sourceX = sourceWidth - 1 - destinationY;
+            auto* destinationRow = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(destinationY) * destinationPitch);
+            for (uint32_t destinationX = 0; destinationX < sourceHeight; ++destinationX) {
+                const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(destinationX) * sourceStride);
+                destinationRow[destinationX] = sourceRow[sourceX];
+            }
+        }
+        return;
+    }
+}
+
+struct ChromeRenderState {
+    bool enabled { true };
+    bool visible { true };
+    bool loading { false };
+    bool canBack { false };
+    bool canForward { false };
+    bool touchDebug { false };
+    unsigned height { 44 };
+    gint64 transitionUS { 0 };
+    unsigned tabCount { 1 };
+    unsigned activeTab { 0 };
+    char panel[32] { "none" };
+    char url[256] { };
+    char title[128] { };
+    char lines[10][96] { };
+    unsigned lineCount { 0 };
+};
+
+static bool chromeEnabled()
+{
+    const char* value = getenv("WPE_CHROME_ENABLED");
+    if (!value || !*value)
+        return true;
+    return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off");
+}
+
+static const char* chromeRenderStatePath()
+{
+    const char* path = getenv("WPE_CHROME_RENDER_STATE");
+    return path && *path ? path : "/tmp/wpe-drm2-chrome-state.ini";
+}
+
+static void copyKeyString(GKeyFile* keyFile, const char* group, const char* key, char* target, size_t targetSize)
+{
+    GError* error = nullptr;
+    char* value = g_key_file_get_string(keyFile, group, key, &error);
+    if (!value) {
+        g_clear_error(&error);
+        return;
+    }
+    g_strlcpy(target, value, targetSize);
+    g_free(value);
+}
+
+static ChromeRenderState readChromeRenderState()
+{
+    ChromeRenderState state;
+    state.enabled = chromeEnabled();
+    if (!state.enabled)
+        return state;
+
+    GError* error = nullptr;
+    GKeyFile* keyFile = g_key_file_new();
+    if (!g_key_file_load_from_file(keyFile, chromeRenderStatePath(), G_KEY_FILE_NONE, &error)) {
+        g_clear_error(&error);
+        g_key_file_unref(keyFile);
+        return state;
+    }
+
+    if (g_key_file_has_key(keyFile, "chrome", "enabled", nullptr))
+        state.enabled = g_key_file_get_boolean(keyFile, "chrome", "enabled", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "visible", nullptr))
+        state.visible = g_key_file_get_boolean(keyFile, "chrome", "visible", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "loading", nullptr))
+        state.loading = g_key_file_get_boolean(keyFile, "chrome", "loading", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "can_back", nullptr))
+        state.canBack = g_key_file_get_boolean(keyFile, "chrome", "can_back", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "can_forward", nullptr))
+        state.canForward = g_key_file_get_boolean(keyFile, "chrome", "can_forward", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "touch_debug", nullptr))
+        state.touchDebug = g_key_file_get_boolean(keyFile, "chrome", "touch_debug", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "height", nullptr))
+        state.height = std::clamp<int>(g_key_file_get_integer(keyFile, "chrome", "height", nullptr), 24, 80);
+    if (g_key_file_has_key(keyFile, "chrome", "transition_us", nullptr)) {
+        char* value = g_key_file_get_string(keyFile, "chrome", "transition_us", nullptr);
+        if (value) {
+            char* end = nullptr;
+            auto parsed = g_ascii_strtoll(value, &end, 10);
+            if (end != value)
+                state.transitionUS = parsed;
+            g_free(value);
+        }
+    }
+    if (g_key_file_has_key(keyFile, "chrome", "tab_count", nullptr))
+        state.tabCount = std::max<int>(1, g_key_file_get_integer(keyFile, "chrome", "tab_count", nullptr));
+    if (g_key_file_has_key(keyFile, "chrome", "active_tab", nullptr))
+        state.activeTab = std::max<int>(0, g_key_file_get_integer(keyFile, "chrome", "active_tab", nullptr));
+
+    copyKeyString(keyFile, "chrome", "panel", state.panel, sizeof(state.panel));
+    copyKeyString(keyFile, "chrome", "url", state.url, sizeof(state.url));
+    copyKeyString(keyFile, "chrome", "title", state.title, sizeof(state.title));
+
+    if (g_key_file_has_group(keyFile, "panel")) {
+        auto count = std::clamp<int>(g_key_file_get_integer(keyFile, "panel", "line_count", nullptr), 0, 10);
+        state.lineCount = count;
+        for (int i = 0; i < count; ++i) {
+            char key[16];
+            snprintf(key, sizeof(key), "line%d", i);
+            copyKeyString(keyFile, "panel", key, state.lines[i], sizeof(state.lines[i]));
+        }
+    }
+
+    g_key_file_unref(keyFile);
+    return state;
+}
+
+static uint32_t chromeReservedTopInset(uint32_t panelHeight)
+{
+    if (!panelHeight)
+        return 0;
+    auto chrome = readChromeRenderState();
+    if (!chrome.enabled)
+        return 0;
+    auto chromeHeight = std::min<uint32_t>(std::clamp<unsigned>(chrome.height, 24, 80), panelHeight - 1);
+    double fraction = chrome.visible ? 1.0 : 0.0;
+    if (chrome.transitionUS > 0) {
+        const char* value = getenv("WPE_CHROME_ANIMATION_MS");
+        char* end = nullptr;
+        auto durationMS = value && *value ? strtol(value, &end, 10) : 160;
+        if (end == value || durationMS <= 0)
+            durationMS = 160;
+        auto elapsedUS = std::max<gint64>(0, g_get_monotonic_time() - chrome.transitionUS);
+        double t = std::min<double>(1.0, static_cast<double>(elapsedUS) / (durationMS * 1000.0));
+        double eased = 1.0 - std::pow(1.0 - t, 3.0);
+        fraction = chrome.visible ? eased : (1.0 - eased);
+    }
+    return std::min<uint32_t>(chromeHeight, static_cast<uint32_t>(std::lround(chromeHeight * fraction)));
+}
+
+static bool chromeAnimationActive()
+{
+    auto chrome = readChromeRenderState();
+    if (!chrome.enabled || chrome.transitionUS <= 0)
+        return false;
+    const char* value = getenv("WPE_CHROME_ANIMATION_MS");
+    char* end = nullptr;
+    auto durationMS = value && *value ? strtol(value, &end, 10) : 160;
+    if (end == value || durationMS <= 0)
+        durationMS = 160;
+    return g_get_monotonic_time() - chrome.transitionUS < durationMS * 1000;
+}
+
+static double chromeShownFraction(const ChromeRenderState& chrome)
+{
+    double fraction = chrome.visible ? 1.0 : 0.0;
+    if (chrome.transitionUS <= 0)
+        return fraction;
+    const char* value = getenv("WPE_CHROME_ANIMATION_MS");
+    char* end = nullptr;
+    auto durationMS = value && *value ? strtol(value, &end, 10) : 160;
+    if (end == value || durationMS <= 0)
+        durationMS = 160;
+    auto elapsedUS = std::max<gint64>(0, g_get_monotonic_time() - chrome.transitionUS);
+    double t = std::min<double>(1.0, static_cast<double>(elapsedUS) / (durationMS * 1000.0));
+    double eased = 1.0 - std::pow(1.0 - t, 3.0);
+    return chrome.visible ? eased : (1.0 - eased);
+}
+
+static guint chromeRenderStateHash()
+{
+    char* contents = nullptr;
+    gsize length = 0;
+    if (!g_file_get_contents(chromeRenderStatePath(), &contents, &length, nullptr))
+        return 0;
+    guint hash = g_str_hash(contents);
+    hash ^= static_cast<guint>(length);
+    g_free(contents);
+    return hash;
+}
+
+static void fontRows(char c, uint8_t rows[7])
+{
+    memset(rows, 0, 7);
+    switch (g_ascii_toupper(c)) {
+    case '0': { uint8_t v[7] = { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case '1': { uint8_t v[7] = { 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e }; memcpy(rows, v, 7); return; }
+    case '2': { uint8_t v[7] = { 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f }; memcpy(rows, v, 7); return; }
+    case '3': { uint8_t v[7] = { 0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e }; memcpy(rows, v, 7); return; }
+    case '4': { uint8_t v[7] = { 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 }; memcpy(rows, v, 7); return; }
+    case '5': { uint8_t v[7] = { 0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e }; memcpy(rows, v, 7); return; }
+    case '6': { uint8_t v[7] = { 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case '7': { uint8_t v[7] = { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 }; memcpy(rows, v, 7); return; }
+    case '8': { uint8_t v[7] = { 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case '9': { uint8_t v[7] = { 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c }; memcpy(rows, v, 7); return; }
+    case 'A': { uint8_t v[7] = { 0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'B': { uint8_t v[7] = { 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e }; memcpy(rows, v, 7); return; }
+    case 'C': { uint8_t v[7] = { 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case 'D': { uint8_t v[7] = { 0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e }; memcpy(rows, v, 7); return; }
+    case 'E': { uint8_t v[7] = { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f }; memcpy(rows, v, 7); return; }
+    case 'F': { uint8_t v[7] = { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10 }; memcpy(rows, v, 7); return; }
+    case 'G': { uint8_t v[7] = { 0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f }; memcpy(rows, v, 7); return; }
+    case 'H': { uint8_t v[7] = { 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'I': { uint8_t v[7] = { 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e }; memcpy(rows, v, 7); return; }
+    case 'J': { uint8_t v[7] = { 0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case 'K': { uint8_t v[7] = { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'L': { uint8_t v[7] = { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f }; memcpy(rows, v, 7); return; }
+    case 'M': { uint8_t v[7] = { 0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'N': { uint8_t v[7] = { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'O': { uint8_t v[7] = { 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case 'P': { uint8_t v[7] = { 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10 }; memcpy(rows, v, 7); return; }
+    case 'Q': { uint8_t v[7] = { 0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d }; memcpy(rows, v, 7); return; }
+    case 'R': { uint8_t v[7] = { 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'S': { uint8_t v[7] = { 0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e }; memcpy(rows, v, 7); return; }
+    case 'T': { uint8_t v[7] = { 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 }; memcpy(rows, v, 7); return; }
+    case 'U': { uint8_t v[7] = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e }; memcpy(rows, v, 7); return; }
+    case 'V': { uint8_t v[7] = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04 }; memcpy(rows, v, 7); return; }
+    case 'W': { uint8_t v[7] = { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a }; memcpy(rows, v, 7); return; }
+    case 'X': { uint8_t v[7] = { 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11 }; memcpy(rows, v, 7); return; }
+    case 'Y': { uint8_t v[7] = { 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04 }; memcpy(rows, v, 7); return; }
+    case 'Z': { uint8_t v[7] = { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f }; memcpy(rows, v, 7); return; }
+    case ':': { uint8_t v[7] = { 0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00 }; memcpy(rows, v, 7); return; }
+    case '.': { uint8_t v[7] = { 0, 0, 0, 0, 0, 0x0c, 0x0c }; memcpy(rows, v, 7); return; }
+    case '/': { uint8_t v[7] = { 0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10 }; memcpy(rows, v, 7); return; }
+    case '-': { uint8_t v[7] = { 0, 0, 0, 0x1f, 0, 0, 0 }; memcpy(rows, v, 7); return; }
+    case '_': { uint8_t v[7] = { 0, 0, 0, 0, 0, 0, 0x1f }; memcpy(rows, v, 7); return; }
+    case '+': { uint8_t v[7] = { 0, 0x04, 0x04, 0x1f, 0x04, 0x04, 0 }; memcpy(rows, v, 7); return; }
+    case '<': { uint8_t v[7] = { 0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02 }; memcpy(rows, v, 7); return; }
+    case '>': { uint8_t v[7] = { 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 }; memcpy(rows, v, 7); return; }
+    case '[': { uint8_t v[7] = { 0x0e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0e }; memcpy(rows, v, 7); return; }
+    case ']': { uint8_t v[7] = { 0x0e, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0e }; memcpy(rows, v, 7); return; }
+    case '#': { uint8_t v[7] = { 0x0a, 0x0a, 0x1f, 0x0a, 0x1f, 0x0a, 0x0a }; memcpy(rows, v, 7); return; }
+    default:
+        return;
+    }
+}
+
+class PanelPixelWriter {
+public:
+    PanelPixelWriter(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
+        : m_destination(destination)
+        , m_destinationPitch(destinationPitch)
+        , m_destinationWidth(destinationWidth)
+        , m_destinationHeight(destinationHeight)
+        , m_panelWidth(panelWidth)
+        , m_panelHeight(panelHeight)
+        , m_rotation(rotation)
+    {
+    }
+
+    void setPixel(int x, int y, uint32_t color)
+    {
+        if (x < 0 || y < 0 || x >= static_cast<int>(m_panelWidth) || y >= static_cast<int>(m_panelHeight))
+            return;
+
+        int dx = x;
+        int dy = y;
+        switch (m_rotation) {
+        case OutputRotation::Rotate0:
+            break;
+        case OutputRotation::Rotate90:
+            dx = static_cast<int>(m_panelHeight) - 1 - y;
+            dy = x;
+            break;
+        case OutputRotation::Rotate180:
+            dx = static_cast<int>(m_panelWidth) - 1 - x;
+            dy = static_cast<int>(m_panelHeight) - 1 - y;
+            break;
+        case OutputRotation::Rotate270:
+            dx = y;
+            dy = static_cast<int>(m_panelWidth) - 1 - x;
+            break;
+        }
+
+        if (dx < 0 || dy < 0 || dx >= static_cast<int>(m_destinationWidth) || dy >= static_cast<int>(m_destinationHeight))
+            return;
+        auto* row = reinterpret_cast<uint32_t*>(m_destination + static_cast<size_t>(dy) * m_destinationPitch);
+        row[dx] = color;
+    }
+
+    void fillRect(int x, int y, int width, int height, uint32_t color)
+    {
+        for (int yy = y; yy < y + height; ++yy) {
+            for (int xx = x; xx < x + width; ++xx)
+                setPixel(xx, yy, color);
+        }
+    }
+
+    void strokeRect(int x, int y, int width, int height, uint32_t color)
+    {
+        fillRect(x, y, width, 1, color);
+        fillRect(x, y + height - 1, width, 1, color);
+        fillRect(x, y, 1, height, color);
+        fillRect(x + width - 1, y, 1, height, color);
+    }
+
+    void drawChar(int x, int y, char c, uint32_t color, int scale)
+    {
+        if (c == ' ')
+            return;
+        uint8_t rows[7];
+        fontRows(c, rows);
+        for (int row = 0; row < 7; ++row) {
+            for (int col = 0; col < 5; ++col) {
+                if (!(rows[row] & (1 << (4 - col))))
+                    continue;
+                fillRect(x + col * scale, y + row * scale, scale, scale, color);
+            }
+        }
+    }
+
+    void drawText(int x, int y, const char* text, uint32_t color, int scale, int maxWidth)
+    {
+        if (!text)
+            return;
+        int cursor = x;
+        int advance = 6 * scale;
+        for (const char* p = text; *p && cursor + advance <= x + maxWidth; ++p) {
+            drawChar(cursor, y, *p, color, scale);
+            cursor += advance;
+        }
+    }
+
+private:
+    uint8_t* m_destination { nullptr };
+    uint32_t m_destinationPitch { 0 };
+    uint32_t m_destinationWidth { 0 };
+    uint32_t m_destinationHeight { 0 };
+    uint32_t m_panelWidth { 0 };
+    uint32_t m_panelHeight { 0 };
+    OutputRotation m_rotation { OutputRotation::Rotate0 };
+};
+
+static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
+{
+    auto chrome = readChromeRenderState();
+    if (!chrome.enabled)
+        return;
+    static bool loggedChromeOverlay;
+    if (!loggedChromeOverlay) {
+        loggedChromeOverlay = true;
+        g_message("WPEViewDRM chrome_overlay=enabled state=%s", chromeRenderStatePath());
+    }
+
+    PanelPixelWriter painter(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation);
+    const uint32_t black = 0xff111820;
+    const uint32_t dark = 0xee202a33;
+    const uint32_t mid = 0xff53606b;
+    const uint32_t white = 0xffffffff;
+    const uint32_t text = 0xff1a222b;
+    const uint32_t disabled = 0xff7f8a94;
+    const uint32_t accent = 0xff1d8dbb;
+    const uint32_t panel = 0xf8f5f7fa;
+
+    int chromeHeight = std::clamp<int>(chrome.height, 24, std::min<int>(80, panelHeight));
+    bool hasPanel = strcmp(chrome.panel, "none") && chrome.panel[0];
+    double shownFraction = hasPanel ? 1.0 : chromeShownFraction(chrome);
+    int toolbarY = static_cast<int>(std::lround((shownFraction - 1.0) * chromeHeight));
+
+    if (shownFraction <= 0.001 && !hasPanel)
+        return;
+
+    painter.fillRect(0, toolbarY, panelWidth, chromeHeight, dark);
+    painter.fillRect(8, toolbarY + 6, std::max<int>(1, panelWidth / 2 - 16), chromeHeight - 12, white);
+    painter.strokeRect(8, toolbarY + 6, std::max<int>(1, panelWidth / 2 - 16), chromeHeight - 12, mid);
+    painter.drawText(18, toolbarY + 17, chrome.url[0] ? chrome.url : "HOME", text, 1, std::max<int>(1, panelWidth / 2 - 36));
+
+    int buttonX = panelWidth / 2 + 8;
+    int buttonW = std::max<int>(36, (static_cast<int>(panelWidth) - buttonX - 8) / 6);
+    const char* labels[6] = { "<", ">", "TAB", "+", chrome.loading ? "X" : "R", "SET" };
+    bool enabled[6] = { chrome.canBack, chrome.canForward, true, true, true, true };
+    for (int i = 0; i < 6; ++i) {
+        int x = buttonX + i * buttonW;
+        painter.fillRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, black);
+        painter.strokeRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, enabled[i] ? accent : mid);
+        painter.drawText(x + 10, toolbarY + 17, labels[i], enabled[i] ? white : disabled, 1, buttonW - 16);
+    }
+
+    char tabLabel[32];
+    snprintf(tabLabel, sizeof(tabLabel), "%u/%u", chrome.activeTab + 1, std::max<unsigned>(1, chrome.tabCount));
+    painter.drawText(buttonX + buttonW * 2 + 8, toolbarY + chromeHeight - 12, tabLabel, white, 1, buttonW - 12);
+
+    if (!hasPanel)
+        return;
+
+    int panelY = toolbarY + chromeHeight;
+    int panelHeightPixels = std::min<int>(static_cast<int>(panelHeight) - panelY, 214);
+    if (panelHeightPixels <= 0)
+        return;
+    painter.fillRect(0, panelY, panelWidth, panelHeightPixels, panel);
+    painter.strokeRect(0, panelY, panelWidth, panelHeightPixels, mid);
+    painter.drawText(14, panelY + 10, chrome.panel, accent, 1, panelWidth - 28);
+
+    int rowY = panelY + 30;
+    for (unsigned i = 0; i < chrome.lineCount && rowY + 24 <= panelY + panelHeightPixels; ++i) {
+        uint32_t rowColor = (i % 2) ? 0xffedf1f5 : 0xffffffff;
+        painter.fillRect(8, rowY, panelWidth - 16, 24, rowColor);
+        painter.strokeRect(8, rowY, panelWidth - 16, 24, 0xffd4dbe2);
+        painter.drawText(18, rowY + 8, chrome.lines[i], text, 1, panelWidth - 36);
+        rowY += 28;
+    }
+
+    if (chrome.touchDebug)
+        painter.drawText(panelWidth - 140, panelY + 10, "TOUCH DEBUG", accent, 1, 130);
+}
+
+class DRMScanoutBuffer {
+public:
+    enum class Kind : uint8_t {
+        DMABufGBM,
+        DMABufDirect,
+        DMABufRotatedDumb,
+        SHMRotatedDumb,
+        SHMDumb
+    };
+
+    static std::unique_ptr<DRMScanoutBuffer> createDMABuf(std::unique_ptr<WPE::DRM::Buffer>&& buffer)
+    {
+        auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::DMABufGBM));
+        scanoutBuffer->m_drmBuffer = WTF::move(buffer);
+        return scanoutBuffer;
+    }
+
+    static std::unique_ptr<DRMScanoutBuffer> createDMABufDirect(int fd, WPEBuffer* buffer, GError** error)
+    {
+        auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
+        if (wpe_buffer_dma_buf_get_n_planes(dmaBuffer) != 1) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: direct dmabuf scanout requires one plane");
+            return nullptr;
+        }
+
+        if (wpe_buffer_dma_buf_get_format(dmaBuffer) != DRM_FORMAT_ARGB8888) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: direct dmabuf scanout requires ARGB8888, got 0x%x", wpe_buffer_dma_buf_get_format(dmaBuffer));
+            return nullptr;
+        }
+
+        if (wpe_buffer_dma_buf_get_modifier(dmaBuffer) != DRM_FORMAT_MOD_INVALID) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: direct dmabuf scanout requires linear modifier, got 0x%" G_GINT64_MODIFIER "x", static_cast<gint64>(wpe_buffer_dma_buf_get_modifier(dmaBuffer)));
+            return nullptr;
+        }
+
+        uint32_t gemHandle = 0;
+        if (drmPrimeFDToHandle(fd, wpe_buffer_dma_buf_get_fd(dmaBuffer, 0), &gemHandle)) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: drmPrimeFDToHandle failed: %s", strerror(errno));
+            return nullptr;
+        }
+
+        auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::DMABufDirect));
+        scanoutBuffer->m_fd = fd;
+        scanoutBuffer->m_width = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        scanoutBuffer->m_height = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        scanoutBuffer->m_format = DRM_FORMAT_ARGB8888;
+        scanoutBuffer->m_primeHandle = gemHandle;
+        scanoutBuffer->m_pitch = wpe_buffer_dma_buf_get_stride(dmaBuffer, 0);
+
+        uint32_t handles[4] = { scanoutBuffer->m_primeHandle, 0, 0, 0 };
+        uint32_t strides[4] = { scanoutBuffer->m_pitch, 0, 0, 0 };
+        uint32_t offsets[4] = { wpe_buffer_dma_buf_get_offset(dmaBuffer, 0), 0, 0, 0 };
+        if (drmModeAddFB2(fd, scanoutBuffer->m_width, scanoutBuffer->m_height, scanoutBuffer->m_format, handles, strides, offsets, &scanoutBuffer->m_frameBufferID, 0)) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: direct dmabuf drmModeAddFB2 failed: %s", strerror(errno));
+            return nullptr;
+        }
+
+        return scanoutBuffer;
+    }
+
+    static std::unique_ptr<DRMScanoutBuffer> createRotatedDMABufDumb(int fd, WPEBuffer* buffer, OutputRotation rotation, GError** error)
+    {
+        auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
+        if (wpe_buffer_dma_buf_get_n_planes(dmaBuffer) != 1) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render rotated buffer: dmabuf requires one plane");
+            return nullptr;
+        }
+        if (wpe_buffer_dma_buf_get_format(dmaBuffer) != DRM_FORMAT_ARGB8888) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render rotated buffer: expected ARGB8888, got 0x%x", wpe_buffer_dma_buf_get_format(dmaBuffer));
+            return nullptr;
+        }
+
+        uint32_t sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        uint32_t sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::DMABufRotatedDumb));
+        scanoutBuffer->m_sourceWidth = sourceWidth;
+        scanoutBuffer->m_sourceHeight = sourceHeight;
+        scanoutBuffer->m_rotation = rotation;
+        if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(sourceWidth, sourceHeight, rotation), rotatedHeight(sourceWidth, sourceHeight, rotation), error))
+            return nullptr;
+        if (!scanoutBuffer->copyRotatedFromDMABuf(buffer, rotation, error))
+            return nullptr;
+        return scanoutBuffer;
+    }
+
+    static std::unique_ptr<DRMScanoutBuffer> createSHMDumb(int fd, WPEBuffer* buffer, GError** error)
+    {
+        auto* shmBuffer = WPE_BUFFER_SHM(buffer);
+        if (wpe_buffer_shm_get_format(shmBuffer) != WPE_PIXEL_FORMAT_ARGB8888) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: unsupported SHM format, expected ARGB8888");
+            return nullptr;
+        }
+
+        auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::SHMDumb));
+        if (!scanoutBuffer->initializeDumb(fd, static_cast<uint32_t>(wpe_buffer_get_width(buffer)), static_cast<uint32_t>(wpe_buffer_get_height(buffer)), error))
+            return nullptr;
+
+        if (!scanoutBuffer->copyFromSHM(buffer, error))
+            return nullptr;
+
+        return scanoutBuffer;
+    }
+
+    static std::unique_ptr<DRMScanoutBuffer> createRotatedSHMDumb(int fd, WPEBuffer* buffer, OutputRotation rotation, GError** error)
+    {
+        auto* shmBuffer = WPE_BUFFER_SHM(buffer);
+        if (wpe_buffer_shm_get_format(shmBuffer) != WPE_PIXEL_FORMAT_ARGB8888) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render rotated SHM buffer: unsupported format, expected ARGB8888");
+            return nullptr;
+        }
+
+        uint32_t sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        uint32_t sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::SHMRotatedDumb));
+        scanoutBuffer->m_sourceWidth = sourceWidth;
+        scanoutBuffer->m_sourceHeight = sourceHeight;
+        scanoutBuffer->m_rotation = rotation;
+        if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(sourceWidth, sourceHeight, rotation), rotatedHeight(sourceWidth, sourceHeight, rotation), error))
+            return nullptr;
+        if (!scanoutBuffer->copyRotatedFromSHM(buffer, rotation, error))
+            return nullptr;
+        return scanoutBuffer;
+    }
+
+    ~DRMScanoutBuffer()
+    {
+        if (m_mapping)
+            munmap(m_mapping, m_size);
+
+        if (m_frameBufferID)
+            drmModeRmFB(m_fd, m_frameBufferID);
+
+        if (m_dumbHandle) {
+            struct drm_mode_destroy_dumb destroyDumb = { };
+            destroyDumb.handle = m_dumbHandle;
+            if (ioctl(m_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroyDumb) < 0)
+                g_warning("Failed to destroy DRM dumb buffer: %s", strerror(errno));
+        }
+
+        if (m_primeHandle) {
+            struct drm_gem_close close = { };
+            close.handle = m_primeHandle;
+            if (ioctl(m_fd, DRM_IOCTL_GEM_CLOSE, &close) < 0)
+                g_warning("Failed to close DRM GEM handle: %s", strerror(errno));
+        }
+    }
+
+    Kind kind() const { return m_kind; }
+
+    uint32_t frameBufferID() const
+    {
+        return m_drmBuffer ? m_drmBuffer->frameBufferID() : m_frameBufferID;
+    }
+
+    uint32_t width() const
+    {
+        return m_drmBuffer ? gbm_bo_get_width(m_drmBuffer->bufferObject()) : m_width;
+    }
+
+    uint32_t height() const
+    {
+        return m_drmBuffer ? gbm_bo_get_height(m_drmBuffer->bufferObject()) : m_height;
+    }
+
+    bool matchesSHMBuffer(WPEBuffer* buffer) const
+    {
+        return m_kind == Kind::SHMDumb
+            && m_width == static_cast<uint32_t>(wpe_buffer_get_width(buffer))
+            && m_height == static_cast<uint32_t>(wpe_buffer_get_height(buffer))
+            && m_format == DRM_FORMAT_ARGB8888;
+    }
+
+    bool matchesRotatedDMABuf(WPEBuffer* buffer, OutputRotation rotation) const
+    {
+        auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        return m_kind == Kind::DMABufRotatedDumb
+            && m_sourceWidth == sourceWidth
+            && m_sourceHeight == sourceHeight
+            && m_width == rotatedWidth(sourceWidth, sourceHeight, rotation)
+            && m_height == rotatedHeight(sourceWidth, sourceHeight, rotation)
+            && m_format == DRM_FORMAT_ARGB8888
+            && m_rotation == rotation;
+    }
+
+    bool matchesRotatedSHM(WPEBuffer* buffer, OutputRotation rotation) const
+    {
+        auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        return m_kind == Kind::SHMRotatedDumb
+            && m_sourceWidth == sourceWidth
+            && m_sourceHeight == sourceHeight
+            && m_width == rotatedWidth(sourceWidth, sourceHeight, rotation)
+            && m_height == rotatedHeight(sourceWidth, sourceHeight, rotation)
+            && m_format == DRM_FORMAT_ARGB8888
+            && m_rotation == rotation;
+    }
+
+    bool initializeDumb(int fd, uint32_t width, uint32_t height, GError** error)
+    {
+        m_fd = fd;
+        m_width = width;
+        m_height = height;
+        m_format = DRM_FORMAT_ARGB8888;
+
+        struct drm_mode_create_dumb createDumb = { };
+        createDumb.width = m_width;
+        createDumb.height = m_height;
+        createDumb.bpp = 32;
+        if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &createDumb) < 0) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to create DRM dumb buffer: %s", strerror(errno));
+            return false;
+        }
+
+        m_dumbHandle = createDumb.handle;
+        m_pitch = createDumb.pitch;
+        m_size = createDumb.size;
+
+        uint32_t handles[4] = { m_dumbHandle, 0, 0, 0 };
+        uint32_t strides[4] = { m_pitch, 0, 0, 0 };
+        uint32_t offsets[4] = { 0, 0, 0, 0 };
+        if (drmModeAddFB2(fd, m_width, m_height, m_format, handles, strides, offsets, &m_frameBufferID, 0)) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to add dumb framebuffer: %s", strerror(errno));
+            return false;
+        }
+
+        struct drm_mode_map_dumb mapDumb = { };
+        mapDumb.handle = m_dumbHandle;
+        if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mapDumb) < 0) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to map DRM dumb buffer: %s", strerror(errno));
+            return false;
+        }
+
+        m_mapping = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, static_cast<off_t>(mapDumb.offset));
+        if (m_mapping == MAP_FAILED) {
+            m_mapping = nullptr;
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to mmap DRM dumb buffer: %s", strerror(errno));
+            return false;
+        }
+        return true;
+    }
+
+    bool copyFromSHM(WPEBuffer* buffer, GError** error)
+    {
+        auto* shmBuffer = WPE_BUFFER_SHM(buffer);
+        if (wpe_buffer_shm_get_format(shmBuffer) != WPE_PIXEL_FORMAT_ARGB8888) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: unsupported SHM format, expected ARGB8888");
+            return false;
+        }
+
+        auto sourceStride = wpe_buffer_shm_get_stride(shmBuffer);
+        auto rowBytes = static_cast<size_t>(m_width) * 4;
+        if (sourceStride < rowBytes) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: invalid SHM stride %u for %ux%u ARGB8888", sourceStride, m_width, m_height);
+            return false;
+        }
+
+        gsize sourceSize = 0;
+        const auto* source = static_cast<const uint8_t*>(g_bytes_get_data(wpe_buffer_shm_get_data(shmBuffer), &sourceSize));
+        if (!source) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: SHM data is empty");
+            return false;
+        }
+
+        auto requiredSize = static_cast<size_t>(sourceStride) * (m_height - 1) + rowBytes;
+        if (sourceSize < requiredSize) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: SHM data too small: have %zu need %zu", static_cast<size_t>(sourceSize), requiredSize);
+            return false;
+        }
+
+        auto* destination = static_cast<uint8_t*>(m_mapping);
+        auto topInset = chromeReservedTopInset(m_height);
+        if (topInset) {
+            for (uint32_t y = 0; y < m_height; ++y)
+                memset(destination + static_cast<size_t>(y) * m_pitch, 0xff, rowBytes);
+            uint32_t copyHeight = m_height > topInset ? m_height - topInset : 0;
+            for (uint32_t y = 0; y < copyHeight; ++y)
+                memcpy(destination + static_cast<size_t>(y + topInset) * m_pitch, source + static_cast<size_t>(y) * sourceStride, rowBytes);
+        } else {
+            for (uint32_t y = 0; y < m_height; ++y)
+                memcpy(destination + static_cast<size_t>(y) * m_pitch, source + static_cast<size_t>(y) * sourceStride, rowBytes);
+        }
+        drawChromeOverlay(destination, m_pitch, m_width, m_height, m_width, m_height, OutputRotation::Rotate0);
+
+        return true;
+    }
+
+    bool copyRotatedFromSHM(WPEBuffer* buffer, OutputRotation rotation, GError** error)
+    {
+        auto* shmBuffer = WPE_BUFFER_SHM(buffer);
+        if (wpe_buffer_shm_get_format(shmBuffer) != WPE_PIXEL_FORMAT_ARGB8888) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate SHM buffer: unsupported format, expected ARGB8888");
+            return false;
+        }
+
+        auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto sourceStride = wpe_buffer_shm_get_stride(shmBuffer);
+        auto rowBytes = static_cast<size_t>(sourceWidth) * 4;
+        if (sourceStride < rowBytes) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate SHM buffer: invalid stride %u for %ux%u", sourceStride, sourceWidth, sourceHeight);
+            return false;
+        }
+
+        gsize sourceSize = 0;
+        const auto* source = static_cast<const uint8_t*>(g_bytes_get_data(wpe_buffer_shm_get_data(shmBuffer), &sourceSize));
+        if (!source) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate SHM buffer: data is empty");
+            return false;
+        }
+
+        auto requiredSize = static_cast<size_t>(sourceStride) * (sourceHeight - 1) + rowBytes;
+        if (sourceSize < requiredSize) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate SHM buffer: data too small: have %zu need %zu", static_cast<size_t>(sourceSize), requiredSize);
+            return false;
+        }
+
+        auto* destination = static_cast<uint8_t*>(m_mapping);
+        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, rotation);
+        drawChromeOverlay(destination, m_pitch, m_width, m_height, sourceWidth, sourceHeight, rotation);
+        return true;
+    }
+
+    bool copyRotatedFromDMABuf(WPEBuffer* buffer, OutputRotation rotation, GError** error)
+    {
+        auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
+        auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+        auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto sourceStride = wpe_buffer_dma_buf_get_stride(dmaBuffer, 0);
+        auto sourceOffset = wpe_buffer_dma_buf_get_offset(dmaBuffer, 0);
+        auto rowBytes = static_cast<size_t>(sourceWidth) * 4;
+        if (sourceStride < rowBytes) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: invalid stride %u for %ux%u", sourceStride, sourceWidth, sourceHeight);
+            return false;
+        }
+
+        size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
+        int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
+        void* mappedSource = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, sourceFD, 0);
+        if (mappedSource == MAP_FAILED) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap source failed: %s", strerror(errno));
+            return false;
+        }
+
+        struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+        ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncStart);
+
+        const auto* source = static_cast<const uint8_t*>(mappedSource) + sourceOffset;
+        auto* destination = static_cast<uint8_t*>(m_mapping);
+        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, rotation);
+        drawChromeOverlay(destination, m_pitch, m_width, m_height, sourceWidth, sourceHeight, rotation);
+
+        struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+        ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
+        munmap(mappedSource, mapSize);
+        return true;
+    }
+
+    void setFenceFD(UnixFileDescriptor&& fenceFD)
+    {
+        if (m_drmBuffer)
+            m_drmBuffer->setFenceFD(WTF::move(fenceFD));
+        else
+            m_fenceFD = WTF::move(fenceFD);
+    }
+
+    const UnixFileDescriptor& fenceFD() const LIFETIME_BOUND
+    {
+        return m_drmBuffer ? m_drmBuffer->fenceFD() : m_fenceFD;
+    }
+
+private:
+    explicit DRMScanoutBuffer(Kind kind)
+        : m_kind(kind)
+    {
+    }
+
+    Kind m_kind { Kind::DMABufGBM };
+    std::unique_ptr<WPE::DRM::Buffer> m_drmBuffer;
+    int m_fd { -1 };
+    uint32_t m_width { 0 };
+    uint32_t m_height { 0 };
+    uint32_t m_sourceWidth { 0 };
+    uint32_t m_sourceHeight { 0 };
+    uint32_t m_format { DRM_FORMAT_INVALID };
+    OutputRotation m_rotation { OutputRotation::Rotate0 };
+    uint32_t m_dumbHandle { 0 };
+    uint32_t m_primeHandle { 0 };
+    uint32_t m_pitch { 0 };
+    uint64_t m_size { 0 };
+    uint32_t m_frameBufferID { 0 };
+    void* m_mapping { nullptr };
+    mutable UnixFileDescriptor m_fenceFD;
+};
+
+/**
+ * WPEViewDRM:
+ *
+ * A [class@WPEPlatform.View] implementation for DRM/KMS.
+ *
+ * [class@ViewDRM] is the [class@WPEPlatform.View] implementation used by
+ * [class@DisplayDRM]. It displays the web view contents by scanning out
+ * buffers directly to the DRM device.
+ */
+struct _WPEViewDRMPrivate {
+    Seconds refreshDuration;
+    std::optional<uint32_t> modeBlob;
+    GRefPtr<WPEBuffer> pendingBuffer;
+    GRefPtr<WPEBuffer> committedBuffer;
+    GRefPtr<WPEBuffer> queuedBuffer;
+    DRMScanoutBuffer* pendingScanoutBuffer { nullptr };
+    DRMScanoutBuffer* committedScanoutBuffer { nullptr };
+    std::array<std::unique_ptr<DRMScanoutBuffer>, 2> shmScanoutBuffers;
+    std::array<std::unique_ptr<DRMScanoutBuffer>, 2> rotatedScanoutBuffers;
+    unsigned nextSHMScanoutBufferIndex { 0 };
+    unsigned nextRotatedScanoutBufferIndex { 0 };
+    Vector<drm_mode_rect> damageRects;
+    Vector<drm_mode_rect> queuedDamageRects;
+    drmEventContext eventContext;
+    GRefPtr<GSource> eventSource;
+    GRefPtr<GSource> rotationSource;
+    GRefPtr<GSource> chromeSource;
+    GRefPtr<GSource> frameThrottleSource;
+    OptionSet<UpdateFlags> updateFlags;
+    std::unique_ptr<RunLoop::Timer> cursorUpdateTimer;
+    guint64 frameCount { 0 };
+    guint64 pageFlipCount { 0 };
+    bool lastCommitWasSynchronous { false };
+    gint64 copyTotalUS { 0 };
+    gint64 commitTotalUS { 0 };
+    gint64 statsStartUS { 0 };
+    gint64 lastFrameCommitUS { 0 };
+    gint64 frameThrottleIntervalUS { 0 };
+    guint chromeStateHash { 0 };
+    OutputRotation outputRotation { OutputRotation::Rotate0 };
+};
+WEBKIT_DEFINE_FINAL_TYPE(WPEViewDRM, wpe_view_drm, WPE_TYPE_VIEW, WPEView)
+
+static void wpeViewDRMDidPageFlip(WPEViewDRM*);
+static gboolean wpeViewDRMRequestUpdate(WPEViewDRM*, GError**);
+static void wpeViewDRMCompleteSynchronousCommitIfNeeded(WPEViewDRM*);
+static void setDamageRects(Vector<drm_mode_rect>&, const WPERectangle*, guint);
+
+static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
+{
+    auto* priv = view->priv;
+    if (!priv->pendingBuffer)
+        return;
+
+    if (priv->committedBuffer)
+        wpe_view_buffer_released(WPE_VIEW(view), priv->committedBuffer.get());
+    priv->committedBuffer = WTF::move(priv->pendingBuffer);
+    priv->committedScanoutBuffer = priv->pendingScanoutBuffer;
+    priv->pendingScanoutBuffer = nullptr;
+    wpe_view_buffer_rendered(WPE_VIEW(view), priv->committedBuffer.get());
+    priv->frameCount++;
+
+    if (!(priv->frameCount % 60)) {
+        gint64 elapsedUS = g_get_monotonic_time() - priv->statsStartUS;
+        if (elapsedUS <= 0)
+            elapsedUS = 1;
+
+        auto fps = static_cast<double>(priv->frameCount) * G_USEC_PER_SEC / elapsedUS;
+        auto copyAverageMS = priv->copyTotalUS / 1000. / priv->frameCount;
+        auto commitAverageMS = priv->commitTotalUS / 1000. / priv->frameCount;
+        g_message("WPEViewDRM fps=%.1f copy_avg_ms=%.2f commit_avg_ms=%.2f frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+            fps, copyAverageMS, commitAverageMS, priv->frameCount, priv->pageFlipCount);
+    }
+}
+
+static void wpeViewDRMQueueBuffer(WPEViewDRM* view, WPEBuffer* buffer, const WPERectangle* damageRects, guint nDamageRects)
+{
+    auto* priv = view->priv;
+    if (priv->queuedBuffer && priv->queuedBuffer.get() != buffer)
+        wpe_view_buffer_released(WPE_VIEW(view), priv->queuedBuffer.get());
+    priv->queuedBuffer = buffer;
+    setDamageRects(priv->queuedDamageRects, damageRects, nDamageRects);
+    priv->updateFlags.add(UpdateFlags::BufferUpdatePending);
+}
+
+static bool wpeViewDRMThrottleDelay(WPEViewDRM* view, gint64& delayUS)
+{
+    auto* priv = view->priv;
+    if (!priv->frameThrottleIntervalUS || !priv->lastFrameCommitUS)
+        return false;
+
+    auto elapsedUS = g_get_monotonic_time() - priv->lastFrameCommitUS;
+    if (elapsedUS >= priv->frameThrottleIntervalUS)
+        return false;
+
+    delayUS = priv->frameThrottleIntervalUS - elapsedUS;
+    return true;
+}
+
+static gboolean wpeViewDRMCommitQueuedBuffer(WPEViewDRM* view, GError** error)
+{
+    auto* priv = view->priv;
+    if (!priv->queuedBuffer)
+        return TRUE;
+
+    priv->updateFlags.remove(UpdateFlags::BufferUpdatePending);
+    priv->pendingBuffer = WTF::move(priv->queuedBuffer);
+    priv->damageRects = WTF::move(priv->queuedDamageRects);
+    if (wpeViewDRMRequestUpdate(view, error)) {
+        priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
+        wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void wpeViewDRMScheduleQueuedCommit(WPEViewDRM* view, gint64 delayUS)
+{
+    auto* priv = view->priv;
+    if (priv->frameThrottleSource)
+        return;
+
+    guint delayMS = std::max<guint>(1, static_cast<guint>((delayUS + 999) / 1000));
+    priv->frameThrottleSource = adoptGRef(g_timeout_source_new(delayMS));
+    g_source_set_name(priv->frameThrottleSource.get(), "WPE DRM frame throttle");
+    g_source_set_callback(priv->frameThrottleSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](gpointer userData) -> gboolean {
+        auto* view = WPE_VIEW_DRM(userData);
+        auto* priv = view->priv;
+        priv->frameThrottleSource = nullptr;
+
+        gint64 delayUS = 0;
+        if (wpeViewDRMThrottleDelay(view, delayUS)) {
+            wpeViewDRMScheduleQueuedCommit(view, delayUS);
+            return G_SOURCE_REMOVE;
+        }
+
+        GError* error = nullptr;
+        if (!wpeViewDRMCommitQueuedBuffer(view, &error)) {
+            g_warning("WPEViewDRM throttled commit failed: %s", error ? error->message : "unknown");
+            g_clear_error(&error);
+        }
+        return G_SOURCE_REMOVE;
+    })), view, nullptr);
+    g_source_attach(priv->frameThrottleSource.get(), g_main_context_get_thread_default());
+}
+
+static void wpeViewDRMCompleteSynchronousCommitIfNeeded(WPEViewDRM* view)
+{
+    auto* priv = view->priv;
+    if (!std::exchange(priv->lastCommitWasSynchronous, false))
+        return;
+
+    priv->updateFlags.remove(UpdateFlags::BufferUpdateRequested);
+    wpeViewDRMFinishBufferCommit(view);
+}
+
+static void wpeViewDRMConstructed(GObject* object)
+{
+    G_OBJECT_CLASS(wpe_view_drm_parent_class)->constructed(object);
+
+    auto* view = WPE_VIEW(object);
+    g_signal_connect(view, "notify::toplevel", G_CALLBACK(+[](WPEView* view, GParamSpec*, gpointer) {
+        auto* toplevel = wpe_view_get_toplevel(view);
+        if (!toplevel) {
+            wpe_view_unmap(view);
+            return;
+        }
+
+        int width;
+        int height;
+        wpe_toplevel_get_size(toplevel, &width, &height);
+        if (width && height)
+            wpe_view_resized(view, width, height);
+
+        wpe_view_map(view);
+    }), nullptr);
+
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(view));
+    auto* priv = WPE_VIEW_DRM(view)->priv;
+    priv->refreshDuration = Seconds(1 / (wpe_screen_get_refresh_rate(wpeDisplayDRMGetScreen(display)) / 1000.));
+    priv->statsStartUS = g_get_monotonic_time();
+    if (auto maxFPS = configuredMaxFPS())
+        priv->frameThrottleIntervalUS = G_USEC_PER_SEC / maxFPS;
+
+    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    priv->outputRotation = configuredOutputRotation();
+    auto panel = configuredPanelSize();
+    g_message("WPEViewDRM output_rotation=%u max_fps=%u panel=%ux%u fit=%s", static_cast<unsigned>(priv->outputRotation),
+        priv->frameThrottleIntervalUS ? static_cast<unsigned>(G_USEC_PER_SEC / priv->frameThrottleIntervalUS) : 0,
+        panel.width, panel.height, drmFitMode());
+    priv->eventContext.version = DRM_EVENT_CONTEXT_VERSION;
+    priv->eventContext.page_flip_handler = [](int, unsigned, unsigned, unsigned, void* userData) {
+        wpeViewDRMDidPageFlip(WPE_VIEW_DRM(userData));
+    };
+
+    priv->eventSource = adoptGRef(g_unix_fd_source_new(fd, static_cast<GIOCondition>(G_IO_IN | G_IO_ERR | G_IO_HUP)));
+    g_source_set_name(priv->eventSource.get(), "WPE DRM events");
+    g_source_set_priority(priv->eventSource.get(), G_PRIORITY_DEFAULT);
+    g_source_set_can_recurse(priv->eventSource.get(), TRUE);
+    g_source_set_callback(priv->eventSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](int fd, GIOCondition condition, gpointer userData) -> gboolean {
+        if (condition & (G_IO_ERR | G_IO_HUP))
+            return G_SOURCE_REMOVE;
+
+        if (condition & G_IO_IN) {
+            auto* priv = WPE_VIEW_DRM(userData)->priv;
+            drmHandleEvent(fd, &priv->eventContext);
+        }
+        return G_SOURCE_CONTINUE;
+    })), object, nullptr);
+    g_source_attach(priv->eventSource.get(), g_main_context_get_thread_default());
+
+    priv->rotationSource = adoptGRef(g_timeout_source_new(250));
+    g_source_set_name(priv->rotationSource.get(), "WPE DRM rotation poll");
+    g_source_set_callback(priv->rotationSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](gpointer userData) -> gboolean {
+        auto* view = WPE_VIEW_DRM(userData);
+        auto* priv = view->priv;
+        auto rotation = configuredOutputRotation();
+        if (rotation == priv->outputRotation)
+            return G_SOURCE_CONTINUE;
+
+        priv->outputRotation = rotation;
+        g_message("WPEViewDRM output_rotation=%u", static_cast<unsigned>(rotation));
+        if (priv->committedBuffer && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
+            if (wpeViewDRMRequestUpdate(view, nullptr)) {
+                priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
+                wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
+            }
+        }
+        return G_SOURCE_CONTINUE;
+    })), object, nullptr);
+    g_source_attach(priv->rotationSource.get(), g_main_context_get_thread_default());
+
+    priv->chromeStateHash = chromeRenderStateHash();
+    priv->chromeSource = adoptGRef(g_timeout_source_new(33));
+    g_source_set_name(priv->chromeSource.get(), "WPE DRM chrome state poll");
+    g_source_set_callback(priv->chromeSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](gpointer userData) -> gboolean {
+        auto* view = WPE_VIEW_DRM(userData);
+        auto* priv = view->priv;
+        auto hash = chromeRenderStateHash();
+        bool animationActive = chromeAnimationActive();
+        if (hash == priv->chromeStateHash && !animationActive)
+            return G_SOURCE_CONTINUE;
+        priv->chromeStateHash = hash;
+        if (priv->committedBuffer && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
+            if (wpeViewDRMRequestUpdate(view, nullptr)) {
+                priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
+                wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
+            }
+        }
+        return G_SOURCE_CONTINUE;
+    })), object, nullptr);
+    g_source_attach(priv->chromeSource.get(), g_main_context_get_thread_default());
+}
+
+static void wpeViewDRMDispose(GObject* object)
+{
+    auto* priv = WPE_VIEW_DRM(object)->priv;
+
+    priv->cursorUpdateTimer = nullptr;
+
+    if (priv->modeBlob) {
+        auto fd = gbm_device_get_fd(wpe_display_drm_get_device(WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(object)))));
+        drmModeDestroyPropertyBlob(fd, priv->modeBlob.value());
+        priv->modeBlob = std::nullopt;
+    }
+
+    if (priv->eventSource) {
+        g_source_destroy(priv->eventSource.get());
+        priv->eventSource = nullptr;
+    }
+
+    if (priv->rotationSource) {
+        g_source_destroy(priv->rotationSource.get());
+        priv->rotationSource = nullptr;
+    }
+
+    if (priv->chromeSource) {
+        g_source_destroy(priv->chromeSource.get());
+        priv->chromeSource = nullptr;
+    }
+
+    if (priv->frameThrottleSource) {
+        g_source_destroy(priv->frameThrottleSource.get());
+        priv->frameThrottleSource = nullptr;
+    }
+
+    G_OBJECT_CLASS(wpe_view_drm_parent_class)->dispose(object);
+}
+
+static void logBufferPathOnce(DRMScanoutBuffer::Kind kind)
+{
+    static bool loggedDMABufGBM;
+    static bool loggedDMABufDirect;
+    static bool loggedDMABufRotated;
+    static bool loggedSHMRotated;
+    static bool loggedSHMDumb;
+
+    if (kind == DRMScanoutBuffer::Kind::DMABufGBM) {
+        if (!loggedDMABufGBM) {
+            loggedDMABufGBM = true;
+            g_message("WPEViewDRM buffer_path=dmabuf_gbm");
+        }
+        return;
+    }
+
+    if (kind == DRMScanoutBuffer::Kind::DMABufDirect) {
+        if (!loggedDMABufDirect) {
+            loggedDMABufDirect = true;
+            g_message("WPEViewDRM buffer_path=dma_heap_scanout");
+        }
+        return;
+    }
+
+    if (kind == DRMScanoutBuffer::Kind::DMABufRotatedDumb) {
+        if (!loggedDMABufRotated) {
+            loggedDMABufRotated = true;
+            g_message("WPEViewDRM buffer_path=dma_heap_rotated_dumb");
+        }
+        return;
+    }
+
+    if (kind == DRMScanoutBuffer::Kind::SHMRotatedDumb) {
+        if (!loggedSHMRotated) {
+            loggedSHMRotated = true;
+            g_message("WPEViewDRM buffer_path=shm_rotated_dumb");
+        }
+        return;
+    }
+
+    if (!loggedSHMDumb) {
+        loggedSHMDumb = true;
+        g_message("WPEViewDRM buffer_path=shm_dumb");
+    }
+}
+
+static bool forceDMAHeapBufferPath()
+{
+    const char* bufferPath = getenv("WPE_DRM_BUFFER_PATH");
+    return bufferPath && !strcmp(bufferPath, "dma_heap");
+}
+
+static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer, bool modifiersSupported, GError** error)
+{
+    auto* device = wpe_display_drm_get_device(WPE_DISPLAY_DRM(wpe_view_get_display(view)));
+    auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
+
+    if (forceDMAHeapBufferPath()) {
+        int fd = gbm_device_get_fd(device);
+        auto scanoutBuffer = DRMScanoutBuffer::createDMABufDirect(fd, buffer, error);
+        if (!scanoutBuffer)
+            return nullptr;
+
+        auto* scanoutBufferPtr = scanoutBuffer.get();
+        wpe_buffer_set_user_data(buffer, scanoutBuffer.release(), reinterpret_cast<GDestroyNotify>(+[](void* userData) {
+            delete static_cast<DRMScanoutBuffer*>(userData);
+        }));
+        logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufDirect);
+        return scanoutBufferPtr;
+    }
+
+    struct gbm_bo* bo;
+    if (modifiersSupported) {
+        auto planeCount = wpe_buffer_dma_buf_get_n_planes(dmaBuffer);
+        struct gbm_import_fd_modifier_data fdModifierData = {
+            static_cast<uint32_t>(wpe_buffer_get_width(buffer)),
+            static_cast<uint32_t>(wpe_buffer_get_height(buffer)),
+            wpe_buffer_dma_buf_get_format(dmaBuffer),
+            planeCount, {
+                wpe_buffer_dma_buf_get_fd(dmaBuffer, 0),
+                planeCount > 1 ? wpe_buffer_dma_buf_get_fd(dmaBuffer, 1) : -1,
+                planeCount > 2 ? wpe_buffer_dma_buf_get_fd(dmaBuffer, 2) : -1,
+                planeCount > 3 ? wpe_buffer_dma_buf_get_fd(dmaBuffer, 3) : -1
+            }, {
+                static_cast<int>(wpe_buffer_dma_buf_get_stride(dmaBuffer, 0)),
+                planeCount > 1 ? static_cast<int>(wpe_buffer_dma_buf_get_stride(dmaBuffer, 1)) : 0,
+                planeCount > 2 ? static_cast<int>(wpe_buffer_dma_buf_get_stride(dmaBuffer, 2)) : 0,
+                planeCount > 3 ? static_cast<int>(wpe_buffer_dma_buf_get_stride(dmaBuffer, 3)) : 0
+            }, {
+                static_cast<int>(wpe_buffer_dma_buf_get_offset(dmaBuffer, 0)),
+                planeCount > 1 ? static_cast<int>(wpe_buffer_dma_buf_get_offset(dmaBuffer, 1)) : 0,
+                planeCount > 2 ? static_cast<int>(wpe_buffer_dma_buf_get_offset(dmaBuffer, 2)) : 0,
+                planeCount > 3 ? static_cast<int>(wpe_buffer_dma_buf_get_offset(dmaBuffer, 3)) : 0
+            },
+            wpe_buffer_dma_buf_get_modifier(dmaBuffer)
+        };
+        bo = gbm_bo_import(device, GBM_BO_IMPORT_FD_MODIFIER, &fdModifierData, GBM_BO_USE_SCANOUT);
+    } else {
+        struct gbm_import_fd_data fdData = {
+            wpe_buffer_dma_buf_get_fd(dmaBuffer, 0),
+            static_cast<uint32_t>(wpe_buffer_get_width(buffer)),
+            static_cast<uint32_t>(wpe_buffer_get_height(buffer)),
+            wpe_buffer_dma_buf_get_stride(dmaBuffer, 0),
+            wpe_buffer_dma_buf_get_format(dmaBuffer)
+        };
+        bo = gbm_bo_import(device, GBM_BO_IMPORT_FD, &fdData, GBM_BO_USE_SCANOUT);
+    }
+    if (!bo) {
+        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to import buffer for scanout");
+        return nullptr;
+    }
+
+    auto drmBuffer = WPE::DRM::Buffer::create(bo);
+    if (!drmBuffer) {
+        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to create DRM frame buffer");
+        gbm_bo_destroy(bo);
+        return nullptr;
+    }
+
+    auto scanoutBuffer = DRMScanoutBuffer::createDMABuf(WTF::move(drmBuffer));
+    auto* scanoutBufferPtr = scanoutBuffer.get();
+    wpe_buffer_set_user_data(buffer, scanoutBuffer.release(), reinterpret_cast<GDestroyNotify>(+[](void* userData) {
+        delete static_cast<DRMScanoutBuffer*>(userData);
+    }));
+    logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufGBM);
+    return scanoutBufferPtr;
+}
+
+static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer, GError** error)
+{
+    auto* priv = view->priv;
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+
+    for (unsigned i = 0; i < priv->shmScanoutBuffers.size(); ++i) {
+        auto index = (priv->nextSHMScanoutBufferIndex + i) % priv->shmScanoutBuffers.size();
+        auto& candidate = priv->shmScanoutBuffers[index];
+        if (candidate
+            && (candidate.get() == priv->committedScanoutBuffer
+                || (priv->pendingBuffer && candidate.get() == priv->pendingScanoutBuffer)))
+            continue;
+
+        if (!candidate || !candidate->matchesSHMBuffer(buffer)) {
+            candidate = DRMScanoutBuffer::createSHMDumb(fd, buffer, error);
+            if (!candidate)
+                return nullptr;
+        } else if (!candidate->copyFromSHM(buffer, error))
+            return nullptr;
+
+        priv->nextSHMScanoutBufferIndex = (index + 1) % priv->shmScanoutBuffers.size();
+        logBufferPathOnce(DRMScanoutBuffer::Kind::SHMDumb);
+        return candidate.get();
+    }
+
+    g_warning("SHM dumb buffers busy: committedScanout=%p pendingScanout=%p committedBuffer=%p pendingBuffer=%p",
+        priv->committedScanoutBuffer, priv->pendingScanoutBuffer, priv->committedBuffer.get(), priv->pendingBuffer.get());
+    g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: no reusable SHM dumb framebuffer available while page flip is pending");
+    return nullptr;
+}
+
+static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* buffer, OutputRotation rotation, GError** error)
+{
+    auto* priv = view->priv;
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+
+    for (unsigned i = 0; i < priv->rotatedScanoutBuffers.size(); ++i) {
+        auto index = (priv->nextRotatedScanoutBufferIndex + i) % priv->rotatedScanoutBuffers.size();
+        auto& candidate = priv->rotatedScanoutBuffers[index];
+        if (candidate
+            && (candidate.get() == priv->committedScanoutBuffer
+                || (priv->pendingBuffer && candidate.get() == priv->pendingScanoutBuffer)))
+            continue;
+
+        if (!candidate || !candidate->matchesRotatedDMABuf(buffer, rotation)) {
+            candidate = DRMScanoutBuffer::createRotatedDMABufDumb(fd, buffer, rotation, error);
+            if (!candidate)
+                return nullptr;
+        } else if (!candidate->copyRotatedFromDMABuf(buffer, rotation, error))
+            return nullptr;
+
+        priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
+        logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufRotatedDumb);
+        return candidate.get();
+    }
+
+    g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: no reusable rotated framebuffer available while page flip is pending");
+    return nullptr;
+}
+
+static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffer, OutputRotation rotation, GError** error)
+{
+    auto* priv = view->priv;
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+
+    for (unsigned i = 0; i < priv->rotatedScanoutBuffers.size(); ++i) {
+        auto index = (priv->nextRotatedScanoutBufferIndex + i) % priv->rotatedScanoutBuffers.size();
+        auto& candidate = priv->rotatedScanoutBuffers[index];
+        if (candidate
+            && (candidate.get() == priv->committedScanoutBuffer
+                || (priv->pendingBuffer && candidate.get() == priv->pendingScanoutBuffer)))
+            continue;
+
+        if (!candidate || !candidate->matchesRotatedSHM(buffer, rotation)) {
+            candidate = DRMScanoutBuffer::createRotatedSHMDumb(fd, buffer, rotation, error);
+            if (!candidate)
+                return nullptr;
+        } else if (!candidate->copyRotatedFromSHM(buffer, rotation, error))
+            return nullptr;
+
+        priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
+        logBufferPathOnce(DRMScanoutBuffer::Kind::SHMRotatedDumb);
+        return candidate.get();
+    }
+
+    g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: no reusable rotated SHM framebuffer available while page flip is pending");
+    return nullptr;
+}
+
+static DRMScanoutBuffer* drmScanoutBufferForRender(WPEViewDRM* view, WPEBuffer* buffer, OutputRotation rotation, GError** error)
+{
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+
+    if (WPE_IS_BUFFER_DMA_BUF(buffer)) {
+        if (rotation != OutputRotation::Rotate0)
+            return nextRotatedDMABufBuffer(view, buffer, rotation, error);
+
+        auto* scanoutBuffer = static_cast<DRMScanoutBuffer*>(wpe_buffer_get_user_data(buffer));
+        if (!scanoutBuffer)
+            scanoutBuffer = drmBufferCreateDMABuf(WPE_VIEW(view), buffer, wpe_display_drm_supports_modifiers(display), error);
+        return scanoutBuffer;
+    }
+
+    if (WPE_IS_BUFFER_SHM(buffer)) {
+        if (rotation != OutputRotation::Rotate0)
+            return nextRotatedSHMBuffer(view, buffer, rotation, error);
+        return nextSHMDumbBuffer(view, buffer, error);
+    }
+
+    g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: unsupported buffer");
+    return nullptr;
+}
+
+static bool drmAtomicAddProperty(drmModeAtomicReq* request, uint32_t id, const WPE::DRM::Property& property)
+{
+    if (!property.first)
+        return false;
+
+    return drmModeAtomicAddProperty(request, id, property.first, property.second) > 0;
+}
+
+static bool addCrtcProperties(drmModeAtomicReq* request, const WPE::DRM::Crtc& crtc, uint32_t modeID)
+{
+    auto properties = crtc.properties();
+    properties.active.second = 1;
+    properties.modeID.second = modeID;
+
+    bool success = drmAtomicAddProperty(request, crtc.id(), properties.active);
+    success &= drmAtomicAddProperty(request, crtc.id(), properties.modeID);
+    return success;
+}
+
+static bool addConnectorProperties(drmModeAtomicReq* request, const WPE::DRM::Connector& connector, uint32_t crtcID)
+{
+    auto properties = connector.properties();
+    properties.crtcID.second = crtcID;
+    properties.linkStatus.second = DRM_MODE_LINK_STATUS_GOOD;
+
+    bool success = drmAtomicAddProperty(request, connector.id(), properties.crtcID);
+    success &= drmAtomicAddProperty(request, connector.id(), properties.linkStatus);
+    return success;
+}
+
+WPE::DRM::Plane::Properties emptyPlaneProperties(const WPE::DRM::Plane& plane)
+{
+    auto properties = plane.properties();
+    properties.crtcID.second = 0;
+    properties.crtcX.second = 0;
+    properties.crtcY.second = 0;
+    properties.crtcW.second = 0;
+    properties.crtcH.second = 0;
+    properties.fbID.second = 0;
+    properties.srcX.second = 0;
+    properties.srcY.second = 0;
+    properties.srcW.second = 0;
+    properties.srcH.second = 0;
+    properties.fbDamageClips.second = 0;
+    properties.rotation.second = drmPlaneRotate0Value();
+    return properties;
+}
+
+static bool shouldStretchToMode()
+{
+    return !strcmp(drmFitMode(), "stretch");
+}
+
+static bool shouldUsePanelNativeFit()
+{
+    return !strcmp(drmFitMode(), "panel-native");
+}
+
+static std::optional<uint32_t> configuredRotatedXOffset(uint32_t maxOffset)
+{
+    const char* value = getenv("WPE_DRM_ROTATED_X");
+    if (!value || !*value)
+        value = "111";
+
+    char* end = nullptr;
+    auto offset = strtol(value, &end, 10);
+    if (end == value || offset < 0)
+        return std::nullopt;
+    return std::min<uint32_t>(static_cast<uint32_t>(offset), maxOffset);
+}
+
+static void destinationRectForBuffer(drmModeModeInfo* mode, const DRMScanoutBuffer& buffer, uint32_t& x, uint32_t& y, uint32_t& width, uint32_t& height)
+{
+    x = 0;
+    y = 0;
+    width = mode->hdisplay;
+    height = mode->vdisplay;
+
+    if (shouldUsePanelNativeFit()) {
+        auto panel = configuredPanelSize();
+        bool framebufferIsRotatedPanel = buffer.width() == panel.height && buffer.height() == panel.width;
+        if (framebufferIsRotatedPanel) {
+            width = std::min<uint32_t>(buffer.width(), mode->hdisplay);
+            height = std::min<uint32_t>(buffer.height(), mode->vdisplay);
+            uint32_t maxX = mode->hdisplay > width ? mode->hdisplay - width : 0;
+            if (auto configuredX = configuredRotatedXOffset(maxX))
+                x = configuredX.value();
+            y = mode->vdisplay > height ? (mode->vdisplay - height) / 2 : 0;
+        }
+        return;
+    }
+
+    if (shouldStretchToMode() || !buffer.width() || !buffer.height())
+        return;
+
+    double scaleX = static_cast<double>(mode->hdisplay) / buffer.width();
+    double scaleY = static_cast<double>(mode->vdisplay) / buffer.height();
+    double scale = std::min(scaleX, scaleY);
+    width = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(buffer.width() * scale)));
+    height = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(buffer.height() * scale)));
+    x = (mode->hdisplay - width) / 2;
+    y = (mode->vdisplay - height) / 2;
+}
+
+WPE::DRM::Plane::Properties primaryPlaneProperties(const WPE::DRM::Plane& plane, uint32_t crtcID, drmModeModeInfo* mode, const DRMScanoutBuffer& buffer, std::optional<uint32_t> damageID)
+{
+    auto properties = plane.properties();
+    uint32_t destinationX = 0;
+    uint32_t destinationY = 0;
+    uint32_t destinationWidth = 0;
+    uint32_t destinationHeight = 0;
+    destinationRectForBuffer(mode, buffer, destinationX, destinationY, destinationWidth, destinationHeight);
+    properties.crtcID.second = crtcID;
+    properties.crtcX.second = destinationX;
+    properties.crtcY.second = destinationY;
+    properties.crtcW.second = destinationWidth;
+    properties.crtcH.second = destinationHeight;
+    properties.fbID.second = buffer.frameBufferID();
+    properties.srcX.second = 0;
+    properties.srcY.second = 0;
+    properties.srcW.second = (static_cast<uint64_t>(buffer.width()) << 16);
+    properties.srcH.second = (static_cast<uint64_t>(buffer.height()) << 16);
+    properties.rotation.second = drmPlaneRotate0Value();
+    static guint64 commitLogCounter = 0;
+    commitLogCounter++;
+    if (commitLogCounter <= 8 || !(commitLogCounter % 60)) {
+        auto panel = configuredPanelSize();
+        g_message("WPEViewDRM commit fit=%s panel=%ux%u drm_mode=%ux%u framebuffer=%ux%u src=%ux%u crtc=%ux%u+%u+%u commit=%" G_GUINT64_FORMAT,
+            drmFitMode(), panel.width, panel.height,
+            mode->hdisplay, mode->vdisplay,
+            buffer.width(), buffer.height(),
+            buffer.width(), buffer.height(),
+            destinationWidth, destinationHeight, destinationX, destinationY,
+            commitLogCounter);
+    }
+    if (properties.fbDamageClips.first && damageID)
+        properties.fbDamageClips.second = damageID.value();
+    if (properties.inFenceFD.first) {
+        if (const auto& inFenceFD = buffer.fenceFD())
+            properties.inFenceFD.second = inFenceFD.value();
+    }
+    return properties;
+}
+
+WPE::DRM::Plane::Properties cursorPlaneProperties(uint32_t crtcID, const WPE::DRM::Cursor& cursor)
+{
+    auto properties = cursor.plane().properties();
+    properties.crtcID.second = crtcID;
+    properties.crtcX.second = cursor.x();
+    properties.crtcY.second = cursor.y();
+    properties.crtcW.second = gbm_bo_get_width(cursor.buffer()->bufferObject());
+    properties.crtcH.second = gbm_bo_get_width(cursor.buffer()->bufferObject());
+    properties.fbID.second = cursor.buffer()->frameBufferID();
+    properties.srcX.second = 0;
+    properties.srcY.second = 0;
+    properties.srcW.second = (static_cast<uint64_t>(gbm_bo_get_width(cursor.buffer()->bufferObject())) << 16);
+    properties.srcH.second = (static_cast<uint64_t>(gbm_bo_get_width(cursor.buffer()->bufferObject())) << 16);
+    properties.rotation.second = drmPlaneRotate0Value();
+    return properties;
+}
+
+static bool addPlaneProperties(drmModeAtomicReq* request, const WPE::DRM::Plane& plane, WPE::DRM::Plane::Properties&& properties)
+{
+    bool success = drmAtomicAddProperty(request, plane.id(), properties.crtcID);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.crtcX);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.crtcY);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.crtcW);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.crtcH);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.fbID);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.srcX);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.srcY);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.srcW);
+    success &= drmAtomicAddProperty(request, plane.id(), properties.srcH);
+    if (properties.fbDamageClips.first)
+        success &= drmAtomicAddProperty(request, plane.id(), properties.fbDamageClips);
+    if (properties.rotation.first)
+        success &= drmAtomicAddProperty(request, plane.id(), properties.rotation);
+    return success;
+}
+
+static bool bufferUsesSynchronousCommit(DRMScanoutBuffer* buffer)
+{
+    if (!buffer)
+        return false;
+    return buffer->kind() == DRMScanoutBuffer::Kind::SHMDumb
+        || buffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb
+        || buffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb;
+}
+
+static bool wpeViewDRMCommitAtomic(WPEViewDRM* view, DRMScanoutBuffer* buffer, std::optional<uint32_t> damageID, GError** error)
+{
+    WPE::DRM::UniquePtr<drmModeAtomicReq> request(drmModeAtomicAlloc());
+    bool synchronousCommit = bufferUsesSynchronousCommit(buffer);
+    uint32_t flags = synchronousCommit ? 0 : (DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK);
+
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto* screen = WPE_SCREEN_DRM(wpeDisplayDRMGetScreen(display));
+    auto& crtc = wpeScreenDRMGetCrtc(screen);
+    auto* mode = wpeScreenDRMGetMode(screen);
+    auto fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    if (!crtc.modeIsCurrent(mode)) {
+        flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+        if (!view->priv->modeBlob) {
+            uint32_t blobID;
+            auto result = drmModeCreatePropertyBlob(fd, mode, sizeof(drmModeModeInfo), &blobID);
+            if (result < 0) {
+                g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to crate blob from DRM mode: %s", safeStrerror(-result).data());
+                return false;
+            }
+
+            view->priv->modeBlob = blobID;
+        }
+
+        const auto& connector = wpeDisplayDRMGetConnector(display);
+        bool success = addCrtcProperties(request.get(), crtc, view->priv->modeBlob.value());
+        success &= addConnectorProperties(request.get(), connector, crtc.id());
+        if (!success) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to set DRM mode");
+            return false;
+        }
+    }
+
+    auto& plane = wpeDisplayDRMGetPrimaryPlane(display);
+    if (!addPlaneProperties(request.get(), plane, buffer ? primaryPlaneProperties(plane, crtc.id(), mode, *buffer, damageID) : emptyPlaneProperties(plane))) {
+        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to set plane properties");
+        return false;
+    }
+
+    if (auto* cursor = wpeDisplayDRMGetCursor(display))
+        addPlaneProperties(request.get(), cursor->plane(), cursor->buffer() ? cursorPlaneProperties(crtc.id(), *cursor) : emptyPlaneProperties(cursor->plane()));
+
+    if (drmModeAtomicCommit(fd, request.get(), flags, view)) {
+        g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to commit properties: %s", strerror(errno));
+        return false;
+    }
+
+    if (flags & DRM_MODE_ATOMIC_ALLOW_MODESET)
+        crtc.setCurrentMode(mode);
+
+    wpeScreenDRMDestroyDumbBufferIfNeeded(screen, fd);
+
+    return true;
+}
+
+static bool wpeViewDRMCommitLegacy(WPEViewDRM* view, const DRMScanoutBuffer& buffer, GError** error)
+{
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto* screen = WPE_SCREEN_DRM(wpeDisplayDRMGetScreen(display));
+    auto& crtc = wpeScreenDRMGetCrtc(screen);
+    auto* mode = wpeScreenDRMGetMode(screen);
+    auto fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    if (!crtc.modeIsCurrent(mode)) {
+        const auto& connector = wpeDisplayDRMGetConnector(display);
+        auto connectorID = connector.id();
+        if (drmModeSetCrtc(fd, crtc.id(), buffer.frameBufferID(), 0, 0, &connectorID, 1, mode)) {
+            g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to set CRTC");
+            return false;
+        }
+
+        crtc.setCurrentMode(mode);
+    }
+
+    // FIXME: support cursors in legacy mode.
+
+    if (drmModePageFlip(fd, crtc.id(), buffer.frameBufferID(), DRM_MODE_PAGE_FLIP_EVENT, view)) {
+        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to request page flip");
+        return false;
+    }
+
+    wpeScreenDRMDestroyDumbBufferIfNeeded(screen, fd);
+
+    return true;
+}
+
+static std::pair<uint32_t, uint64_t> wpeBufferFormat(WPEBuffer* buffer)
+{
+    if (WPE_IS_BUFFER_DMA_BUF(buffer)) {
+        auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
+        return { wpe_buffer_dma_buf_get_format(dmaBuffer), wpe_buffer_dma_buf_get_modifier(dmaBuffer) };
+    }
+
+    if (WPE_IS_BUFFER_SHM(buffer) && wpe_buffer_shm_get_format(WPE_BUFFER_SHM(buffer)) == WPE_PIXEL_FORMAT_ARGB8888)
+        return { DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID };
+
+    return { DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID };
+}
+
+static std::optional<uint32_t> buildDamageBlob(WPEDisplayDRM* display, const Vector<drm_mode_rect>& damageRects, GError** error)
+{
+    if (damageRects.isEmpty())
+        return std::nullopt;
+
+    uint32_t blobID;
+    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    auto result = drmModeCreatePropertyBlob(fd, damageRects.span().data(), damageRects.sizeInBytes(), &blobID);
+    if (result < 0) {
+        g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: failed to crate damage blob: %s", safeStrerror(-result).data());
+        return 0;
+    }
+
+    return blobID;
+}
+
+static void destroyDamageBlob(WPEDisplayDRM* display, uint32_t blobID)
+{
+    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    drmModeDestroyPropertyBlob(fd, blobID);
+}
+
+static void setDamageRects(Vector<drm_mode_rect>& destination, const WPERectangle* damageRects, guint nDamageRects)
+{
+    destination.clear();
+    destination.reserveInitialCapacity(nDamageRects);
+    for (unsigned i = 0; i < nDamageRects; ++i)
+        destination.append({ damageRects[i].x, damageRects[i].y, damageRects[i].x + damageRects[i].width, damageRects[i].y + damageRects[i].height });
+}
+
+static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+{
+    auto* priv = view->priv;
+    auto* buffer = priv->pendingBuffer ? priv->pendingBuffer.get() : priv->committedBuffer.get();
+    DRMScanoutBuffer* drmBuffer = nullptr;
+    auto rotation = priv->outputRotation;
+    bool needsScanoutRebuild = buffer && (rotation != OutputRotation::Rotate0
+        || (priv->committedScanoutBuffer
+            && (priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb
+                || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb)));
+    if (priv->pendingBuffer || needsScanoutRebuild) {
+        gint64 copyStartUS = g_get_monotonic_time();
+        drmBuffer = drmScanoutBufferForRender(view, buffer, rotation, error);
+        if (!drmBuffer)
+            return FALSE;
+
+        if (drmBuffer->kind() == DRMScanoutBuffer::Kind::SHMDumb
+            || drmBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb
+            || drmBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb)
+            priv->copyTotalUS += g_get_monotonic_time() - copyStartUS;
+        if (rotation != OutputRotation::Rotate0)
+            priv->damageRects.clear();
+
+        if (priv->pendingBuffer) {
+            drmBuffer->setFenceFD(UnixFileDescriptor { wpe_buffer_take_rendering_fence(buffer), UnixFileDescriptor::Adopt });
+            priv->pendingScanoutBuffer = drmBuffer;
+        } else
+            priv->committedScanoutBuffer = drmBuffer;
+    } else
+        drmBuffer = priv->committedScanoutBuffer;
+
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    gint64 commitStartUS = g_get_monotonic_time();
+    if (wpe_display_drm_supports_atomic(display)) {
+        auto damageID = drmBuffer ? buildDamageBlob(display, priv->damageRects, error) : std::nullopt;
+        if (damageID.has_value() && !damageID.value())
+            return FALSE;
+
+        auto result = wpeViewDRMCommitAtomic(WPE_VIEW_DRM(view), drmBuffer, damageID, error);
+        if (damageID)
+            destroyDamageBlob(display, damageID.value());
+        priv->damageRects.clear();
+        priv->commitTotalUS += g_get_monotonic_time() - commitStartUS;
+        if (result && drmBuffer)
+            priv->lastFrameCommitUS = commitStartUS;
+        priv->lastCommitWasSynchronous = result && bufferUsesSynchronousCommit(drmBuffer);
+        return result;
+    }
+
+    if (!drmBuffer) {
+        g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: no DRM buffer to commit");
+        return FALSE;
+    }
+
+    auto result = wpeViewDRMCommitLegacy(WPE_VIEW_DRM(view), *drmBuffer, error);
+    priv->commitTotalUS += g_get_monotonic_time() - commitStartUS;
+    if (result)
+        priv->lastFrameCommitUS = commitStartUS;
+    return result;
+}
+
+static gboolean wpeViewDRMRenderBuffer(WPEView* view, WPEBuffer* buffer, const WPERectangle* damageRects, guint nDamageRects, GError** error)
+{
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(view));
+    auto& plane = wpeDisplayDRMGetPrimaryPlane(display);
+    auto format = wpeBufferFormat(buffer);
+    if (!plane.supportsFormat(format.first, format.second)) {
+        g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render buffer: buffer format 0x%x modifier 0x%" G_GINT64_MODIFIER "x is not supported by DRM plane", format.first, static_cast<gint64>(format.second));
+        return FALSE;
+    }
+
+    auto* priv = WPE_VIEW_DRM(view)->priv;
+    if (priv->updateFlags.contains(UpdateFlags::CursorUpdateRequested) && !priv->committedBuffer) {
+        priv->updateFlags.remove(UpdateFlags::CursorUpdateRequested);
+        priv->updateFlags.remove(UpdateFlags::CursorUpdatePending);
+    }
+    if (priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
+        wpeViewDRMQueueBuffer(WPE_VIEW_DRM(view), buffer, damageRects, nDamageRects);
+        return TRUE;
+    }
+
+    gint64 throttleDelayUS = 0;
+    if (priv->frameThrottleSource || (priv->committedBuffer && wpeViewDRMThrottleDelay(WPE_VIEW_DRM(view), throttleDelayUS))) {
+        wpeViewDRMQueueBuffer(WPE_VIEW_DRM(view), buffer, damageRects, nDamageRects);
+        if (!priv->frameThrottleSource)
+            wpeViewDRMScheduleQueuedCommit(WPE_VIEW_DRM(view), throttleDelayUS);
+        return TRUE;
+    }
+
+    priv->pendingBuffer = buffer;
+    setDamageRects(priv->damageRects, damageRects, nDamageRects);
+
+    if (priv->cursorUpdateTimer)
+        priv->cursorUpdateTimer->stop();
+    if (wpeViewDRMRequestUpdate(WPE_VIEW_DRM(view), error)) {
+        priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
+        wpeViewDRMCompleteSynchronousCommitIfNeeded(WPE_VIEW_DRM(view));
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void wpeViewDRMSetCursorFromName(WPEView* view, const char* name)
+{
+    if (auto* cursor = wpeDisplayDRMGetCursor(WPE_DISPLAY_DRM(wpe_view_get_display(view))))
+        cursor->setFromName(name, wpe_view_get_scale(view));
+}
+
+static void wpeViewDRMSetCursorFromBytes(WPEView* view, GBytes* bytes, guint width, guint height, guint stride, guint hotspotX, guint hotspotY)
+{
+    if (auto* cursor = wpeDisplayDRMGetCursor(WPE_DISPLAY_DRM(wpe_view_get_display(view))))
+        cursor->setFromBytes(bytes, width, height, stride, hotspotX, hotspotY);
+}
+
+static void wpeViewDRMScheduleCursorUpdate(WPEViewDRM* view)
+{
+    auto* priv = view->priv;
+    if (priv->cursorUpdateTimer && priv->cursorUpdateTimer->isActive())
+        return;
+
+    if (!priv->cursorUpdateTimer) {
+        priv->cursorUpdateTimer = makeUnique<RunLoop::Timer>(RunLoop::currentSingleton(), "_WPEViewDRMPrivate::cursorUpdateTimer"_s, [view] {
+            if (wpeViewDRMRequestUpdate(view, nullptr))
+                view->priv->updateFlags.add(UpdateFlags::CursorUpdateRequested);
+        });
+    }
+
+    // Wait until the end of the frame to do the cursor update.
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto* screen = WPE_SCREEN_DRM(wpeDisplayDRMGetScreen(display));
+    auto crtcIndex = wpeScreenDRMGetCrtc(screen).index();
+    int crtcBitmask = 0;
+    if (crtcIndex > 1)
+        crtcBitmask = ((crtcIndex << DRM_VBLANK_HIGH_CRTC_SHIFT) & DRM_VBLANK_HIGH_CRTC_MASK);
+    else if (crtcIndex > 0)
+        crtcBitmask = DRM_VBLANK_SECONDARY;
+
+    drmVBlank vblank;
+    vblank.request.type = static_cast<drmVBlankSeqType>(DRM_VBLANK_RELATIVE | crtcBitmask);
+    vblank.request.sequence = 0;
+    vblank.request.signal = 0;
+    drmWaitVBlank(gbm_device_get_fd(wpe_display_drm_get_device(display)), &vblank);
+
+    auto lastVBlank = Seconds::fromMicroseconds(vblank.reply.tval_sec * G_USEC_PER_SEC + vblank.reply.tval_usec);
+    auto elapsed = MonotonicTime::now().secondsSinceEpoch() - lastVBlank;
+    priv->cursorUpdateTimer->startOneShot(priv->refreshDuration - elapsed - 1_ms);
+}
+
+static void wpeViewDRMDidPageFlip(WPEViewDRM* view)
+{
+    auto* priv = view->priv;
+    auto updateFlags = std::exchange(priv->updateFlags, OptionSet<UpdateFlags> { });
+    priv->pageFlipCount++;
+    if (updateFlags.contains(UpdateFlags::BufferUpdateRequested))
+        wpeViewDRMFinishBufferCommit(view);
+
+    if (updateFlags.contains(UpdateFlags::BufferUpdatePending)) {
+        gint64 delayUS = 0;
+        if (wpeViewDRMThrottleDelay(view, delayUS)) {
+            priv->updateFlags.add(UpdateFlags::BufferUpdatePending);
+            wpeViewDRMScheduleQueuedCommit(view, delayUS);
+        } else
+            wpeViewDRMCommitQueuedBuffer(view, nullptr);
+    } else if (updateFlags.contains(UpdateFlags::CursorUpdatePending))
+        wpeViewDRMScheduleCursorUpdate(view);
+}
+
+void wpeViewDRMUpdateCursor(WPEViewDRM* view, double x, double y)
+{
+    auto* cursor = wpeDisplayDRMGetCursor(WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view))));
+    if (!cursor)
+        return;
+
+    if (!cursor->setPosition(x, y))
+        return;
+
+    if (view->priv->updateFlags.containsAny({ UpdateFlags::CursorUpdateRequested, UpdateFlags::BufferUpdateRequested })) {
+        view->priv->updateFlags.add(UpdateFlags::CursorUpdatePending);
+        return;
+    }
+
+    wpeViewDRMScheduleCursorUpdate(view);
+}
+
+static void wpe_view_drm_class_init(WPEViewDRMClass* viewDRMClass)
+{
+    GObjectClass* objectClass = G_OBJECT_CLASS(viewDRMClass);
+    objectClass->constructed = wpeViewDRMConstructed;
+    objectClass->dispose = wpeViewDRMDispose;
+
+    WPEViewClass* viewClass = WPE_VIEW_CLASS(viewDRMClass);
+    viewClass->render_buffer = wpeViewDRMRenderBuffer;
+    viewClass->set_cursor_from_name = wpeViewDRMSetCursorFromName;
+    viewClass->set_cursor_from_bytes = wpeViewDRMSetCursorFromBytes;
+}
