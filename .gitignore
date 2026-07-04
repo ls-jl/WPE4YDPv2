@@ -21,7 +21,6 @@ build/
 *.zip
 tools/*.tar.bz2
 tools/*.zip
-!assets/wpe-drm2-runtime.tar.gz
 !debian-12-arm64_20260526.tar
 !tools/*.tar.bz2
 !tools/*.zip
@@ -33,6 +32,8 @@ libs/**/*.so
 !libs/**
 !assets/mesa/
 !assets/mesa/**
+!assets/wpe-runtime/
+!assets/wpe-runtime/**
 
 # Logs and crash dumps
 *.log

@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="utf-8"?>
+<familyset>
+    <!-- first font is default -->
+    <family name="PuHuiTi">
+        <font weight="400">Alibaba-PuHuiTi-Regular.otf</font>
+    </family>
+    <!-- nunito sans -->
+    <family name="Nunito Sans">
+        <font weight="400">HarmonyOS_Sans_SC_Regular.ttf</font>
+        <font weight="500">HarmonyOS_Sans_SC_Medium.ttf</font>
+        <font weight="700">HarmonyOS_Sans_SC_Bold.ttf</font>
+    </family>
+    <family name="Poppins">
+        <font weight="400">HarmonyOS_Sans_SC_Regular.ttf</font>
+        <font weight="500">HarmonyOS_Sans_SC_Medium.ttf</font>
+        <font weight="600">HarmonyOS_Sans_SC_Medium.ttf</font>
+        <font weight="700">HarmonyOS_Sans_SC_Bold.ttf</font>
+    </family>
+	
+	 <family name="OPPOSans">
+        <font weight="400">HarmonyOS_Sans_SC_Regular.ttf</font>
+        <font weight="500">HarmonyOS_Sans_SC_Medium.ttf</font>
+        <font weight="700">HarmonyOS_Sans_SC_Bold.ttf</font>
+    </family>
+	 <family name="STXihei_CP">
+        <font weight="400">STXihei_CP.ttf</font>
+    </family>
+	<family name="Noto Sans">
+        <font weight="400">NotoSans-Regular.ttf</font>
+		<font weight="700">NotoSans-Bold.ttf</font>
+    </family>
+	
+	 <family name="Castoro">
+        <font weight="400">Castoro-Regular.ttf</font>
+    </family>
+    <!-- icon fonts -->
+    <family name="falcon-icons">
+        <font weight="400">falcon-icons.ttf</font>
+    </family>
+    <family name="HarmonyOS Sans SC">
+        <font weight="400">HarmonyOS_Sans_SC_Regular.ttf</font>
+        <font weight="500">HarmonyOS_Sans_SC_Medium.ttf</font>
+        <font weight="700">HarmonyOS_Sans_SC_Bold.ttf</font>
+    </family>
+    <family name="NotoSansEthiopic">
+        <font weight="400">NotoSansEthiopic.ttf</font>
+    </family>
+    <family name="NotoNaskhArabic">
+        <font weight="400">NotoNaskhArabic.ttf</font>
+    </family>
+    <family name="NotoSansArmenian">
+        <font weight="400">NotoSansArmenian.ttf</font>
+    </family>
+    <family name="NotoSansBengali">
+        <font weight="400">NotoSansBengali.ttf</font>
+    </family>
+    <family name="NotoSansGujarati">
+        <font weight="400">NotoSansGujarati.ttf</font>
+    </family>
+    <family name="NotoSansGurmukhi">
+        <font weight="400">NotoSansGurmukhi.ttf</font>
+    </family>
+    <family name="NotoSansHebrew">
+        <font weight="400">NotoSansHebrew.ttf</font>
+    </family>
+    <family name="NotoSansKhmer">
+        <font weight="400">NotoSansKhmer.ttf</font>
+    </family>
+    <family name="NotoSansLao">
+        <font weight="400">NotoSansLao.ttf</font>
+    </family>
+    <family name="NotoSansMalayalam">
+        <font weight="400">NotoSansMalayalam.ttf</font>
+    </family>
+    <family name="NotoSansMyanmar">
+        <font weight="400">NotoSansMyanmar.ttf</font>
+    </family>
+    <family name="NotoSansSinhala">
+        <font weight="400">NotoSansSinhala.ttf</font>
+    </family>
+    <family name="NotoSansTelugu">
+        <font weight="400">NotoSansTelugu.ttf</font>
+    </family>
+    <family name="NotoSerifDevanagari">
+        <font weight="400">NotoSerifDevanagari.ttf</font>
+    </family>
+    <family name="NotoSerifGeorgian">
+        <font weight="400">NotoSerifGeorgian.ttf</font>
+    </family>
+    <family name="NotoSerifKannada">
+        <font weight="400">NotoSerifKannada.ttf</font>
+    </family>
+    <family name="NotoSerifTamil">
+        <font weight="400">NotoSerifTamil.ttf</font>
+    </family>
+    <family name="NotoSansJP">
+        <font weight="400">NotoSansJP.otf</font>
+    </family>
+    <family name="NotoSansKR">
+        <font weight="400">NotoSansKR-Regular.otf</font>
+    </family>
+    <family name="NotoSansThai">
+        <font weight="400">NotoSansThai-Regular.ttf</font>
+        <font weight="500">NotoSansThai-Medium.ttf</font>
+    </family>
+    <family name="NotoSansMalayalam">
+        <font weight="400">NotoSansMalayalam-Regular.ttf</font>
+    </family>
+    <family name="NotoSerifKannada">
+        <font weight="400">NotoSerifKannada-Regular.ttf</font>
+    </family>
+    <family name="Gkai00m">
+        <font weight="400">gkai00mp.ttf</font>
+    </family>
+    <family>
+        <font weight="400">Adobe.otf</font>
+    </family>
+    <family>
+        <font weight="400">HarmonyOS_Sans_SC_Regular.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSans-Regular.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansKR-Regular.otf</font>
+        <font weight="500">NotoSansKR-Medium.otf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansThai-Regular.ttf</font>
+        <font weight="500">NotoSansThai-Medium.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansEthiopic.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoNaskhArabic.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansArmenian.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansBengali.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansGujarati.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansGurmukhi.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansHebrew.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansKhmer.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansLao.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansMalayalam.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansMyanmar.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansSinhala.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansTelugu.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSerifDevanagari.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSerifGeorgian.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSerifKannada.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSerifTamil.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansJP.otf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansMalayalam-Regular.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSerifKannada-Regular.ttf</font>
+    </family>
+    <family>
+        <font weight="400">NotoSansSC-Regular.otf</font>
+    </family>
+    <family>
+        <font weight="400">STXihei_CP.ttf</font>
+    </family>
+</familyset>

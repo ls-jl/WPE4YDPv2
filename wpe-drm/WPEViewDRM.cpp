@@ -107,6 +107,30 @@ static PanelSize configuredPanelSize()
     return size;
 }
 
+static bool chromeLayoutResizeEnabled()
+{
+    const char* value = getenv("WPE_CHROME_LAYOUT");
+    if (!value || !*value)
+        return true;
+    if (!g_ascii_strcasecmp(value, "resize"))
+        return true;
+    if (!g_ascii_strcasecmp(value, "overlay"))
+        return false;
+    return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off") && g_ascii_strcasecmp(value, "no");
+}
+
+static PanelSize scanoutPanelForSource(uint32_t sourceWidth, uint32_t sourceHeight)
+{
+    PanelSize sourcePanel { sourceWidth, sourceHeight };
+    if (!chromeLayoutResizeEnabled())
+        return sourcePanel;
+
+    auto panel = configuredPanelSize();
+    if (panel.width >= sourceWidth && panel.height >= sourceHeight)
+        return panel;
+    return sourcePanel;
+}
+
 static const char* drmFitMode()
 {
     const char* fit = getenv("WPE_DRM_FIT");
@@ -231,21 +255,37 @@ static void setRotatedPanelPixel(uint8_t* destination, uint32_t destinationPitch
     row[dx] = color;
 }
 
-static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, uint8_t* destination, uint32_t destinationPitch, OutputRotation rotation)
+static void fillARGB8888(uint8_t* destination, uint32_t destinationPitch, uint32_t width, uint32_t height, uint32_t color)
 {
-    auto topInset = chromeReservedTopInset(sourceHeight);
-    if (topInset) {
-        auto destinationWidth = rotatedWidth(sourceWidth, sourceHeight, rotation);
-        auto destinationHeight = rotatedHeight(sourceWidth, sourceHeight, rotation);
-        for (uint32_t y = 0; y < destinationHeight; ++y)
-            memset(destination + static_cast<size_t>(y) * destinationPitch, 0xff, static_cast<size_t>(destinationWidth) * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+        auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(y) * destinationPitch);
+        std::fill(row, row + width, color);
+    }
+}
 
-        uint32_t copyHeight = sourceHeight > topInset ? sourceHeight - topInset : 0;
+static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, uint8_t* destination, uint32_t destinationPitch, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
+{
+    auto destinationWidth = rotatedWidth(panelWidth, panelHeight, rotation);
+    auto destinationHeight = rotatedHeight(panelWidth, panelHeight, rotation);
+    auto topInset = chromeReservedTopInset(panelHeight);
+    if (topInset || panelWidth != sourceWidth || panelHeight != sourceHeight) {
+        fillARGB8888(destination, destinationPitch, destinationWidth, destinationHeight, 0xff000000);
+
+        uint32_t copyWidth = std::min(sourceWidth, panelWidth);
+        uint32_t availableHeight = panelHeight > topInset ? panelHeight - topInset : 0;
+        uint32_t copyHeight = std::min(sourceHeight, availableHeight);
         for (uint32_t sourceY = 0; sourceY < copyHeight; ++sourceY) {
             const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
             uint32_t panelY = sourceY + topInset;
-            for (uint32_t sourceX = 0; sourceX < sourceWidth; ++sourceX)
-                setRotatedPanelPixel(destination, destinationPitch, destinationWidth, destinationHeight, sourceWidth, sourceHeight, rotation, sourceX, panelY, sourceRow[sourceX]);
+            for (uint32_t sourceX = 0; sourceX < copyWidth; ++sourceX)
+                setRotatedPanelPixel(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation, sourceX, panelY, sourceRow[sourceX]);
+        }
+        if (copyWidth && copyHeight && copyHeight < availableHeight) {
+            const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(copyHeight - 1) * sourceStride);
+            for (uint32_t panelY = topInset + copyHeight; panelY < topInset + availableHeight; ++panelY) {
+                for (uint32_t sourceX = 0; sourceX < copyWidth; ++sourceX)
+                    setRotatedPanelPixel(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation, sourceX, panelY, sourceRow[sourceX]);
+            }
         }
         return;
     }
@@ -404,6 +444,10 @@ static uint32_t chromeReservedTopInset(uint32_t panelHeight)
     if (!chrome.enabled)
         return 0;
     auto chromeHeight = std::min<uint32_t>(std::clamp<unsigned>(chrome.height, 24, 80), panelHeight - 1);
+    bool hasPanel = chrome.panel[0] && strcmp(chrome.panel, "none");
+    if (chromeLayoutResizeEnabled())
+        return (chrome.visible || hasPanel) ? chromeHeight : 0;
+
     double fraction = chrome.visible ? 1.0 : 0.0;
     if (chrome.transitionUS > 0) {
         const char* value = getenv("WPE_CHROME_ANIMATION_MS");
@@ -759,11 +803,12 @@ public:
 
         uint32_t sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
         uint32_t sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
         auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::DMABufRotatedDumb));
         scanoutBuffer->m_sourceWidth = sourceWidth;
         scanoutBuffer->m_sourceHeight = sourceHeight;
         scanoutBuffer->m_rotation = rotation;
-        if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(sourceWidth, sourceHeight, rotation), rotatedHeight(sourceWidth, sourceHeight, rotation), error))
+        if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(panel.width, panel.height, rotation), rotatedHeight(panel.width, panel.height, rotation), error))
             return nullptr;
         if (!scanoutBuffer->copyRotatedFromDMABuf(buffer, rotation, error))
             return nullptr;
@@ -798,11 +843,12 @@ public:
 
         uint32_t sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
         uint32_t sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
         auto scanoutBuffer = std::unique_ptr<DRMScanoutBuffer>(new DRMScanoutBuffer(Kind::SHMRotatedDumb));
         scanoutBuffer->m_sourceWidth = sourceWidth;
         scanoutBuffer->m_sourceHeight = sourceHeight;
         scanoutBuffer->m_rotation = rotation;
-        if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(sourceWidth, sourceHeight, rotation), rotatedHeight(sourceWidth, sourceHeight, rotation), error))
+        if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(panel.width, panel.height, rotation), rotatedHeight(panel.width, panel.height, rotation), error))
             return nullptr;
         if (!scanoutBuffer->copyRotatedFromSHM(buffer, rotation, error))
             return nullptr;
@@ -861,11 +907,12 @@ public:
     {
         auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
         auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
         return m_kind == Kind::DMABufRotatedDumb
             && m_sourceWidth == sourceWidth
             && m_sourceHeight == sourceHeight
-            && m_width == rotatedWidth(sourceWidth, sourceHeight, rotation)
-            && m_height == rotatedHeight(sourceWidth, sourceHeight, rotation)
+            && m_width == rotatedWidth(panel.width, panel.height, rotation)
+            && m_height == rotatedHeight(panel.width, panel.height, rotation)
             && m_format == DRM_FORMAT_ARGB8888
             && m_rotation == rotation;
     }
@@ -874,11 +921,12 @@ public:
     {
         auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
         auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
         return m_kind == Kind::SHMRotatedDumb
             && m_sourceWidth == sourceWidth
             && m_sourceHeight == sourceHeight
-            && m_width == rotatedWidth(sourceWidth, sourceHeight, rotation)
-            && m_height == rotatedHeight(sourceWidth, sourceHeight, rotation)
+            && m_width == rotatedWidth(panel.width, panel.height, rotation)
+            && m_height == rotatedHeight(panel.width, panel.height, rotation)
             && m_format == DRM_FORMAT_ARGB8888
             && m_rotation == rotation;
     }
@@ -1003,8 +1051,9 @@ public:
         }
 
         auto* destination = static_cast<uint8_t*>(m_mapping);
-        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, rotation);
-        drawChromeOverlay(destination, m_pitch, m_width, m_height, sourceWidth, sourceHeight, rotation);
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
+        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
+        drawChromeOverlay(destination, m_pitch, m_width, m_height, panel.width, panel.height, rotation);
         return true;
     }
 
@@ -1034,8 +1083,9 @@ public:
 
         const auto* source = static_cast<const uint8_t*>(mappedSource) + sourceOffset;
         auto* destination = static_cast<uint8_t*>(m_mapping);
-        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, rotation);
-        drawChromeOverlay(destination, m_pitch, m_width, m_height, sourceWidth, sourceHeight, rotation);
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
+        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
+        drawChromeOverlay(destination, m_pitch, m_width, m_height, panel.width, panel.height, rotation);
 
         struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
@@ -1675,7 +1725,7 @@ static std::optional<uint32_t> configuredRotatedXOffset(uint32_t maxOffset)
 {
     const char* value = getenv("WPE_DRM_ROTATED_X");
     if (!value || !*value)
-        value = "111";
+        return std::nullopt;
 
     char* end = nullptr;
     auto offset = strtol(value, &end, 10);
@@ -1700,6 +1750,8 @@ static void destinationRectForBuffer(drmModeModeInfo* mode, const DRMScanoutBuff
             uint32_t maxX = mode->hdisplay > width ? mode->hdisplay - width : 0;
             if (auto configuredX = configuredRotatedXOffset(maxX))
                 x = configuredX.value();
+            else
+                x = maxX / 2;
             y = mode->vdisplay > height ? (mode->vdisplay - height) / 2 : 0;
         }
         return;

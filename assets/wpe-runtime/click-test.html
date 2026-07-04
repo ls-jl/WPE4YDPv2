@@ -1,0 +1,8 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:18px sans-serif;overflow:hidden}.btn{position:absolute;width:160px;height:68px;border:2px solid #0f0;background:#064;display:flex;align-items:center;justify-content:center}.a{left:20px;top:20px}.b{left:400px;top:95px}.c{right:20px;bottom:20px}#log{position:absolute;left:8px;bottom:8px;right:8px;color:#ff0;font-size:14px;white-space:pre-wrap}
+</style></head><body><div class="btn a" id="lt">LT</div><div class="btn b" id="mid">MID</div><div class="btn c" id="rb">RB</div><div id="log">ready</div><script>
+let n=0; const log=document.getElementById("log"); function p(s){n++; log.textContent=s; console.log("click-test",n,s)}
+document.addEventListener("touchstart",e=>{const t=e.changedTouches[0]; p("touchstart "+Math.round(t.clientX)+","+Math.round(t.clientY)+" target="+e.target.id)},true);
+document.addEventListener("touchend",e=>{const t=e.changedTouches[0]; p("touchend "+Math.round(t.clientX)+","+Math.round(t.clientY)+" target="+e.target.id)},true);
+document.addEventListener("click",e=>p("click "+Math.round(e.clientX)+","+Math.round(e.clientY)+" target="+e.target.id),true);
+</script></body></html>

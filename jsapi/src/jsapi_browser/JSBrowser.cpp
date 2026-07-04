@@ -2,7 +2,9 @@
 #include "jqutil_v2/JQSignal.h"
 #include "utils/log.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -13,6 +15,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <strings.h>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -30,7 +33,7 @@ namespace browser {
 namespace {
 
 const char* kTag = "miniapp-browser-launcher";
-const char* kRuntimeArchiveRelative = "assets/wpe-drm2-runtime.tar.gz";
+const char* kRuntimeRelative = "assets/wpe-runtime";
 const char* kDefaultUrl = "https://m.baidu.com/";
 const char* kDefaultViewport = "960x266";
 const int kDefaultRotation = 270;
@@ -46,6 +49,18 @@ static bool pathExists(const std::string& path)
 {
     struct stat st;
     return stat(path.c_str(), &st) == 0;
+}
+
+static bool dirExists(const std::string& path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool fileExists(const std::string& path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
 static bool ensureDir(const std::string& path)
@@ -167,17 +182,6 @@ static std::string jsonEscape(const std::string& value)
     return out;
 }
 
-static std::string shellSingleQuote(const std::string& value)
-{
-    std::string out("'");
-    for (char ch : value) {
-        if (ch == '\'') out += "'\\''";
-        else out += ch;
-    }
-    out += "'";
-    return out;
-}
-
 static JSValue getObjectProperty(JSContext* ctx, JSValueConst obj, const char* name)
 {
     if (!JS_IsObject(obj)) return JS_UNDEFINED;
@@ -215,6 +219,18 @@ static int getIntProperty(JSContext* ctx, JSValueConst obj, const char* name, in
     return result;
 }
 
+static bool getBoolProperty(JSContext* ctx, JSValueConst obj, const char* name, bool fallback)
+{
+    JSValue value = getObjectProperty(ctx, obj, name);
+    if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        JS_FreeValue(ctx, value);
+        return fallback;
+    }
+    int result = JS_ToBool(ctx, value);
+    JS_FreeValue(ctx, value);
+    return result < 0 ? fallback : result != 0;
+}
+
 static bool processExists(pid_t pid)
 {
     return pid > 1 && (kill(pid, 0) == 0 || errno == EPERM);
@@ -234,6 +250,36 @@ static pid_t readPidFile(const std::string& path)
 static bool writePidFile(const std::string& path, pid_t pid)
 {
     return writeFile(path, std::to_string(static_cast<long>(pid)) + "\n", 0666);
+}
+
+static bool hasSuffix(const std::string& value, const std::string& suffix)
+{
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool isSafeKeyboardId(const std::string& value)
+{
+    if (value.empty() || value.size() > 96) return false;
+    for (char ch : value) {
+        unsigned char c = static_cast<unsigned char>(ch);
+        if (std::isalnum(c) || ch == '_' || ch == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+static std::string keyboardDirForWorkdir(const std::string& workdir)
+{
+    return joinPath(workdir, "keyboard");
+}
+
+static bool prepareKeyboardDirs(const std::string& workdir)
+{
+    if (workdir.empty()) return false;
+    const std::string keyboardDir = keyboardDirForWorkdir(workdir);
+    return ensureDirRecursive(joinPath(keyboardDir, "requests")) &&
+        ensureDirRecursive(joinPath(keyboardDir, "responses"));
 }
 
 static int waitForProcessExit(pid_t pid, int timeoutMs)
@@ -323,45 +369,117 @@ static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const 
     for (pid_t pid : pids) signalProcessTree(pid, SIGKILL);
 }
 
-static int runTarExtract(const std::string& archive, const std::string& dest)
+static bool directoryHasFilePrefix(const std::string& path, const std::string& prefix)
 {
-    const std::string sentinel = joinPath(dest, ".extract-ok");
-    unlink(sentinel.c_str());
-
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        const std::string command = "gzip -dc " + shellSingleQuote(archive) +
-            " | tar -xf - -C " + shellSingleQuote(dest) +
-            " && touch " + shellSingleQuote(sentinel);
-        execlp("sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
-        _exit(127);
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        if (errno == ECHILD) {
-            for (int i = 0; i < 7200 && processExists(pid); ++i)
-                usleep(100000);
-            return pathExists(sentinel) ? 0 : -1;
+    DIR* dir = opendir(path.c_str());
+    if (!dir) return false;
+    bool found = false;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
+        if (!std::strncmp(entry->d_name, prefix.c_str(), prefix.size())) {
+            found = true;
+            break;
         }
-        return -1;
     }
-    if (!WIFEXITED(status)) return -1;
-    int exitStatus = WEXITSTATUS(status);
-    if (exitStatus == 0 && !pathExists(sentinel)) return -1;
-    return exitStatus;
+    closedir(dir);
+    return found;
 }
 
-static std::string archiveStamp(const std::string& archive)
+static bool directoryHasFontFile(const std::string& path)
 {
-    struct stat st;
-    if (stat(archive.c_str(), &st) != 0) return "";
-    std::ostringstream ss;
-    ss << "archive=" << archive << "\n";
-    ss << "size=" << static_cast<long long>(st.st_size) << "\n";
-    ss << "mtime=" << static_cast<long long>(st.st_mtime) << "\n";
-    return ss.str();
+    DIR* dir = opendir(path.c_str());
+    if (!dir) return false;
+    bool found = false;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const char* name = entry->d_name;
+        size_t len = std::strlen(name);
+        if (len > 4) {
+            const char* ext = name + len - 4;
+            if (!strcasecmp(ext, ".ttf") || !strcasecmp(ext, ".otf") || !strcasecmp(ext, ".ttc")) {
+                found = true;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+static bool chmodIfExists(const std::string& path, mode_t mode)
+{
+    if (!pathExists(path)) return true;
+    return chmod(path.c_str(), mode) == 0;
+}
+
+static void cleanupOldExtractedRuntime(const std::string& dataDir)
+{
+    if (dataDir.empty()) return;
+    const std::string browserDir = joinPath(dataDir, "browser");
+    removeRecursive(joinPath(browserDir, "runtime"));
+    removeRecursive(joinPath(browserDir, "runtime.old"));
+    unlink(joinPath(browserDir, ".installed.json").c_str());
+
+    DIR* dir = opendir(browserDir.c_str());
+    if (!dir) return;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (!std::strncmp(entry->d_name, "runtime.tmp.", 12))
+            removeRecursive(joinPath(browserDir, entry->d_name));
+    }
+    closedir(dir);
+}
+
+static bool ensurePackagedRuntimeReady(const std::string& runtimeDir, std::string& error)
+{
+    if (!dirExists(runtimeDir)) {
+        error = "runtime dir missing: " + runtimeDir;
+        return false;
+    }
+
+    const std::vector<std::string> requiredFiles = {
+        "run.sh",
+        "wpe-drm-minimal",
+        "etc/ssl/certs/ca-certificates.crt",
+        "libexec/wpe-webkit-2.0/WPEWebProcess",
+        "libexec/wpe-webkit-2.0/WPENetworkProcess",
+    };
+    for (const std::string& file : requiredFiles) {
+        const std::string path = joinPath(runtimeDir, file);
+        if (!fileExists(path)) {
+            error = "runtime file missing: " + path;
+            return false;
+        }
+    }
+
+    if (!directoryHasFilePrefix(joinPath(runtimeDir, "lib"), "libWPEWebKit-2.0.so")) {
+        error = "runtime WebKit library missing: " + joinPath(runtimeDir, "lib");
+        return false;
+    }
+    if (!directoryHasFontFile(joinPath(runtimeDir, "assets/fonts/dejavu"))) {
+        error = "runtime fonts missing: " + joinPath(runtimeDir, "assets/fonts/dejavu");
+        return false;
+    }
+
+    const std::vector<std::string> executableFiles = {
+        "run.sh",
+        "wpe-drm-minimal",
+        "libexec/wpe-webkit-2.0/WPEWebProcess",
+        "libexec/wpe-webkit-2.0/WPENetworkProcess",
+        "libexec/wpe-webkit-2.0/WPEGPUProcess",
+        "libexec/gstreamer-1.0/gst-plugin-scanner",
+        "libexec/gstreamer-1.0/gst-ptp-helper",
+    };
+    for (const std::string& file : executableFiles) {
+        const std::string path = joinPath(runtimeDir, file);
+        if (!chmodIfExists(path, 0755)) {
+            error = "runtime chmod failed: " + path + ": " + std::strerror(errno);
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static bool parseDrmModeLine(const std::string& line, int& width, int& height)
@@ -375,6 +493,123 @@ static bool parseDrmModeLine(const std::string& line, int& width, int& height)
     width = w;
     height = h;
     return true;
+}
+
+static bool parseSizeLine(const std::string& line, int& width, int& height)
+{
+    int w = 0;
+    int h = 0;
+    if (std::sscanf(line.c_str(), "%dx%d", &w, &h) != 2) return false;
+    if (w <= 0 || h <= 0) return false;
+    width = w;
+    height = h;
+    return true;
+}
+
+static bool parseJsonIntField(const std::string& text, const std::string& key, int& value)
+{
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = text.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = text.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos >= text.size()) return false;
+    char* end = nullptr;
+    errno = 0;
+    long parsed = std::strtol(text.c_str() + pos, &end, 10);
+    if (errno != 0 || end == text.c_str() + pos) return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+static std::string parseJsonStringField(const std::string& text, const std::string& key)
+{
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = text.find(needle);
+    if (pos == std::string::npos) return "";
+    pos = text.find(':', pos + needle.size());
+    if (pos == std::string::npos) return "";
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos >= text.size() || text[pos] != '"') return "";
+    ++pos;
+    std::string result;
+    while (pos < text.size()) {
+        char ch = text[pos++];
+        if (ch == '"') break;
+        if (ch == '\\' && pos < text.size()) {
+            char escaped = text[pos++];
+            switch (escaped) {
+            case '"': result += '"'; break;
+            case '\\': result += '\\'; break;
+            case '/': result += '/'; break;
+            case 'b': result += '\b'; break;
+            case 'f': result += '\f'; break;
+            case 'n': result += '\n'; break;
+            case 'r': result += '\r'; break;
+            case 't': result += '\t'; break;
+            default: result += escaped; break;
+            }
+            continue;
+        }
+        result += ch;
+    }
+    return result;
+}
+
+static int normalizeRotationValue(int value, int fallback)
+{
+    value %= 360;
+    if (value < 0) value += 360;
+    if (value == 0 || value == 90 || value == 180 || value == 270) return value;
+    return fallback;
+}
+
+static std::string currentDrmModeSpec()
+{
+    int width = 0;
+    int height = 0;
+    std::ifstream state("/sys/kernel/debug/dri/0/state");
+    if (state.good()) {
+        std::string line;
+        while (std::getline(state, line)) {
+            if (parseDrmModeLine(line, width, height))
+                return std::to_string(width) + "x" + std::to_string(height);
+        }
+    }
+
+    const std::vector<std::string> knownModeFiles = {
+        "/sys/class/drm/card0-DSI-1/modes",
+        "/sys/class/drm/card0-eDP-1/modes",
+        "/sys/class/drm/card0-LVDS-1/modes",
+        "/sys/class/drm/card0-HDMI-A-1/modes",
+    };
+    for (const std::string& path : knownModeFiles) {
+        std::ifstream modeFile(path.c_str());
+        std::string mode;
+        if (modeFile.good() && std::getline(modeFile, mode) && parseSizeLine(mode, width, height))
+            return std::to_string(width) + "x" + std::to_string(height);
+    }
+
+    DIR* dir = opendir("/sys/class/drm");
+    if (!dir) return "";
+    std::string result;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr && result.empty()) {
+        const std::string name(entry->d_name);
+        if (name.find("card") != 0 || name.find('-') == std::string::npos) continue;
+        const std::string base = joinPath("/sys/class/drm", name);
+        const std::string status = readFile(joinPath(base, "status"));
+        if (!status.empty() && status.find("connected") == std::string::npos) continue;
+        std::ifstream modeFile(joinPath(base, "modes").c_str());
+        std::string mode;
+        if (modeFile.good() && std::getline(modeFile, mode) && parseSizeLine(mode, width, height))
+            result = std::to_string(width) + "x" + std::to_string(height);
+    }
+    closedir(dir);
+    return result;
 }
 
 class JSBrowserPlayer : public JQBaseObject {
@@ -399,92 +634,16 @@ public:
             throwError(info, "workspace is empty");
             return;
         }
-        if (dataDir.empty()) {
-            throwError(info, "dataDir is empty");
-            return;
-        }
 
-        const std::string archive = joinPath(workspace, kRuntimeArchiveRelative);
-        if (!pathExists(archive)) {
-            throwError(info, std::string("runtime archive missing: ") + archive);
-            return;
-        }
+        if (!dataDir.empty())
+            cleanupOldExtractedRuntime(dataDir);
 
-        const std::string browserDir = joinPath(dataDir, "browser");
-        const std::string runtimeDir = joinPath(browserDir, "runtime");
-        const std::string marker = joinPath(browserDir, ".installed.json");
-        const std::string stamp = archiveStamp(archive);
-        if (stamp.empty()) {
-            throwError(info, std::string("runtime archive stat failed: ") + archive);
+        const std::string runtimeDir = joinPath(workspace, kRuntimeRelative);
+        std::string error;
+        if (!ensurePackagedRuntimeReady(runtimeDir, error)) {
+            throwError(info, error);
             return;
         }
-
-        if (pathExists(joinPath(runtimeDir, "run.sh")) &&
-            pathExists(joinPath(runtimeDir, "wpe-drm-minimal")) &&
-            readFile(marker) == stamp) {
-            publishState("runtime_ready", runtimeDir);
-            info.GetReturnValue().Set(runtimeDir);
-            return;
-        }
-
-        stopBrowserByPath(joinPath(browserDir, "browser.pid"));
-        cleanupScopedBrowserProcesses(runtimeDir, browserDir);
-
-        if (!ensureDirRecursive(browserDir)) {
-            throwError(info, std::string("mkdir failed: ") + browserDir);
-            return;
-        }
-
-        const std::string tmpDir = joinPath(browserDir, "runtime.tmp." + std::to_string(static_cast<long>(getpid())));
-        const std::string oldDir = joinPath(browserDir, "runtime.old");
-        removeRecursive(tmpDir);
-        removeRecursive(oldDir);
-        if (!ensureDirRecursive(tmpDir)) {
-            throwError(info, std::string("mkdir failed: ") + tmpDir);
-            return;
-        }
-
-        publishState("runtime_extracting", archive);
-        int tarStatus = runTarExtract(archive, tmpDir);
-        if (tarStatus != 0) {
-            removeRecursive(tmpDir);
-            throwError(info, "runtime extract failed status=" + std::to_string(tarStatus));
-            return;
-        }
-
-        std::string extractedRoot = tmpDir;
-        if (!pathExists(joinPath(extractedRoot, "run.sh"))) {
-            const std::string nested = joinPath(tmpDir, "wpe-drm2");
-            if (pathExists(joinPath(nested, "run.sh"))) {
-                extractedRoot = nested;
-            } else {
-                removeRecursive(tmpDir);
-                throwError(info, "runtime run.sh missing after extract");
-                return;
-            }
-        }
-        if (!pathExists(joinPath(extractedRoot, "wpe-drm-minimal"))) {
-            removeRecursive(tmpDir);
-            throwError(info, "runtime wpe-drm-minimal missing after extract");
-            return;
-        }
-
-        if (pathExists(runtimeDir) && rename(runtimeDir.c_str(), oldDir.c_str()) != 0) {
-            removeRecursive(tmpDir);
-            throwError(info, std::string("rename old runtime failed: ") + std::strerror(errno));
-            return;
-        }
-        if (rename(extractedRoot.c_str(), runtimeDir.c_str()) != 0) {
-            if (pathExists(oldDir)) rename(oldDir.c_str(), runtimeDir.c_str());
-            removeRecursive(tmpDir);
-            throwError(info, std::string("install runtime failed: ") + std::strerror(errno));
-            return;
-        }
-        removeRecursive(tmpDir);
-        removeRecursive(oldDir);
-        chmod(joinPath(runtimeDir, "run.sh").c_str(), 0777);
-        chmod(joinPath(runtimeDir, "wpe-drm-minimal").c_str(), 0777);
-        writeFile(marker, stamp, 0666);
 
         publishState("runtime_ready", runtimeDir);
         info.GetReturnValue().Set(runtimeDir);
@@ -499,11 +658,27 @@ public:
         const std::string logPath = getStringProperty(ctx, options, "logPath", joinPath(workdir, "wpe-drm.log"));
         const std::string url = getStringProperty(ctx, options, "url", kDefaultUrl);
         const std::string viewport = getStringProperty(ctx, options, "viewport", kDefaultViewport);
+        const std::string panelSize = getStringProperty(ctx, options, "panelSize", viewport);
+        const std::string drmMode = getStringProperty(ctx, options, "drmMode", "");
+        const std::string displaySource = getStringProperty(ctx, options, "displaySource", "unknown");
+        const std::string browserMode = getStringProperty(ctx, options, "browserMode", "");
+        const std::string touchDevice = getStringProperty(ctx, options, "touchDevice", "");
         const std::string drm = getStringProperty(ctx, options, "drm", "/dev/dri/card0");
         const int rotation = getIntProperty(ctx, options, "rotation", kDefaultRotation);
+        const int touchRotation = getIntProperty(ctx, options, "touchRotation", rotation);
+        const int touchOffsetX = getIntProperty(ctx, options, "touchOffsetX", 0);
+        const int touchOffsetY = getIntProperty(ctx, options, "touchOffsetY", 0);
+        const int fpsMax = getIntProperty(ctx, options, "fpsMax", 0);
+        const bool useOverlay = getBoolProperty(ctx, options, "useOverlay", true);
+        const int overlayZpos = getIntProperty(ctx, options, "overlayZpos", 3);
 
         if (runtimePath.empty()) {
             throwError(info, "runtimePath is empty");
+            return;
+        }
+        std::string runtimeError;
+        if (!ensurePackagedRuntimeReady(runtimePath, runtimeError)) {
+            throwError(info, runtimeError);
             return;
         }
         const std::string launcher = joinPath(runtimePath, "run.sh");
@@ -517,6 +692,12 @@ public:
         }
         if (!ensureDirRecursive(workdir)) {
             throwError(info, std::string("mkdir failed: ") + workdir);
+            return;
+        }
+        removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "requests"));
+        removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "responses"));
+        if (!prepareKeyboardDirs(workdir)) {
+            throwError(info, std::string("keyboard dir mkdir failed: ") + keyboardDirForWorkdir(workdir));
             return;
         }
         ensureDirRecursive(parentDir(logPath));
@@ -550,10 +731,34 @@ public:
             setenv("WPE_VAR_DIR", workdir.c_str(), 1);
             setenv("WPE_CHROME_STATE", joinPath(workdir, "browser-state.ini").c_str(), 1);
             setenv("WPE_CHROME_RENDER_STATE", joinPath(workdir, "chrome-render-state.ini").c_str(), 1);
+            setenv("WPE_KEYBOARD_DIR", keyboardDirForWorkdir(workdir).c_str(), 1);
             setenv("WPE_DRM_RUNTIME_DIR", joinPath(workdir, "runtime-tmp").c_str(), 1);
             setenv("WPE_DRM_SKIP_MASTER", "1", 0);
-            setenv("WPE_DRM_USE_OVERLAY", "1", 0);
-            setenv("WPE_DRM_ZPOS", "3", 0);
+            setenv("WPE_DRM_USE_OVERLAY", useOverlay ? "1" : "0", 1);
+            const std::string overlayZposValue = std::to_string(overlayZpos);
+            setenv("WPE_DRM_ZPOS", overlayZposValue.c_str(), 1);
+            const std::string rotationValue = std::to_string(rotation);
+            const std::string touchRotationValue = std::to_string(touchRotation);
+            if (!panelSize.empty()) setenv("WPE_PANEL_SIZE", panelSize.c_str(), 1);
+            if (!viewport.empty()) {
+                setenv("WPE_VIEWPORT", viewport.c_str(), 1);
+                setenv("WPE_DRM_VIEWPORT", viewport.c_str(), 1);
+            }
+            if (!drmMode.empty()) setenv("WPE_DRM_MODE", drmMode.c_str(), 1);
+            if (!displaySource.empty()) setenv("WPE_DISPLAY_SOURCE", displaySource.c_str(), 1);
+            if (!browserMode.empty()) setenv("WPE_BROWSER_MODE", browserMode.c_str(), 1);
+            setenv("WPE_PANEL_ROTATION", rotationValue.c_str(), 1);
+            setenv("WPE_TOUCH_ROTATION", touchRotationValue.c_str(), 1);
+            if (!touchDevice.empty()) setenv("WPE_TOUCH_DEVICE", touchDevice.c_str(), 1);
+            const std::string touchOffsetXValue = std::to_string(touchOffsetX);
+            const std::string touchOffsetYValue = std::to_string(touchOffsetY);
+            setenv("WPE_TOUCH_OFFSET_X", touchOffsetXValue.c_str(), 1);
+            setenv("WPE_TOUCH_OFFSET_Y", touchOffsetYValue.c_str(), 1);
+            if (fpsMax > 0) {
+                const std::string fpsMaxValue = std::to_string(fpsMax);
+                setenv("WPE_DRM_MAX_FPS", fpsMaxValue.c_str(), 1);
+            }
+            setenv("WPE_CHROME_LAYOUT", "resize", 0);
             setenv("GST_REGISTRY", joinPath(workdir, "gst-registry.bin").c_str(), 1);
             setenv("WPE_DEFAULT_URL", url.c_str(), 1);
             setenv("HOME", workdir.c_str(), 1);
@@ -620,31 +825,134 @@ public:
         info.GetReturnValue().Set(processExists(pid));
     }
 
-    void getDrmScreenSize(JQFunctionInfo& info)
+    void pollKeyboardRequest(JQFunctionInfo& info)
     {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        if (workdir.empty()) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+
+        const std::string requestsDir = joinPath(keyboardDirForWorkdir(workdir), "requests");
+        DIR* dir = opendir(requestsDir.c_str());
+        if (!dir) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+
+        std::string selected;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name(entry->d_name);
+            if (name == "." || name == "..") continue;
+            if (!hasSuffix(name, ".json")) continue;
+            selected = name;
+            break;
+        }
+        closedir(dir);
+
+        if (selected.empty()) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+
+        info.GetReturnValue().Set(readFile(joinPath(requestsDir, selected)));
+    }
+
+    void respondKeyboardRequest(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        const std::string id = getStringProperty(ctx, options, "id", "");
+        const bool confirmed = getBoolProperty(ctx, options, "confirmed", false);
+        const std::string text = getStringProperty(ctx, options, "text", "");
+
+        if (workdir.empty()) {
+            throwError(info, "workdir is empty");
+            return;
+        }
+        if (!isSafeKeyboardId(id)) {
+            throwError(info, "invalid keyboard request id");
+            return;
+        }
+        if (!prepareKeyboardDirs(workdir)) {
+            throwError(info, std::string("keyboard dir mkdir failed: ") + keyboardDirForWorkdir(workdir));
+            return;
+        }
+
+        const std::string keyboardDir = keyboardDirForWorkdir(workdir);
+        const std::string responsesDir = joinPath(keyboardDir, "responses");
+        const std::string responsePath = joinPath(responsesDir, id + (confirmed ? ".ok" : ".cancel"));
+        if (!writeFile(responsePath, confirmed ? text : "", 0666)) {
+            throwError(info, std::string("keyboard response write failed: ") + responsePath + ": " + std::strerror(errno));
+            return;
+        }
+        unlink(joinPath(joinPath(keyboardDir, "requests"), id + ".json").c_str());
+        publishState("keyboard_response", id + (confirmed ? ":ok" : ":cancel"));
+        info.GetReturnValue().Set(true);
+    }
+
+    void getSystemDisplayConfig(JQFunctionInfo& info)
+    {
+        const std::string cfg = readFile("/etc/miniapp/resources/cfg.json");
         int width = 0;
         int height = 0;
-        std::ifstream state("/sys/kernel/debug/dri/0/state");
-        if (state.good()) {
-            std::string line;
-            while (std::getline(state, line)) {
-                if (parseDrmModeLine(line, width, height)) {
-                    info.GetReturnValue().Set(std::to_string(width) + "x" + std::to_string(height));
-                    return;
-                }
-            }
+        int direction = kDefaultRotation;
+        int videoDirection = -1;
+        int touchDirection = -1;
+        int touchOffsetX = 0;
+        int touchOffsetY = 0;
+        int fpsMax = 0;
+        std::string touchDevice;
+
+        if (!cfg.empty()) {
+            parseJsonIntField(cfg, "width", width);
+            parseJsonIntField(cfg, "height", height);
+            parseJsonIntField(cfg, "direction", direction);
+            parseJsonIntField(cfg, "video_direction", videoDirection);
+            parseJsonIntField(cfg, "tp_direction", touchDirection);
+            parseJsonIntField(cfg, "tp_xoffset", touchOffsetX);
+            parseJsonIntField(cfg, "tp_yoffset", touchOffsetY);
+            parseJsonIntField(cfg, "fps_max", fpsMax);
+            touchDevice = parseJsonStringField(cfg, "tp");
         }
-        std::ifstream dsiMode("/sys/class/drm/card0-DSI-1/modes");
-        if (dsiMode.good()) {
-            std::string mode;
-            if (std::getline(dsiMode, mode)) {
-                if (std::sscanf(mode.c_str(), "%dx%d", &width, &height) == 2 && width > 0 && height > 0) {
-                    info.GetReturnValue().Set(std::to_string(width) + "x" + std::to_string(height));
-                    return;
-                }
-            }
-        }
-        info.GetReturnValue().Set("");
+
+        direction = normalizeRotationValue(direction, kDefaultRotation);
+        videoDirection = videoDirection >= 0 ? normalizeRotationValue(videoDirection, direction) : direction;
+        touchDirection = touchDirection >= 0 ? normalizeRotationValue(touchDirection, videoDirection) : videoDirection;
+        const std::string drmMode = currentDrmModeSpec();
+        int panelWidth = width;
+        int panelHeight = height;
+        if ((videoDirection == 90 || videoDirection == 270) && panelWidth > 0 && panelHeight > 0 && panelWidth < panelHeight)
+            std::swap(panelWidth, panelHeight);
+        const std::string panelSize = panelWidth > 0 && panelHeight > 0
+            ? std::to_string(panelWidth) + "x" + std::to_string(panelHeight)
+            : "";
+
+        std::ostringstream ss;
+        ss << "{";
+        ss << "\"source\":\"" << (cfg.empty() ? "missing" : "system_cfg") << "\",";
+        ss << "\"width\":" << width << ",";
+        ss << "\"height\":" << height << ",";
+        ss << "\"panelSize\":\"" << jsonEscape(panelSize) << "\",";
+        ss << "\"frameworkRotation\":" << direction << ",";
+        ss << "\"videoRotation\":" << videoDirection << ",";
+        ss << "\"touchRotation\":" << touchDirection << ",";
+        ss << "\"touchOffsetX\":" << touchOffsetX << ",";
+        ss << "\"touchOffsetY\":" << touchOffsetY << ",";
+        ss << "\"fpsMax\":" << fpsMax << ",";
+        ss << "\"drmMode\":\"" << jsonEscape(drmMode) << "\",";
+        ss << "\"touchDevice\":\"" << jsonEscape(touchDevice) << "\"";
+        ss << "}";
+        info.GetReturnValue().Set(ss.str());
+    }
+
+    void getDrmScreenSize(JQFunctionInfo& info)
+    {
+        info.GetReturnValue().Set(currentDrmModeSpec());
     }
 
     void getState(JQFunctionInfo& info)
@@ -774,6 +1082,9 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("startBrowser", &JSBrowserPlayer::startBrowser);
     tpl->SetProtoMethod("stopBrowser", &JSBrowserPlayer::stopBrowser);
     tpl->SetProtoMethod("isBrowserRunning", &JSBrowserPlayer::isBrowserRunning);
+    tpl->SetProtoMethod("pollKeyboardRequest", &JSBrowserPlayer::pollKeyboardRequest);
+    tpl->SetProtoMethod("respondKeyboardRequest", &JSBrowserPlayer::respondKeyboardRequest);
+    tpl->SetProtoMethod("getSystemDisplayConfig", &JSBrowserPlayer::getSystemDisplayConfig);
     tpl->SetProtoMethod("getDrmScreenSize", &JSBrowserPlayer::getDrmScreenSize);
     tpl->SetProtoMethod("getState", &JSBrowserPlayer::getState);
     tpl->PrototypeTemplate()->Set("onStateChanged", &JSBrowserPlayer::onStateChanged);

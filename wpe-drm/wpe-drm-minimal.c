@@ -87,6 +87,7 @@ typedef struct {
     int touch_height;
     double hide_down_px;
     double show_up_px;
+    double show_up_min_velocity_px_s;
     gint64 transition_us;
     char *state_path;
     char *render_state_path;
@@ -97,6 +98,8 @@ typedef struct {
     guint next_tab_id;
     ChromePanel panel;
     double scroll_accum;
+    double scroll_velocity_peak;
+    guint32 scroll_last_time_ms;
     int scroll_direction;
     gboolean suppress_history;
 } BrowserChrome;
@@ -112,6 +115,7 @@ typedef struct {
     int panel_width;
     int panel_height;
     int panel_rotation;
+    int touch_rotation;
     int touch_fd;
     guint touch_source_id;
     guint64 touch_event_count;
@@ -131,10 +135,13 @@ typedef struct {
     gboolean touch_swap_xy;
     gboolean touch_invert_x;
     gboolean touch_invert_y;
+    int touch_offset_x;
+    int touch_offset_y;
     gboolean touch_scroll_fallback;
     gboolean touch_native_scroll_fallback;
     gboolean touch_js_scroll_fallback;
     gboolean touch_horizontal_scroll;
+    gboolean touch_scroll_invert_y;
     gboolean send_touch_events;
     gboolean synthesize_pointer_tap;
     gboolean native_scroll_scheduled;
@@ -154,6 +161,16 @@ typedef struct {
     guint32 last_scroll_time_ms;
     guint64 scroll_event_count;
     guint64 scroll_drop_count;
+    gint64 scroll_stats_last_us;
+    guint64 scroll_stats_last_event_count;
+    guint64 scroll_stats_last_frame_count;
+    char *keyboard_dir;
+    guint keyboard_response_source_id;
+    guint64 keyboard_next_id;
+    char *keyboard_active_id;
+    char *keyboard_active_kind;
+    gint64 keyboard_active_us;
+    gint64 last_pointer_tap_us;
     BrowserChrome chrome;
     TouchSlot slots[MAX_TOUCH_SLOTS];
 } AppState;
@@ -204,6 +221,18 @@ static double env_double(const char *name, double default_value)
     if (end == value)
         return default_value;
     return result;
+}
+
+static gboolean chrome_layout_resize_enabled(void)
+{
+    const char *value = g_getenv("WPE_CHROME_LAYOUT");
+    if (!value || !value[0])
+        return TRUE;
+    if (!g_ascii_strcasecmp(value, "resize"))
+        return TRUE;
+    if (!g_ascii_strcasecmp(value, "overlay"))
+        return FALSE;
+    return env_enabled("WPE_CHROME_LAYOUT", TRUE);
 }
 
 static gboolean parse_int_range(const char *value, int *minimum, int *maximum)
@@ -334,6 +363,8 @@ static const char *default_home_url(void)
     return url && url[0] ? url : "https://m.baidu.com/";
 }
 
+static void chrome_apply_layout(AppState *state, const char *reason);
+
 static void chrome_request_frame(AppState *state)
 {
     if (!state || !state->view)
@@ -387,7 +418,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         line_count++;
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
         const char *home = chrome->home_url && chrome->home_url[0] ? chrome->home_url : default_home_url();
-        snprintf(line, sizeof(line), "HOME %s", g_str_has_prefix(home, "https://www.bing") ? "BING" : "BAIDU");
+        snprintf(line, sizeof(line), "SET HOME %.80s", home);
         g_key_file_set_string(key_file, "panel", "line0", line);
         g_key_file_set_string(key_file, "panel", "line1", chrome->touch_debug ? "TOUCH DEBUG ON" : "TOUCH DEBUG OFF");
         g_key_file_set_string(key_file, "panel", "line2", "CLEAR CACHE");
@@ -479,6 +510,7 @@ static void chrome_save_state(AppState *state)
     g_free(data);
     g_key_file_unref(key_file);
     chrome_update_render_state(state);
+    chrome_apply_layout(state, "chrome_state");
 }
 
 static void chrome_set_tab_url(BrowserTab *tab, const char *url)
@@ -558,6 +590,8 @@ static int chrome_page_top_inset(AppState *state)
     BrowserChrome *chrome = &state->chrome;
     if (chrome->panel != CHROME_PANEL_NONE)
         return chrome->height;
+    if (chrome_layout_resize_enabled())
+        return chrome->visible ? chrome->height : 0;
     double fraction = chrome_shown_fraction(chrome);
     return (int)lround((double)chrome->height * fraction);
 }
@@ -565,7 +599,9 @@ static int chrome_page_top_inset(AppState *state)
 static double web_event_y(AppState *state, double screen_y)
 {
     double y = screen_y - chrome_page_top_inset(state);
-    int height = state->panel_height > 0 ? state->panel_height : state->viewport_height;
+    int height = chrome_layout_resize_enabled() && state->viewport_height > 0
+        ? state->viewport_height
+        : (state->panel_height > 0 ? state->panel_height : state->viewport_height);
     if (height <= 0)
         height = 1;
     if (y < 0)
@@ -666,6 +702,399 @@ static void chrome_go_forward(AppState *state)
     g_free(url);
 }
 
+static char *json_escape_string(const char *value)
+{
+    GString *out = g_string_new(NULL);
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    for (; *p; ++p) {
+        switch (*p) {
+        case '\\': g_string_append(out, "\\\\"); break;
+        case '"': g_string_append(out, "\\\""); break;
+        case '\n': g_string_append(out, "\\n"); break;
+        case '\r': g_string_append(out, "\\r"); break;
+        case '\t': g_string_append(out, "\\t"); break;
+        default:
+            if (*p < 0x20)
+                g_string_append_printf(out, "\\u%04x", *p);
+            else
+                g_string_append_c(out, (char)*p);
+            break;
+        }
+    }
+    return g_string_free(out, FALSE);
+}
+
+static char *js_quote_string(const char *value)
+{
+    char *escaped = json_escape_string(value);
+    char *quoted = g_strdup_printf("\"%s\"", escaped ? escaped : "");
+    g_free(escaped);
+    return quoted;
+}
+
+static char *normalize_user_url(const char *raw)
+{
+    char *value = g_strdup(raw ? raw : "");
+    g_strstrip(value);
+    if (!value[0]) {
+        g_free(value);
+        return g_strdup(default_home_url());
+    }
+    if (!g_ascii_strcasecmp(value, "baidu")) {
+        g_free(value);
+        return g_strdup("https://m.baidu.com/");
+    }
+    if (!g_ascii_strcasecmp(value, "bing")) {
+        g_free(value);
+        return g_strdup("https://www.bing.com/");
+    }
+    if (strstr(value, "://") || g_str_has_prefix(value, "about:") || g_str_has_prefix(value, "file:"))
+        return value;
+
+    if (strchr(value, ' ') || strchr(value, '\t') || !strchr(value, '.')) {
+        char *escaped = g_uri_escape_string(value, NULL, TRUE);
+        char *url = g_strdup_printf("https://m.baidu.com/s?word=%s", escaped ? escaped : "");
+        g_free(escaped);
+        g_free(value);
+        return url;
+    }
+
+    char *url = g_strdup_printf("https://%s", value);
+    g_free(value);
+    return url;
+}
+
+static char *keyboard_path(AppState *state, const char *subdir, const char *filename)
+{
+    if (!state || !state->keyboard_dir || !state->keyboard_dir[0] || !subdir || !filename)
+        return NULL;
+    char *dir = g_build_filename(state->keyboard_dir, subdir, NULL);
+    char *path = g_build_filename(dir, filename, NULL);
+    g_free(dir);
+    return path;
+}
+
+static void keyboard_clear_active(AppState *state)
+{
+    if (!state)
+        return;
+    if (state->keyboard_response_source_id) {
+        g_source_remove(state->keyboard_response_source_id);
+        state->keyboard_response_source_id = 0;
+    }
+    if (state->keyboard_active_id) {
+        char *request_name = g_strdup_printf("%s.json", state->keyboard_active_id);
+        char *request_path = keyboard_path(state, "requests", request_name);
+        if (request_path)
+            g_unlink(request_path);
+        g_free(request_path);
+        g_free(request_name);
+    }
+    g_clear_pointer(&state->keyboard_active_id, g_free);
+    g_clear_pointer(&state->keyboard_active_kind, g_free);
+    state->keyboard_active_us = 0;
+}
+
+static void keyboard_insert_web_text(AppState *state, const char *text)
+{
+    if (!state || !state->web_view)
+        return;
+    char *quoted = js_quote_string(text ? text : "");
+    char *script = g_strdup_printf(
+        "(function(text){"
+        "if(window.__haasKeyboardSetText)return window.__haasKeyboardSetText(text);"
+        "var el=document.activeElement;"
+        "function editable(n){return n&&(n.tagName==='INPUT'||n.tagName==='TEXTAREA'||n.isContentEditable);}"
+        "if(!editable(el))return false;"
+        "if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(text.length,text.length);}catch(e){}}}"
+        "function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}"
+        "fire('input');fire('change');return true;"
+        "})(%s)",
+        quoted);
+    g_print("Keyboard insert web text: bytes=%zu\n", strlen(text ? text : ""));
+    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL, NULL);
+    g_free(script);
+    g_free(quoted);
+}
+
+static void keyboard_handle_response(AppState *state, gboolean confirmed, const char *text)
+{
+    if (!state || !state->keyboard_active_id || !state->keyboard_active_kind)
+        return;
+
+    g_print("Keyboard %s: id=%s kind=%s bytes=%zu\n",
+            confirmed ? "confirmed" : "cancelled",
+            state->keyboard_active_id,
+            state->keyboard_active_kind,
+            strlen(text ? text : ""));
+
+    if (confirmed) {
+        if (!g_strcmp0(state->keyboard_active_kind, "address")) {
+            char *url = normalize_user_url(text);
+            chrome_load_url(state, url, TRUE);
+            g_free(url);
+        } else if (!g_strcmp0(state->keyboard_active_kind, "home_url")) {
+            char *url = normalize_user_url(text);
+            g_free(state->chrome.home_url);
+            state->chrome.home_url = url;
+            state->chrome.panel = CHROME_PANEL_NONE;
+            chrome_save_state(state);
+            chrome_request_frame(state);
+        } else if (!g_strcmp0(state->keyboard_active_kind, "web_input"))
+            keyboard_insert_web_text(state, text);
+    }
+
+    keyboard_clear_active(state);
+}
+
+static gboolean keyboard_response_tick(gpointer user_data)
+{
+    AppState *state = (AppState *)user_data;
+    if (!state || !state->keyboard_active_id) {
+        if (state)
+            state->keyboard_response_source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    gint64 timeout_ms = (gint64)env_double("WPE_KEYBOARD_TIMEOUT_MS", 120000);
+    if (timeout_ms > 0 && state->keyboard_active_us > 0 &&
+        g_get_monotonic_time() - state->keyboard_active_us > timeout_ms * 1000) {
+        g_warning("Keyboard timeout: id=%s kind=%s", state->keyboard_active_id,
+                  state->keyboard_active_kind ? state->keyboard_active_kind : "");
+        state->keyboard_response_source_id = 0;
+        keyboard_clear_active(state);
+        return G_SOURCE_REMOVE;
+    }
+
+    char *ok_name = g_strdup_printf("%s.ok", state->keyboard_active_id);
+    char *cancel_name = g_strdup_printf("%s.cancel", state->keyboard_active_id);
+    char *ok_path = keyboard_path(state, "responses", ok_name);
+    char *cancel_path = keyboard_path(state, "responses", cancel_name);
+    g_free(ok_name);
+    g_free(cancel_name);
+
+    char *contents = NULL;
+    gsize length = 0;
+    if (ok_path && g_file_get_contents(ok_path, &contents, &length, NULL)) {
+        g_unlink(ok_path);
+        g_free(ok_path);
+        if (cancel_path) {
+            g_unlink(cancel_path);
+            g_free(cancel_path);
+        }
+        state->keyboard_response_source_id = 0;
+        keyboard_handle_response(state, TRUE, contents ? contents : "");
+        g_free(contents);
+        return G_SOURCE_REMOVE;
+    }
+    g_free(ok_path);
+
+    if (cancel_path && g_file_test(cancel_path, G_FILE_TEST_EXISTS)) {
+        g_unlink(cancel_path);
+        g_free(cancel_path);
+        state->keyboard_response_source_id = 0;
+        keyboard_handle_response(state, FALSE, "");
+        return G_SOURCE_REMOVE;
+    }
+    g_free(cancel_path);
+
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean keyboard_request(AppState *state, const char *kind, const char *text,
+                                 const char *placeholder, const char *input_type,
+                                 int maxlength, gboolean multiline)
+{
+    if (!state || !state->keyboard_dir || !state->keyboard_dir[0]) {
+        g_warning("Keyboard request ignored: no WPE_KEYBOARD_DIR kind=%s", kind ? kind : "");
+        return FALSE;
+    }
+    if (state->keyboard_active_id) {
+        g_warning("Keyboard request ignored: active id=%s kind=%s new=%s",
+                  state->keyboard_active_id,
+                  state->keyboard_active_kind ? state->keyboard_active_kind : "",
+                  kind ? kind : "");
+        return FALSE;
+    }
+
+    char *requests_dir = g_build_filename(state->keyboard_dir, "requests", NULL);
+    char *responses_dir = g_build_filename(state->keyboard_dir, "responses", NULL);
+    g_mkdir_with_parents(requests_dir, 0700);
+    g_mkdir_with_parents(responses_dir, 0700);
+    g_free(requests_dir);
+    g_free(responses_dir);
+
+    state->keyboard_next_id++;
+    char *id = g_strdup_printf("%" G_GUINT64_FORMAT "_%" G_GINT64_FORMAT,
+                               state->keyboard_next_id, g_get_monotonic_time());
+    char *name = g_strdup_printf("%s.json", id);
+    char *path = keyboard_path(state, "requests", name);
+    g_free(name);
+
+    char *kind_json = json_escape_string(kind ? kind : "");
+    char *text_json = json_escape_string(text ? text : "");
+    char *placeholder_json = json_escape_string(placeholder ? placeholder : "");
+    char *input_type_json = json_escape_string(input_type && input_type[0] ? input_type : "ZhCNPreferred");
+    char *payload = g_strdup_printf(
+        "{\"id\":\"%s\",\"kind\":\"%s\",\"text\":\"%s\",\"placeholder\":\"%s\","
+        "\"inputType\":\"%s\",\"maxlength\":%d,\"multiLinesEditVisible\":%s,"
+        "\"confirmButtonDisabledOnTextEmpty\":false}",
+        id, kind_json, text_json, placeholder_json, input_type_json,
+        maxlength == 0 ? 100 : maxlength,
+        multiline ? "true" : "false");
+
+    gboolean ok = path && g_file_set_contents(path, payload, -1, NULL);
+    if (ok) {
+        state->keyboard_active_id = g_strdup(id);
+        state->keyboard_active_kind = g_strdup(kind ? kind : "");
+        state->keyboard_active_us = g_get_monotonic_time();
+        state->keyboard_response_source_id = g_timeout_add(150, keyboard_response_tick, state);
+        g_print("Keyboard request: id=%s kind=%s placeholder=%s maxlength=%d multiline=%d\n",
+                id, kind ? kind : "", placeholder ? placeholder : "", maxlength, multiline);
+    } else
+        g_warning("Keyboard request write failed: %s", path ? path : "(null)");
+
+    g_free(payload);
+    g_free(kind_json);
+    g_free(text_json);
+    g_free(placeholder_json);
+    g_free(input_type_json);
+    g_free(path);
+    g_free(id);
+    return ok;
+}
+
+static char *query_get_param(const char *message, const char *key)
+{
+    if (!message || !key)
+        return NULL;
+    char **pairs = g_strsplit(message, "&", -1);
+    char *result = NULL;
+    for (int i = 0; pairs && pairs[i]; ++i) {
+        char *equals = strchr(pairs[i], '=');
+        if (!equals)
+            continue;
+        *equals = 0;
+        if (!strcmp(pairs[i], key)) {
+            result = g_uri_unescape_string(equals + 1, NULL);
+            break;
+        }
+    }
+    g_strfreev(pairs);
+    return result;
+}
+
+static int query_get_int(const char *message, const char *key, int fallback)
+{
+    char *value = query_get_param(message, key);
+    if (!value)
+        return fallback;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    int result = end != value ? (int)parsed : fallback;
+    g_free(value);
+    return result;
+}
+
+static gboolean query_get_bool(const char *message, const char *key, gboolean fallback)
+{
+    char *value = query_get_param(message, key);
+    if (!value)
+        return fallback;
+    gboolean result = !g_ascii_strcasecmp(value, "1") || !g_ascii_strcasecmp(value, "true") ||
+        !g_ascii_strcasecmp(value, "yes");
+    g_free(value);
+    return result;
+}
+
+static void on_keyboard_script_message(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
+{
+    (void)manager;
+    AppState *state = (AppState *)user_data;
+    if (!state || !value)
+        return;
+
+    char *message = jsc_value_to_string(value);
+    char *kind = query_get_param(message, "kind");
+    if (g_strcmp0(kind, "web_input")) {
+        g_free(kind);
+        g_free(message);
+        return;
+    }
+
+    char *text = query_get_param(message, "text");
+    char *placeholder = query_get_param(message, "placeholder");
+    char *input_type = query_get_param(message, "inputType");
+    int maxlength = query_get_int(message, "maxlength", 100);
+    gboolean multiline = query_get_bool(message, "multiLinesEditVisible", FALSE);
+    gint64 pointer_gate_us = (gint64)env_double("WPE_KEYBOARD_POINTER_GATE_MS", 2000) * 1000;
+    gint64 since_pointer_us = state->last_pointer_tap_us > 0 ? g_get_monotonic_time() - state->last_pointer_tap_us : G_MAXINT64;
+    if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
+        keyboard_request(state, "web_input", text ? text : "", placeholder && placeholder[0] ? placeholder : "请输入内容",
+                         input_type && input_type[0] ? input_type : "ZhCNPreferred",
+                         maxlength, multiline);
+    } else
+        g_print("Keyboard web_input ignored: no recent pointer tap since_us=%" G_GINT64_FORMAT "\n", since_pointer_us);
+    g_free(kind);
+    g_free(text);
+    g_free(placeholder);
+    g_free(input_type);
+    g_free(message);
+}
+
+static void setup_keyboard_bridge(AppState *state)
+{
+    if (!state)
+        return;
+    const char *keyboard_dir = g_getenv("WPE_KEYBOARD_DIR");
+    if (!keyboard_dir || !keyboard_dir[0]) {
+        g_print("Keyboard bridge disabled: WPE_KEYBOARD_DIR empty\n");
+        return;
+    }
+    state->keyboard_dir = g_strdup(keyboard_dir);
+    char *requests_dir = g_build_filename(state->keyboard_dir, "requests", NULL);
+    char *responses_dir = g_build_filename(state->keyboard_dir, "responses", NULL);
+    g_mkdir_with_parents(requests_dir, 0700);
+    g_mkdir_with_parents(responses_dir, 0700);
+    g_print("Keyboard bridge: dir=%s requests=%s responses=%s\n",
+            state->keyboard_dir, requests_dir, responses_dir);
+    g_free(requests_dir);
+    g_free(responses_dir);
+}
+
+static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppState *state)
+{
+    if (!manager || !state)
+        return;
+    g_signal_connect(manager, "script-message-received::haasKeyboard",
+                     G_CALLBACK(on_keyboard_script_message), state);
+    if (!webkit_user_content_manager_register_script_message_handler(manager, "haasKeyboard", NULL))
+        g_warning("Keyboard script message handler already registered");
+
+    const char *source =
+        "(function(){"
+        "if(window.__haasKeyboardInstalled)return;"
+        "window.__haasKeyboardInstalled=true;"
+        "window.__haasKeyboardTarget=null;"
+        "window.__haasKeyboardLastAt=0;"
+        "function editable(el){return !!(el&&((el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(el.type||''))||el.tagName==='TEXTAREA'||el.isContentEditable)&&!el.disabled&&!el.readOnly);}"
+        "function enc(v){return encodeURIComponent(v==null?'':String(v));}"
+        "function valueOf(el){return el.isContentEditable?(el.innerText||el.textContent||''):(el.value||'');}"
+        "function typeOf(el){var t=String(el.getAttribute('type')||'').toLowerCase();if(t==='number'||t==='tel')return 'Number';if(t==='email'||t==='url'||t==='password')return 'EnUSPreferred';return 'ZhCNPreferred';}"
+        "function request(el){if(!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;var now=Date.now();if(window.__haasKeyboardTarget===el&&now-window.__haasKeyboardLastAt<600)return;window.__haasKeyboardTarget=el;window.__haasKeyboardLastAt=now;var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
+        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var el=e.target;if(editable(el))setTimeout(function(){request(el);},0);},true);"
+        "window.__haasKeyboardSetText=function(text){var el=window.__haasKeyboardTarget||document.activeElement;if(!editable(el))return false;try{el.focus();}catch(e){}if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(String(text).length,String(text).length);}catch(e){}}}function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}fire('input');fire('change');return true;};"
+        "})();";
+    WebKitUserScript *script = webkit_user_script_new(source,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+        NULL,
+        NULL);
+    webkit_user_content_manager_add_script(manager, script);
+    webkit_user_script_unref(script);
+    g_print("Keyboard user script installed\n");
+}
+
 static gboolean remove_dir_contents(const char *path)
 {
     GDir *dir = g_dir_open(path, 0, NULL);
@@ -713,10 +1142,10 @@ static void chrome_select_panel_row(AppState *state, int row)
             chrome_close_active_tab(state);
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
         if (row == 0) {
-            const char *next = chrome->home_url && g_str_has_prefix(chrome->home_url, "https://www.bing") ? "https://m.baidu.com/" : "https://www.bing.com/";
-            g_free(chrome->home_url);
-            chrome->home_url = g_strdup(next);
+            chrome->panel = CHROME_PANEL_NONE;
             chrome_save_state(state);
+            keyboard_request(state, "home_url", chrome->home_url ? chrome->home_url : default_home_url(),
+                             "设置主页 URL", "EnUSPreferred", 512, FALSE);
         } else if (row == 1) {
             chrome->touch_debug = !chrome->touch_debug;
             chrome_save_state(state);
@@ -769,11 +1198,14 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
 
     int panel_width = state->panel_width > 0 ? state->panel_width : 960;
     if (x < panel_width / 2) {
-        chrome->panel = chrome->panel == CHROME_PANEL_ADDRESS ? CHROME_PANEL_NONE : CHROME_PANEL_ADDRESS;
+        BrowserTab *tab = chrome_active_tab(chrome);
+        const char *current = tab && tab->url[0] ? tab->url : (chrome->home_url ? chrome->home_url : default_home_url());
+        chrome->panel = CHROME_PANEL_NONE;
         chrome_set_visible(state, TRUE);
         chrome_save_state(state);
         chrome_request_frame(state);
-        g_print("Chrome tap: address panel=%s x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), x, y);
+        keyboard_request(state, "address", current, "输入网址或搜索", "EnUSPreferred", 512, FALSE);
+        g_print("Chrome tap: address keyboard x=%.1f y=%.1f\n", x, y);
         return;
     }
 
@@ -833,7 +1265,7 @@ static gboolean chrome_touch_down_consumes(AppState *state, double x, double y)
     return FALSE;
 }
 
-static void chrome_note_scroll(AppState *state, double finger_delta_y)
+static void chrome_note_scroll(AppState *state, double finger_delta_y, guint32 time_ms)
 {
     BrowserChrome *chrome = &state->chrome;
     if (!chrome->enabled)
@@ -853,7 +1285,20 @@ static void chrome_note_scroll(AppState *state, double finger_delta_y)
     if (chrome->scroll_direction != direction) {
         chrome->scroll_direction = direction;
         chrome->scroll_accum = 0;
+        chrome->scroll_velocity_peak = 0;
+        chrome->scroll_last_time_ms = time_ms;
     }
+
+    if (chrome->scroll_last_time_ms) {
+        guint32 elapsed_ms = time_ms - chrome->scroll_last_time_ms;
+        if (elapsed_ms > 0 && elapsed_ms < 1000) {
+            double velocity = distance * 1000.0 / (double)elapsed_ms;
+            if (velocity > chrome->scroll_velocity_peak)
+                chrome->scroll_velocity_peak = velocity;
+        }
+    }
+    chrome->scroll_last_time_ms = time_ms;
+
     chrome->scroll_accum += distance;
 
     if (direction < 0) {
@@ -861,14 +1306,20 @@ static void chrome_note_scroll(AppState *state, double finger_delta_y)
             chrome_set_visible(state, FALSE);
             chrome->panel = CHROME_PANEL_NONE;
             chrome->scroll_accum = 0;
+            chrome->scroll_velocity_peak = 0;
+            chrome->scroll_last_time_ms = 0;
             chrome->scroll_direction = 0;
             chrome_save_state(state);
             chrome_request_frame(state);
         }
     } else if (direction > 0) {
-        if (chrome->scroll_accum >= chrome->show_up_px && !chrome->visible) {
+        gboolean fast_enough = chrome->show_up_min_velocity_px_s <= 0 ||
+            chrome->scroll_velocity_peak >= chrome->show_up_min_velocity_px_s;
+        if (chrome->scroll_accum >= chrome->show_up_px && fast_enough && !chrome->visible) {
             chrome_set_visible(state, TRUE);
             chrome->scroll_accum = 0;
+            chrome->scroll_velocity_peak = 0;
+            chrome->scroll_last_time_ms = 0;
             chrome->scroll_direction = 0;
             chrome_save_state(state);
             chrome_request_frame(state);
@@ -892,7 +1343,8 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     if (chrome->touch_height > 140)
         chrome->touch_height = 140;
     chrome->hide_down_px = env_double("WPE_CHROME_HIDE_DOWN_PX", 96);
-    chrome->show_up_px = env_double("WPE_CHROME_SHOW_UP_PX", 72);
+    chrome->show_up_px = env_double("WPE_CHROME_SHOW_UP_PX", 180);
+    chrome->show_up_min_velocity_px_s = env_double("WPE_CHROME_SHOW_UP_MIN_VELOCITY", 700);
     chrome->state_path = g_strdup(g_getenv("WPE_CHROME_STATE") && g_getenv("WPE_CHROME_STATE")[0] ? g_getenv("WPE_CHROME_STATE") : "/tmp/wpe-drm2-browser-state.ini");
     chrome->render_state_path = g_strdup(g_getenv("WPE_CHROME_RENDER_STATE") && g_getenv("WPE_CHROME_RENDER_STATE")[0] ? g_getenv("WPE_CHROME_RENDER_STATE") : "/tmp/wpe-drm2-chrome-state.ini");
     chrome->home_url = g_strdup(default_home_url());
@@ -901,6 +1353,9 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     chrome->next_tab_id = 2;
     chrome->tabs[0].id = 1;
     chrome_set_tab_url(&chrome->tabs[0], initial_url && initial_url[0] ? initial_url : chrome->home_url);
+    g_print("Chrome config: enabled=%d height=%d touch_height=%d hide_down=%.1f show_up=%.1f show_min_velocity=%.1f\n",
+            chrome->enabled, chrome->height, chrome->touch_height,
+            chrome->hide_down_px, chrome->show_up_px, chrome->show_up_min_velocity_px_s);
 
     GKeyFile *key_file = g_key_file_new();
     if (g_key_file_load_from_file(key_file, chrome->state_path, G_KEY_FILE_NONE, NULL)) {
@@ -983,6 +1438,38 @@ static void apply_viewport(AppState *state, int width, int height, const char *r
     g_print("Viewport applied: %dx%d reason=%s resize_ok=%d view=%dx%d\n",
             width, height, reason ? reason : "unknown", resize_ok,
             wpe_view_get_width(state->view), wpe_view_get_height(state->view));
+}
+
+static void ensure_panel_size(AppState *state)
+{
+    if (!state)
+        return;
+    if (state->panel_width > 0 && state->panel_height > 0)
+        return;
+    if (!parse_viewport_string(g_getenv("WPE_PANEL_SIZE"), &state->panel_width, &state->panel_height)) {
+        if (!parse_viewport_string(g_getenv("WPE_VIEWPORT"), &state->panel_width, &state->panel_height)) {
+            state->panel_width = state->viewport_width > 0 ? state->viewport_width : (state->view ? wpe_view_get_width(state->view) : 960);
+            state->panel_height = state->viewport_height > 0 ? state->viewport_height : (state->view ? wpe_view_get_height(state->view) : 266);
+        }
+    }
+}
+
+static void chrome_apply_layout(AppState *state, const char *reason)
+{
+    if (!state || !state->view || !state->chrome.enabled || !chrome_layout_resize_enabled())
+        return;
+
+    ensure_panel_size(state);
+    int panel_width = state->panel_width > 0 ? state->panel_width : 960;
+    int panel_height = state->panel_height > 0 ? state->panel_height : 266;
+    int top_inset = chrome_page_top_inset(state);
+    int content_height = panel_height - top_inset;
+    if (content_height < 64)
+        content_height = 64;
+
+    char detail[96];
+    snprintf(detail, sizeof(detail), "chrome_%s inset=%d panel=%dx%d", reason ? reason : "layout", top_inset, panel_width, panel_height);
+    apply_viewport(state, panel_width, content_height, detail);
 }
 
 static gboolean viewport_file_tick(gpointer user_data)
@@ -1092,7 +1579,7 @@ static void update_touch_position(AppState *state, TouchSlot *slot)
 
     double tx = nx;
     double ty = ny;
-    switch (state->panel_rotation) {
+    switch (state->touch_rotation) {
     case 90:
         tx = ny;
         ty = 1 - nx;
@@ -1172,6 +1659,7 @@ static void send_pointer_tap(AppState *state, double x, double y, guint32 time_m
     if (!state->synthesize_pointer_tap)
         return;
 
+    state->last_pointer_tap_us = g_get_monotonic_time();
     wpe_view_focus_in(state->view);
     double view_y = web_event_y(state, y);
 
@@ -1238,6 +1726,37 @@ static void send_js_scroll_event(AppState *state, double x, double y, double del
     g_free(script);
 }
 
+static void maybe_log_scroll_stats(AppState *state, const char *mode, double delta_x, double delta_y)
+{
+    gint64 now_us = g_get_monotonic_time();
+    if (!state->scroll_stats_last_us) {
+        state->scroll_stats_last_us = now_us;
+        state->scroll_stats_last_event_count = state->scroll_event_count;
+        state->scroll_stats_last_frame_count = frame_count;
+        return;
+    }
+
+    gint64 elapsed_us = now_us - state->scroll_stats_last_us;
+    if (elapsed_us < G_USEC_PER_SEC && state->scroll_event_count > 8)
+        return;
+    if (elapsed_us <= 0)
+        elapsed_us = 1;
+
+    guint64 scroll_delta = state->scroll_event_count - state->scroll_stats_last_event_count;
+    guint64 frame_delta = frame_count - state->scroll_stats_last_frame_count;
+    double fps = (double)frame_delta * G_USEC_PER_SEC / (double)elapsed_us;
+    g_print("Scroll stats: mode=%s dx=%.1f dy=%.1f total=%" G_GUINT64_FORMAT " +%" G_GUINT64_FORMAT
+            " frame=%" G_GUINT64_FORMAT " +%" G_GUINT64_FORMAT " fps=%.1f pending=%.1f,%.1f native=%d js=%d\n",
+            mode, delta_x, delta_y, state->scroll_event_count, scroll_delta,
+            frame_count, frame_delta, fps,
+            state->pending_native_scroll_x, state->pending_native_scroll_y,
+            state->touch_native_scroll_fallback, state->touch_js_scroll_fallback);
+
+    state->scroll_stats_last_us = now_us;
+    state->scroll_stats_last_event_count = state->scroll_event_count;
+    state->scroll_stats_last_frame_count = frame_count;
+}
+
 static void send_scroll_event_now(AppState *state, double x, double y, double delta_x, double delta_y, guint32 time_ms, gboolean is_stop)
 {
     double view_y = web_event_y(state, y);
@@ -1260,13 +1779,15 @@ static void send_scroll_event_now(AppState *state, double x, double y, double de
     if (state->touch_native_scroll_fallback) {
         state->scroll_event_count++;
         if (state->scroll_event_count <= 8 || !(state->scroll_event_count % 60))
-            g_print("Scroll fallback: dx=%.1f dy=%.1f count=%" G_GUINT64_FORMAT "\n",
+            g_print("Native scroll: dx=%.1f dy=%.1f count=%" G_GUINT64_FORMAT "\n",
                     delta_x, delta_y, state->scroll_event_count);
+        maybe_log_scroll_stats(state, "native", delta_x, delta_y);
     } else if (state->touch_js_scroll_fallback) {
         state->scroll_event_count++;
         if (state->scroll_event_count <= 8 || !(state->scroll_event_count % 60))
             g_print("JS scroll fallback: dy=%.1f count=%" G_GUINT64_FORMAT "\n",
                     delta_y, state->scroll_event_count);
+        maybe_log_scroll_stats(state, "js", delta_x, delta_y);
     }
 
     schedule_scroll_stop(state);
@@ -1324,9 +1845,11 @@ static void queue_scroll_event(AppState *state, double x, double y, double delta
 
     if (!state->touch_horizontal_scroll)
         delta_x = 0;
-    chrome_note_scroll(state, delta_y);
+    chrome_note_scroll(state, delta_y, time_ms);
     delta_x *= state->touch_scroll_scale;
-    delta_y *= -state->touch_scroll_scale;
+    delta_y *= state->touch_scroll_scale;
+    if (state->touch_scroll_invert_y)
+        delta_y = -delta_y;
     if (state->panel_rotation == 90 || state->panel_rotation == 270) {
         delta_x = -delta_x;
         delta_y = -delta_y;
@@ -1563,12 +2086,30 @@ static void setup_raw_touch(AppState *state)
         }
     }
     state->panel_rotation = normalize_rotation_degrees((int)env_double("WPE_PANEL_ROTATION", 0));
+    state->touch_rotation = normalize_rotation_degrees((int)env_double("WPE_TOUCH_ROTATION", state->panel_rotation));
+    state->touch_offset_x = (int)env_double("WPE_TOUCH_OFFSET_X", 0);
+    state->touch_offset_y = (int)env_double("WPE_TOUCH_OFFSET_Y", 0);
+    if (!state->touch_active_x_enabled && state->touch_offset_x) {
+        state->touch_active_x_enabled = TRUE;
+        state->touch_active_x_min = CLAMP(state->abs_x_min + state->touch_offset_x, state->abs_x_min, state->abs_x_max);
+        state->touch_active_x_max = state->abs_x_max;
+        if (state->touch_active_x_max <= state->touch_active_x_min)
+            state->touch_active_x_enabled = FALSE;
+    }
+    if (!state->touch_active_y_enabled && state->touch_offset_y) {
+        state->touch_active_y_enabled = TRUE;
+        state->touch_active_y_min = CLAMP(state->abs_y_min + state->touch_offset_y, state->abs_y_min, state->abs_y_max);
+        state->touch_active_y_max = state->abs_y_max;
+        if (state->touch_active_y_max <= state->touch_active_y_min)
+            state->touch_active_y_enabled = FALSE;
+    }
     state->send_touch_events = env_enabled("WPE_SEND_TOUCH_EVENTS", TRUE);
     state->synthesize_pointer_tap = env_enabled("WPE_SYNTHESIZE_POINTER_TAP", TRUE);
     state->touch_scroll_fallback = env_enabled("WPE_TOUCH_SCROLL_FALLBACK", FALSE);
     state->touch_native_scroll_fallback = env_enabled("WPE_TOUCH_NATIVE_SCROLL", TRUE);
     state->touch_js_scroll_fallback = env_enabled("WPE_TOUCH_JS_SCROLL", FALSE);
     state->touch_horizontal_scroll = env_enabled("WPE_TOUCH_HORIZONTAL_SCROLL", FALSE);
+    state->touch_scroll_invert_y = env_enabled("WPE_TOUCH_SCROLL_INVERT_Y", TRUE);
     state->touch_scroll_scale = env_double("WPE_TOUCH_SCROLL_SCALE", 1.0);
     state->touch_scroll_max_step = env_double("WPE_TOUCH_SCROLL_MAX_STEP", 32);
     state->touch_scroll_pending_limit = env_double("WPE_TOUCH_SCROLL_PENDING_LIMIT", 48);
@@ -1578,9 +2119,10 @@ static void setup_raw_touch(AppState *state)
     init_touch_slots(state);
 
     state->touch_source_id = g_unix_fd_add(fd, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL, touch_io_cb, state);
-    g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
+    g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d touch_rotation=%d touch_offset=%d,%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_invert_y=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
             device, fd,
             state->panel_width, state->panel_height, state->panel_rotation,
+            state->touch_rotation, state->touch_offset_x, state->touch_offset_y,
             state->abs_x_code, state->abs_x_min, state->abs_x_max,
             state->touch_active_x_enabled ? "" : "off:",
             state->touch_active_x_enabled ? state->touch_active_x_min : state->abs_x_min,
@@ -1593,7 +2135,7 @@ static void setup_raw_touch(AppState *state)
             state->send_touch_events, state->synthesize_pointer_tap,
             state->touch_scroll_fallback, state->touch_native_scroll_fallback,
             state->touch_js_scroll_fallback,
-            state->touch_horizontal_scroll, state->touch_scroll_scale,
+            state->touch_horizontal_scroll, state->touch_scroll_invert_y, state->touch_scroll_scale,
             state->touch_scroll_max_step, state->touch_scroll_pending_limit,
             state->touch_tap_max_move, state->touch_scroll_interval_ms,
             state->touch_scroll_stop_delay_ms);
@@ -2111,7 +2653,6 @@ int main(int argc, char **argv) {
         "display", display,
         NULL);
     g_object_unref(settings);
-    g_object_unref(user_content_manager);
     g_object_unref(policies);
 
     g_signal_connect(web_view, "load-failed",
@@ -2148,6 +2689,8 @@ int main(int argc, char **argv) {
         state->viewport_width = width;
         state->viewport_height = height;
         chrome_load_state(state, url);
+        setup_keyboard_bridge(state);
+        setup_keyboard_user_script(user_content_manager, state);
         g_signal_connect(web_view, "load-changed",
                          G_CALLBACK(on_load_changed), state);
         g_signal_connect(web_view, "notify::title",
@@ -2183,11 +2726,13 @@ int main(int argc, char **argv) {
             g_print("Viewport hot-update file: %s\n", state->viewport_file);
         }
         setup_raw_touch(state);
+        chrome_apply_layout(state, "startup");
         g_timeout_add_seconds(1, print_view_state, state);
         if (g_getenv("WPE_DRM_EVAL_TICK"))
             g_timeout_add_seconds(1, eval_tick, web_view);
         g_print("WPEView: buffers managed by WPEViewDRM (built-in scanout)\n");
     }
+    g_object_unref(user_content_manager);
 
     /* 4. Load URL */
     const char *startup_url = url;
@@ -2205,11 +2750,13 @@ int main(int argc, char **argv) {
     if (state) {
         if (state->scroll_stop_source_id)
             g_source_remove(state->scroll_stop_source_id);
+        keyboard_clear_active(state);
         if (state->touch_source_id)
             g_source_remove(state->touch_source_id);
         if (state->touch_fd >= 0)
             close(state->touch_fd);
         chrome_destroy(state);
+        g_free(state->keyboard_dir);
         g_free(state->viewport_file);
         g_free(state->viewport_spec);
         g_free(state);

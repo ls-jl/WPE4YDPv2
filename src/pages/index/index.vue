@@ -1,61 +1,66 @@
 <template>
   <div class="launcher-page">
-    <div class="topbar">
-      <text class="title">WPE Browser</text>
-      <text class="status">{{ statusText }}</text>
-    </div>
+    <div class="launcher-shell">
+      <div class="topbar">
+        <text class="title">WPE Browser</text>
+        <text class="status">{{ statusText }}</text>
+      </div>
 
-    <div class="content">
-      <text class="message">{{ messageText }}</text>
-      <text v-if="detailText" class="detail">{{ detailText }}</text>
-      <text class="primary-button" @click="launchBrowser">{{ busy ? '启动中' : '启动浏览器' }}</text>
-      <text class="secondary-button" @click="stopBrowser">停止浏览器</text>
+      <div class="content">
+        <text class="message">{{ messageText }}</text>
+        <text v-if="detailText" class="detail">{{ detailText }}</text>
+
+        <div class="mode-block">
+          <text class="section-label">显示模式</text>
+          <div class="mode-row">
+            <text :class="selectedMode === 'native' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('native')">原生模式</text>
+            <text :class="selectedMode === 'rotate270' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('rotate270')">横屏旋转</text>
+          </div>
+        </div>
+
+        <textarea
+          ref="keyboardProbeField"
+          class="keyboard-probe-field"
+          :value="keyboardProbeText"
+          :focus="keyboardProbeFocused"
+          placeholder="键盘测试"
+          placeholderColor="#878A99"
+          cursorColor="#FF683D"
+          maxlength="128"
+          @textEditFinished="onKeyboardProbeTextEditFinished"
+          @textChanged="onKeyboardProbeTextChanged"
+          @focus="onKeyboardProbeFocus"
+          @blur="onKeyboardProbeBlur"
+        ></textarea>
+
+        <div class="button-row">
+          <text class="primary-button" @click="launchBrowser()">{{ busy ? '启动中' : '启动浏览器' }}</text>
+          <text class="secondary-button" @click="openKeyboardProbe()">键盘测试</text>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script>
-import { browserPlayer } from 'browser'
+import globalModule from 'global'
 
 const DEFAULT_URL = 'https://m.baidu.com/'
-const DEFAULT_VIEWPORT = '960x266'
-const DEFAULT_ROTATION = 270
+const DEFAULT_BROWSER_MODE = 'native'
+const BROWSER_MODES = ['native', 'rotate270']
 
-function dataRootPath() {
-  if (typeof $dataDir === 'string' && $dataDir) return $dataDir
-  if (typeof $falcon !== 'undefined' && $falcon && typeof $falcon.$dataDir === 'string' && $falcon.$dataDir) {
-    return $falcon.$dataDir
+let keyboardProbeGlobal = null
+
+function getKeyboardProbeGlobal() {
+  if (!keyboardProbeGlobal) {
+    keyboardProbeGlobal = new globalModule.Global()
   }
-  try {
-    if (typeof globalThis !== 'undefined' && typeof globalThis.$dataDir === 'string' && globalThis.$dataDir) {
-      return globalThis.$dataDir
-    }
-  } catch (err) {
-    console.warn(`read data dir failed ${err}`)
-  }
-  return '/tmp/wpe-browser-data'
+  return keyboardProbeGlobal
 }
 
-function workspacePath(page) {
-  if (page && typeof page.$workspace === 'string' && page.$workspace) return page.$workspace
-  try {
-    if (typeof globalThis !== 'undefined' && typeof globalThis.$workspace === 'string' && globalThis.$workspace) {
-      return globalThis.$workspace
-    }
-  } catch (err) {
-    console.warn(`read workspace failed ${err}`)
-  }
-  if (typeof $falcon !== 'undefined' && $falcon && typeof $falcon.$workspace === 'string' && $falcon.$workspace) {
-    return $falcon.$workspace
-  }
-  if (typeof $workspace === 'string' && $workspace) return $workspace
-  const dataRoot = dataRootPath()
-  if (dataRoot.slice(-5) === '/data') return dataRoot.slice(0, -5) + '/a'
-  return ''
-}
-
-function browserDataPath(name) {
-  return dataRootPath() + '/browser/' + name
+function normalizeBrowserMode(value) {
+  const mode = `${value || ''}`
+  return BROWSER_MODES.indexOf(mode) >= 0 ? mode : DEFAULT_BROWSER_MODE
 }
 
 function normalizeUrl(url) {
@@ -78,18 +83,175 @@ export default {
       statusText: 'Ready',
       messageText: '准备启动 Direct WPE 浏览器',
       detailText: '',
-      autoLaunchDone: false,
+      selectedMode: DEFAULT_BROWSER_MODE,
+      keyboardProbeUuid: '',
+      keyboardProbeHandler: null,
+      keyboardProbeTimer: null,
+      keyboardProbeFocused: false,
+      keyboardProbeText: '',
     }
   },
   mounted() {
-    this.cleanupBrowser()
-    this.scheduleAutoLaunch()
+    this.applyPageOptions()
+    this.bindKeyboardProbe()
+  },
+  beforeDestroy() {
+    if (this.keyboardProbeTimer) {
+      clearTimeout(this.keyboardProbeTimer)
+      this.keyboardProbeTimer = null
+    }
+    this.unbindKeyboardProbe()
   },
   methods: {
-    scheduleAutoLaunch() {
-      if (this.autoLaunchDone) return
-      this.autoLaunchDone = true
-      setTimeout(() => this.launchBrowser(), 80)
+    pageOptions() {
+      return this.$page && this.$page.options ? this.$page.options : {}
+    },
+    applyPageOptions() {
+      const options = this.pageOptions()
+      this.selectedMode = normalizeBrowserMode(options.browserMode || this.selectedMode)
+      if (options.browserStatus) {
+        this.statusText = 'Ready'
+        this.messageText = '准备启动 Direct WPE 浏览器'
+        this.detailText = `${options.browserStatus}`
+      }
+    },
+    setMode(mode) {
+      this.selectedMode = normalizeBrowserMode(mode)
+      this.detailText = ''
+    },
+    bindKeyboardProbe() {
+      try {
+        const gm = getKeyboardProbeGlobal()
+        this.keyboardProbeHandler = (uuid, jsonData) => {
+          if (`${uuid || ''}` !== `${this.keyboardProbeUuid || ''}`) return
+          let result = null
+          try {
+            result = JSON.parse(jsonData || '{}')
+          } catch (err) {
+            this.detailText = `键盘回调解析失败 ${err}`
+            return
+          }
+          if (result && result.editConfirmed) {
+            this.detailText = `键盘返回: ${result.text || ''}`
+            this.keyboardProbeUuid = ''
+          }
+        }
+        if (gm.textEditFinished) {
+          gm.textEditFinished.on(this.keyboardProbeHandler)
+          console.warn('index keyboard probe listener mounted')
+        }
+      } catch (err) {
+        this.detailText = `键盘监听失败 ${err}`
+      }
+    },
+    unbindKeyboardProbe() {
+      try {
+        const gm = getKeyboardProbeGlobal()
+        if (gm.textEditFinished && this.keyboardProbeHandler) {
+          gm.textEditFinished.off(this.keyboardProbeHandler)
+        }
+      } catch (err) {
+        console.warn(`index keyboard probe unbind failed ${err}`)
+      }
+      this.keyboardProbeHandler = null
+      this.keyboardProbeUuid = ''
+    },
+    openKeyboardProbe() {
+      this.keyboardProbeFocused = true
+      this.detailText = 'textarea focus 键盘请求'
+      console.warn('index keyboard textarea focus request')
+      return
+    },
+    onKeyboardProbeTextEditFinished(result) {
+      const text = this.parseKeyboardProbeResult(result)
+      this.keyboardProbeText = text
+      this.keyboardProbeFocused = false
+      this.detailText = `textarea 键盘返回: ${text || '空'}`
+      console.warn(`index keyboard textarea finished ${text || ''}`)
+    },
+    onKeyboardProbeTextChanged(result) {
+      this.keyboardProbeText = this.parseKeyboardProbeResult(result)
+      console.warn(`index keyboard textarea changed ${this.keyboardProbeText || ''}`)
+    },
+    onKeyboardProbeFocus() {
+      console.warn('index keyboard textarea focused')
+    },
+    onKeyboardProbeBlur() {
+      this.keyboardProbeFocused = false
+      console.warn('index keyboard textarea blurred')
+    },
+    parseKeyboardProbeResult(result) {
+      if (!result) return ''
+      if (typeof result === 'string') {
+        try {
+          const parsed = JSON.parse(result)
+          return parsed.text || (parsed.records && parsed.records[0] && parsed.records[0].text) || parsed.contents || result
+        } catch (err) {
+          return result
+        }
+      }
+      if (typeof result === 'object') {
+        return result.text || (result.records && result.records[0] && result.records[0].text) || result.contents || ''
+      }
+      return `${result}`
+    },
+    openKeyboardProbeViaGlobal() {
+      try {
+        const request = {
+          uuid: `index_keyboard_probe_${Date.now()}`,
+          contents: '',
+          text: '',
+          placeholder: '键盘测试',
+          placeholderColor: '#878A99',
+          autofocus: true,
+          maxlength: 128,
+          showCursor: true,
+          cursorIndex: 0,
+          cursorColor: '#FF683D',
+          cursorSize: 3,
+          confirmButtonDisabledOnTextEmpty: false,
+          inputType: 'ZhCNPreferred',
+          keyboardType: 'normal',
+          multiLinesEditVisible: false,
+          capsLockSwitchOn: false,
+          micInputVisible: false,
+          isNetworkConnected: true,
+          enterButtonText: '确认',
+        }
+        const falcon = typeof $falcon !== 'undefined' ? $falcon : null
+        if (falcon && falcon.trigger) {
+          this.keyboardProbeUuid = request.uuid
+          falcon.trigger('requestIMAppShow', request)
+          this.detailText = `falcon 键盘请求 ${this.keyboardProbeUuid}`
+          console.warn(`index keyboard falcon request uuid ${this.keyboardProbeUuid}`)
+          return
+        }
+        const gm = getKeyboardProbeGlobal()
+        if (!gm.startTextEdit) {
+          this.detailText = 'startTextEdit 不存在'
+          return
+        }
+        this.keyboardProbeUuid = gm.startTextEdit(JSON.stringify({
+          text: '',
+          placeholder: '键盘测试',
+          placeholderColor: '#878A99',
+          autofocus: true,
+          maxlength: 128,
+          showCursor: true,
+          cursorColor: '#FF683D',
+          cursorSize: 3,
+          confirmButtonDisabledOnTextEmpty: false,
+          inputType: 'ZhCNPreferred',
+          multiLinesEditVisible: false,
+          capsLockSwitchOn: false,
+          enterButtonText: '确认',
+        })) || ''
+        this.detailText = this.keyboardProbeUuid ? `键盘请求 ${this.keyboardProbeUuid}` : '键盘请求失败'
+        console.warn(`index keyboard probe uuid ${this.keyboardProbeUuid}`)
+      } catch (err) {
+        this.detailText = `键盘启动失败 ${err}`
+        console.warn(`index keyboard probe failed ${err}`)
+      }
     },
     readInitialUrl() {
       const page = this.$page || {}
@@ -113,58 +275,27 @@ export default {
       }
       return DEFAULT_URL
     },
-    cleanupBrowser() {
-      try {
-        if (browserPlayer && browserPlayer.stopBrowser) {
-          browserPlayer.stopBrowser({ workdir: browserDataPath('') })
-        }
-      } catch (err) {
-        console.warn(`cleanup browser failed ${err}`)
-      }
-    },
-    stopBrowser() {
-      this.cleanupBrowser()
-      this.statusText = 'Stopped'
-      this.messageText = '浏览器已停止'
-      this.detailText = ''
-    },
     launchBrowser() {
       if (this.busy) return
       this.busy = true
-      this.statusText = 'Preparing'
-      this.messageText = '正在准备浏览器运行时'
+      this.statusText = 'Starting'
+      this.messageText = '正在进入浏览器'
       this.detailText = ''
 
-      setTimeout(() => {
-        try {
-          const workspace = workspacePath(this)
-          const dataDir = dataRootPath()
-          const runtimePath = browserPlayer.prepareRuntime({
-            workspace,
-            dataDir,
-          })
-          const workdir = browserDataPath('')
-          const logPath = browserDataPath('wpe-drm.log')
-          this.statusText = 'Starting'
-          this.messageText = '正在进入浏览器'
-          $falcon.navTo('frame', {
-            runtimePath,
-            workdir,
-            logPath,
-            url: this.readInitialUrl(),
-            viewport: DEFAULT_VIEWPORT,
-            rotation: DEFAULT_ROTATION,
-          })
-        } catch (err) {
-          const message = err && err.message ? err.message : `${err}`
-          this.statusText = 'Error'
-          this.messageText = '浏览器启动失败'
-          this.detailText = message
-          console.warn(`launch browser failed ${message}`)
-        } finally {
-          this.busy = false
-        }
-      }, 0)
+      try {
+        $falcon.navTo('frame', {
+          url: this.readInitialUrl(),
+          browserMode: this.selectedMode,
+          returnPage: 'index',
+        })
+      } catch (err) {
+        const message = err && err.message ? err.message : `${err}`
+        this.statusText = 'Error'
+        this.messageText = '浏览器启动失败'
+        this.detailText = message
+        console.warn(`launch browser nav failed ${message}`)
+        this.busy = false
+      }
     },
   },
 }
@@ -176,12 +307,22 @@ export default {
   height: 100vh;
   background-color: #0c1014;
   color: #f5f7fa;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.launcher-shell {
+  background-color: #0c1014;
+  color: #f5f7fa;
+  width: 100vw;
+  height: 100vh;
 }
 
 .topbar {
-  height: 48px;
-  padding-left: 18px;
-  padding-right: 18px;
+  height: 38px;
+  padding-left: 12px;
+  padding-right: 12px;
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
@@ -189,41 +330,77 @@ export default {
 }
 
 .title {
-  font-size: 20px;
+  font-size: 18px;
   color: #ffffff;
 }
 
 .status {
-  font-size: 15px;
+  font-size: 14px;
   color: #8fd0ff;
 }
 
 .content {
-  padding-left: 28px;
-  padding-right: 28px;
-  padding-top: 28px;
+  padding-left: 10px;
+  padding-right: 10px;
+  padding-top: 8px;
 }
 
 .message {
-  font-size: 22px;
+  font-size: 18px;
   color: #ffffff;
 }
 
 .detail {
-  margin-top: 14px;
+  margin-top: 8px;
   font-size: 15px;
   color: #ffb4a8;
 }
 
-.primary-button,
-.secondary-button {
-  margin-top: 22px;
-  width: 180px;
-  height: 42px;
-  line-height: 42px;
+.mode-block {
+  margin-top: 8px;
+}
+
+.section-label {
+  font-size: 13px;
+  color: #9fb1c0;
+}
+
+.mode-row,
+.button-row {
+  flex-direction: row;
+  align-items: center;
+}
+
+.mode-row {
+  margin-top: 5px;
+}
+
+.mode-option {
+  margin-right: 8px;
+  width: 96px;
+  height: 30px;
+  line-height: 30px;
   text-align: center;
   border-radius: 6px;
-  font-size: 17px;
+  font-size: 14px;
+  color: #d9e6f2;
+  background-color: #26323d;
+}
+
+.mode-option-active {
+  color: #081018;
+  background-color: #8fd0ff;
+}
+
+.primary-button {
+  margin-top: 10px;
+  margin-right: 8px;
+  width: 112px;
+  height: 36px;
+  line-height: 36px;
+  text-align: center;
+  border-radius: 6px;
+  font-size: 15px;
 }
 
 .primary-button {
@@ -232,7 +409,28 @@ export default {
 }
 
 .secondary-button {
+  margin-top: 10px;
+  margin-right: 8px;
+  width: 112px;
+  height: 36px;
+  line-height: 36px;
+  text-align: center;
+  border-radius: 6px;
+  font-size: 15px;
   color: #d9e6f2;
   background-color: #26323d;
 }
+
+.keyboard-probe-field {
+  margin-top: 4px;
+  width: 260px;
+  height: 42px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  opacity: 1;
+  color: #ffffff;
+  background-color: #18212a;
+  font-size: 18px;
+}
+
 </style>
