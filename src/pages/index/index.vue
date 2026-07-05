@@ -19,6 +19,7 @@
         </div>
 
         <textarea
+          v-if="keyboardProbeVisible"
           ref="keyboardProbeField"
           class="keyboard-probe-field"
           :value="keyboardProbeText"
@@ -43,20 +44,9 @@
 </template>
 
 <script>
-import globalModule from 'global'
-
 const DEFAULT_URL = 'https://m.baidu.com/'
 const DEFAULT_BROWSER_MODE = 'native'
 const BROWSER_MODES = ['native', 'rotate270']
-
-let keyboardProbeGlobal = null
-
-function getKeyboardProbeGlobal() {
-  if (!keyboardProbeGlobal) {
-    keyboardProbeGlobal = new globalModule.Global()
-  }
-  return keyboardProbeGlobal
-}
 
 function normalizeBrowserMode(value) {
   const mode = `${value || ''}`
@@ -84,79 +74,46 @@ export default {
       messageText: '准备启动 Direct WPE 浏览器',
       detailText: '',
       selectedMode: DEFAULT_BROWSER_MODE,
-      keyboardProbeUuid: '',
-      keyboardProbeHandler: null,
-      keyboardProbeTimer: null,
+      keyboardProbeVisible: false,
       keyboardProbeFocused: false,
       keyboardProbeText: '',
     }
   },
   mounted() {
-    this.applyPageOptions()
-    this.bindKeyboardProbe()
+    this.applyPageOptions(this.pageOptions(), false)
   },
-  beforeDestroy() {
-    if (this.keyboardProbeTimer) {
-      clearTimeout(this.keyboardProbeTimer)
-      this.keyboardProbeTimer = null
-    }
-    this.unbindKeyboardProbe()
+  onShow() {
+    this.applyPageOptions(this.pageOptions(), true)
+  },
+  onNewOptions(options) {
+    this.applyPageOptions(options || {}, true)
   },
   methods: {
     pageOptions() {
       return this.$page && this.$page.options ? this.$page.options : {}
     },
-    applyPageOptions() {
-      const options = this.pageOptions()
-      this.selectedMode = normalizeBrowserMode(options.browserMode || this.selectedMode)
-      if (options.browserStatus) {
+    applyPageOptions(options, resetTransient) {
+      const pageOptions = options || {}
+      const wasLaunching = this.busy || this.messageText === '正在进入浏览器'
+      this.selectedMode = normalizeBrowserMode(pageOptions.browserMode || this.selectedMode)
+      if (resetTransient || this.busy) {
+        this.busy = false
         this.statusText = 'Ready'
         this.messageText = '准备启动 Direct WPE 浏览器'
-        this.detailText = `${options.browserStatus}`
+        this.keyboardProbeFocused = false
+      }
+      if (pageOptions.browserStatus) {
+        this.detailText = `${pageOptions.browserStatus}`
+      } else if (resetTransient && wasLaunching) {
+        this.detailText = ''
       }
     },
     setMode(mode) {
       this.selectedMode = normalizeBrowserMode(mode)
       this.detailText = ''
     },
-    bindKeyboardProbe() {
-      try {
-        const gm = getKeyboardProbeGlobal()
-        this.keyboardProbeHandler = (uuid, jsonData) => {
-          if (`${uuid || ''}` !== `${this.keyboardProbeUuid || ''}`) return
-          let result = null
-          try {
-            result = JSON.parse(jsonData || '{}')
-          } catch (err) {
-            this.detailText = `键盘回调解析失败 ${err}`
-            return
-          }
-          if (result && result.editConfirmed) {
-            this.detailText = `键盘返回: ${result.text || ''}`
-            this.keyboardProbeUuid = ''
-          }
-        }
-        if (gm.textEditFinished) {
-          gm.textEditFinished.on(this.keyboardProbeHandler)
-          console.warn('index keyboard probe listener mounted')
-        }
-      } catch (err) {
-        this.detailText = `键盘监听失败 ${err}`
-      }
-    },
-    unbindKeyboardProbe() {
-      try {
-        const gm = getKeyboardProbeGlobal()
-        if (gm.textEditFinished && this.keyboardProbeHandler) {
-          gm.textEditFinished.off(this.keyboardProbeHandler)
-        }
-      } catch (err) {
-        console.warn(`index keyboard probe unbind failed ${err}`)
-      }
-      this.keyboardProbeHandler = null
-      this.keyboardProbeUuid = ''
-    },
     openKeyboardProbe() {
+      this.keyboardProbeVisible = true
       this.keyboardProbeFocused = true
       this.detailText = 'textarea focus 键盘请求'
       console.warn('index keyboard textarea focus request')
@@ -195,64 +152,6 @@ export default {
       }
       return `${result}`
     },
-    openKeyboardProbeViaGlobal() {
-      try {
-        const request = {
-          uuid: `index_keyboard_probe_${Date.now()}`,
-          contents: '',
-          text: '',
-          placeholder: '键盘测试',
-          placeholderColor: '#878A99',
-          autofocus: true,
-          maxlength: 128,
-          showCursor: true,
-          cursorIndex: 0,
-          cursorColor: '#FF683D',
-          cursorSize: 3,
-          confirmButtonDisabledOnTextEmpty: false,
-          inputType: 'ZhCNPreferred',
-          keyboardType: 'normal',
-          multiLinesEditVisible: false,
-          capsLockSwitchOn: false,
-          micInputVisible: false,
-          isNetworkConnected: true,
-          enterButtonText: '确认',
-        }
-        const falcon = typeof $falcon !== 'undefined' ? $falcon : null
-        if (falcon && falcon.trigger) {
-          this.keyboardProbeUuid = request.uuid
-          falcon.trigger('requestIMAppShow', request)
-          this.detailText = `falcon 键盘请求 ${this.keyboardProbeUuid}`
-          console.warn(`index keyboard falcon request uuid ${this.keyboardProbeUuid}`)
-          return
-        }
-        const gm = getKeyboardProbeGlobal()
-        if (!gm.startTextEdit) {
-          this.detailText = 'startTextEdit 不存在'
-          return
-        }
-        this.keyboardProbeUuid = gm.startTextEdit(JSON.stringify({
-          text: '',
-          placeholder: '键盘测试',
-          placeholderColor: '#878A99',
-          autofocus: true,
-          maxlength: 128,
-          showCursor: true,
-          cursorColor: '#FF683D',
-          cursorSize: 3,
-          confirmButtonDisabledOnTextEmpty: false,
-          inputType: 'ZhCNPreferred',
-          multiLinesEditVisible: false,
-          capsLockSwitchOn: false,
-          enterButtonText: '确认',
-        })) || ''
-        this.detailText = this.keyboardProbeUuid ? `键盘请求 ${this.keyboardProbeUuid}` : '键盘请求失败'
-        console.warn(`index keyboard probe uuid ${this.keyboardProbeUuid}`)
-      } catch (err) {
-        this.detailText = `键盘启动失败 ${err}`
-        console.warn(`index keyboard probe failed ${err}`)
-      }
-    },
     readInitialUrl() {
       const page = this.$page || {}
       const app = typeof $falcon !== 'undefined' && $falcon.$app
@@ -277,6 +176,7 @@ export default {
     },
     launchBrowser() {
       if (this.busy) return
+      this.keyboardProbeFocused = false
       this.busy = true
       this.statusText = 'Starting'
       this.messageText = '正在进入浏览器'

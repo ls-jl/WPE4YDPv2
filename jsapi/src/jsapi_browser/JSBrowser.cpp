@@ -1,5 +1,4 @@
 #include "jqutil_v2/jqutil.h"
-#include "jqutil_v2/JQSignal.h"
 #include "utils/log.h"
 
 #include <algorithm>
@@ -621,9 +620,6 @@ public:
 
     ~JSBrowserPlayer() override = default;
 
-    JQSignal<std::string> onStateChanged;
-    JQSignal<std::string> onError;
-
     void prepareRuntime(JQFunctionInfo& info)
     {
         JSContext* ctx = info.GetContext();
@@ -955,16 +951,6 @@ public:
         info.GetReturnValue().Set(currentDrmModeSpec());
     }
 
-    void getState(JQFunctionInfo& info)
-    {
-        std::string payload;
-        {
-            std::lock_guard<std::mutex> lock(processMutex_);
-            payload = makeStatePayloadLocked();
-        }
-        info.GetReturnValue().Set(payload);
-    }
-
 protected:
     void OnGCCollect() override
     {
@@ -981,45 +967,14 @@ private:
         return workdir_;
     }
 
-    std::string makeStatePayloadLocked()
-    {
-        pid_t pid = browserPid_ > 1 ? browserPid_ : readPidFile(pidFile_);
-        bool running = processExists(pid);
-        std::ostringstream ss;
-        ss << "{";
-        ss << "\"state\":\"" << jsonEscape(lastState_) << "\",";
-        ss << "\"detail\":\"" << jsonEscape(lastDetail_) << "\",";
-        ss << "\"running\":" << (running ? "true" : "false") << ",";
-        ss << "\"pid\":" << static_cast<long>(running ? pid : -1) << ",";
-        ss << "\"runtimePath\":\"" << jsonEscape(runtimePath_) << "\",";
-        ss << "\"workdir\":\"" << jsonEscape(workdir_) << "\",";
-        ss << "\"logPath\":\"" << jsonEscape(logPath_) << "\"";
-        ss << "}";
-        return ss.str();
-    }
-
     void publishState(const std::string& state, const std::string& detail)
     {
-        std::string payload;
-        {
-            std::lock_guard<std::mutex> lock(processMutex_);
-            lastState_ = state;
-            lastDetail_ = detail;
-            payload = makeStatePayloadLocked();
-        }
         LOGI("%s state %s %s", kTag, state.c_str(), detail.c_str());
-        onStateChanged.emit(payload);
     }
 
     void publishError(const std::string& message)
     {
-        {
-            std::lock_guard<std::mutex> lock(processMutex_);
-            lastState_ = "error";
-            lastDetail_ = message;
-        }
         LOGE("%s error %s", kTag, message.c_str());
-        onError.emit(message);
     }
 
     void throwError(JQFunctionInfo& info, const std::string& message)
@@ -1062,8 +1017,6 @@ private:
     std::string workdir_;
     std::string runtimePath_;
     std::string logPath_;
-    std::string lastState_ = "idle";
-    std::string lastDetail_;
 };
 
 static JSValue createBrowserPlayer(JQModuleEnv* env)
@@ -1086,9 +1039,6 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("respondKeyboardRequest", &JSBrowserPlayer::respondKeyboardRequest);
     tpl->SetProtoMethod("getSystemDisplayConfig", &JSBrowserPlayer::getSystemDisplayConfig);
     tpl->SetProtoMethod("getDrmScreenSize", &JSBrowserPlayer::getDrmScreenSize);
-    tpl->SetProtoMethod("getState", &JSBrowserPlayer::getState);
-    tpl->PrototypeTemplate()->Set("onStateChanged", &JSBrowserPlayer::onStateChanged);
-    tpl->PrototypeTemplate()->Set("onError", &JSBrowserPlayer::onError);
     return tpl->CallConstructor();
 }
 

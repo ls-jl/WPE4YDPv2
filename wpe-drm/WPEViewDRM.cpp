@@ -95,28 +95,36 @@ static bool parseSize(const char* value, uint32_t& width, uint32_t& height)
     return true;
 }
 
+// 以下配置全部来自环境变量，进程生命周期内不变；用 static 缓存，
+// 避免在每帧 copy/commit 热路径里反复 getenv+解析。
 static PanelSize configuredPanelSize()
 {
-    PanelSize size;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    if (parseSize(getenv("WPE_PANEL_SIZE"), width, height)) {
-        size.width = width;
-        size.height = height;
-    }
+    static PanelSize size = []() {
+        PanelSize parsed;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        if (parseSize(getenv("WPE_PANEL_SIZE"), width, height)) {
+            parsed.width = width;
+            parsed.height = height;
+        }
+        return parsed;
+    }();
     return size;
 }
 
 static bool chromeLayoutResizeEnabled()
 {
-    const char* value = getenv("WPE_CHROME_LAYOUT");
-    if (!value || !*value)
-        return true;
-    if (!g_ascii_strcasecmp(value, "resize"))
-        return true;
-    if (!g_ascii_strcasecmp(value, "overlay"))
-        return false;
-    return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off") && g_ascii_strcasecmp(value, "no");
+    static bool enabled = []() {
+        const char* value = getenv("WPE_CHROME_LAYOUT");
+        if (!value || !*value)
+            return true;
+        if (!g_ascii_strcasecmp(value, "resize"))
+            return true;
+        if (!g_ascii_strcasecmp(value, "overlay"))
+            return false;
+        return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off") && g_ascii_strcasecmp(value, "no");
+    }();
+    return enabled;
 }
 
 static PanelSize scanoutPanelForSource(uint32_t sourceWidth, uint32_t sourceHeight)
@@ -133,8 +141,11 @@ static PanelSize scanoutPanelForSource(uint32_t sourceWidth, uint32_t sourceHeig
 
 static const char* drmFitMode()
 {
-    const char* fit = getenv("WPE_DRM_FIT");
-    return fit && *fit ? fit : "panel-native";
+    static const char* mode = []() {
+        const char* fit = getenv("WPE_DRM_FIT");
+        return fit && *fit ? fit : "panel-native";
+    }();
+    return mode;
 }
 
 static uint32_t rotatedWidth(uint32_t width, uint32_t height, OutputRotation rotation)
@@ -224,42 +235,70 @@ static uint64_t drmPlaneRotate0Value()
 
 static uint32_t chromeReservedTopInset(uint32_t panelHeight);
 
-static void setRotatedPanelPixel(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t x, uint32_t y, uint32_t color)
-{
-    if (x >= panelWidth || y >= panelHeight)
-        return;
-
-    uint32_t dx = x;
-    uint32_t dy = y;
-    switch (rotation) {
-    case OutputRotation::Rotate0:
-        break;
-    case OutputRotation::Rotate90:
-        dx = panelHeight - 1 - y;
-        dy = x;
-        break;
-    case OutputRotation::Rotate180:
-        dx = panelWidth - 1 - x;
-        dy = panelHeight - 1 - y;
-        break;
-    case OutputRotation::Rotate270:
-        dx = y;
-        dy = panelWidth - 1 - x;
-        break;
-    }
-
-    if (dx >= destinationWidth || dy >= destinationHeight)
-        return;
-
-    auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(dy) * destinationPitch);
-    row[dx] = color;
-}
-
 static void fillARGB8888(uint8_t* destination, uint32_t destinationPitch, uint32_t width, uint32_t height, uint32_t color)
 {
     for (uint32_t y = 0; y < height; ++y) {
         auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(y) * destinationPitch);
         std::fill(row, row + width, color);
+    }
+}
+
+// 把一行 panel 坐标系的像素写入旋转后的目标缓冲。调用方保证
+// panelY < panelHeight 且 x0+width <= panelWidth，因此无需逐像素做边界检查。
+static void writeRotatedPanelRow(const uint32_t* sourceRow, uint8_t* destination, uint32_t destinationPitch, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t panelY, uint32_t x0, uint32_t width)
+{
+    switch (rotation) {
+    case OutputRotation::Rotate0: {
+        auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(panelY) * destinationPitch);
+        memcpy(row + x0, sourceRow, static_cast<size_t>(width) * 4);
+        return;
+    }
+    case OutputRotation::Rotate90: {
+        // dx = panelHeight-1-panelY（列固定），dy = x
+        auto* column = destination + static_cast<size_t>(panelHeight - 1 - panelY) * 4 + static_cast<size_t>(x0) * destinationPitch;
+        for (uint32_t x = 0; x < width; ++x)
+            *reinterpret_cast<uint32_t*>(column + static_cast<size_t>(x) * destinationPitch) = sourceRow[x];
+        return;
+    }
+    case OutputRotation::Rotate180: {
+        auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(panelHeight - 1 - panelY) * destinationPitch);
+        for (uint32_t x = 0; x < width; ++x)
+            row[panelWidth - 1 - (x0 + x)] = sourceRow[x];
+        return;
+    }
+    case OutputRotation::Rotate270: {
+        // dx = panelY（列固定），dy = panelWidth-1-x
+        auto* column = destination + static_cast<size_t>(panelY) * 4 + static_cast<size_t>(panelWidth - 1 - x0) * destinationPitch;
+        for (uint32_t x = 0; x < width; ++x)
+            *reinterpret_cast<uint32_t*>(column - static_cast<size_t>(x) * destinationPitch) = sourceRow[x];
+        return;
+    }
+    }
+}
+
+static void fillRotatedPanelRow(uint8_t* destination, uint32_t destinationPitch, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t panelY, uint32_t x0, uint32_t width, uint32_t color)
+{
+    switch (rotation) {
+    case OutputRotation::Rotate0:
+    case OutputRotation::Rotate180: {
+        uint32_t rowY = rotation == OutputRotation::Rotate0 ? panelY : panelHeight - 1 - panelY;
+        auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(rowY) * destinationPitch);
+        uint32_t start = rotation == OutputRotation::Rotate0 ? x0 : panelWidth - x0 - width;
+        std::fill(row + start, row + start + width, color);
+        return;
+    }
+    case OutputRotation::Rotate90: {
+        auto* column = destination + static_cast<size_t>(panelHeight - 1 - panelY) * 4 + static_cast<size_t>(x0) * destinationPitch;
+        for (uint32_t x = 0; x < width; ++x)
+            *reinterpret_cast<uint32_t*>(column + static_cast<size_t>(x) * destinationPitch) = color;
+        return;
+    }
+    case OutputRotation::Rotate270: {
+        auto* column = destination + static_cast<size_t>(panelY) * 4 + static_cast<size_t>(panelWidth - 1 - x0) * destinationPitch;
+        for (uint32_t x = 0; x < width; ++x)
+            *reinterpret_cast<uint32_t*>(column - static_cast<size_t>(x) * destinationPitch) = color;
+        return;
+    }
     }
 }
 
@@ -269,23 +308,31 @@ static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uin
     auto destinationHeight = rotatedHeight(panelWidth, panelHeight, rotation);
     auto topInset = chromeReservedTopInset(panelHeight);
     if (topInset || panelWidth != sourceWidth || panelHeight != sourceHeight) {
-        fillARGB8888(destination, destinationPitch, destinationWidth, destinationHeight, 0xff000000);
-
         uint32_t copyWidth = std::min(sourceWidth, panelWidth);
         uint32_t availableHeight = panelHeight > topInset ? panelHeight - topInset : 0;
         uint32_t copyHeight = std::min(sourceHeight, availableHeight);
+        if (!copyWidth || !copyHeight) {
+            fillARGB8888(destination, destinationPitch, destinationWidth, destinationHeight, 0xff000000);
+            return;
+        }
+
+        // 只清网页内容覆盖不到的区域（顶部 chrome 让位带 + 右侧信箱带），
+        // 不再每帧整幅清屏后重画。
+        for (uint32_t panelY = 0; panelY < topInset; ++panelY)
+            fillRotatedPanelRow(destination, destinationPitch, panelWidth, panelHeight, rotation, panelY, 0, panelWidth, 0xff000000);
+        if (copyWidth < panelWidth) {
+            for (uint32_t panelY = topInset; panelY < panelHeight; ++panelY)
+                fillRotatedPanelRow(destination, destinationPitch, panelWidth, panelHeight, rotation, panelY, copyWidth, panelWidth - copyWidth, 0xff000000);
+        }
+
         for (uint32_t sourceY = 0; sourceY < copyHeight; ++sourceY) {
             const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
-            uint32_t panelY = sourceY + topInset;
-            for (uint32_t sourceX = 0; sourceX < copyWidth; ++sourceX)
-                setRotatedPanelPixel(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation, sourceX, panelY, sourceRow[sourceX]);
+            writeRotatedPanelRow(sourceRow, destination, destinationPitch, panelWidth, panelHeight, rotation, sourceY + topInset, 0, copyWidth);
         }
-        if (copyWidth && copyHeight && copyHeight < availableHeight) {
+        if (copyHeight < availableHeight) {
             const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(copyHeight - 1) * sourceStride);
-            for (uint32_t panelY = topInset + copyHeight; panelY < topInset + availableHeight; ++panelY) {
-                for (uint32_t sourceX = 0; sourceX < copyWidth; ++sourceX)
-                    setRotatedPanelPixel(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation, sourceX, panelY, sourceRow[sourceX]);
-            }
+            for (uint32_t panelY = topInset + copyHeight; panelY < topInset + availableHeight; ++panelY)
+                writeRotatedPanelRow(sourceRow, destination, destinationPitch, panelWidth, panelHeight, rotation, panelY, 0, copyWidth);
         }
         return;
     }
@@ -350,16 +397,35 @@ struct ChromeRenderState {
 
 static bool chromeEnabled()
 {
-    const char* value = getenv("WPE_CHROME_ENABLED");
-    if (!value || !*value)
-        return true;
-    return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off");
+    static bool enabled = []() {
+        const char* value = getenv("WPE_CHROME_ENABLED");
+        if (!value || !*value)
+            return true;
+        return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off");
+    }();
+    return enabled;
 }
 
 static const char* chromeRenderStatePath()
 {
-    const char* path = getenv("WPE_CHROME_RENDER_STATE");
-    return path && *path ? path : "/tmp/wpe-drm2-chrome-state.ini";
+    static const char* statePath = []() {
+        const char* path = getenv("WPE_CHROME_RENDER_STATE");
+        return path && *path ? path : "/tmp/wpe-drm2-chrome-state.ini";
+    }();
+    return statePath;
+}
+
+static long chromeAnimationDurationMS()
+{
+    static long durationMS = []() -> long {
+        const char* value = getenv("WPE_CHROME_ANIMATION_MS");
+        char* end = nullptr;
+        auto parsed = value && *value ? strtol(value, &end, 10) : 160;
+        if (end == value || parsed <= 0)
+            parsed = 160;
+        return parsed;
+    }();
+    return durationMS;
 }
 
 static void copyKeyString(GKeyFile* keyFile, const char* group, const char* key, char* target, size_t targetSize)
@@ -436,62 +502,6 @@ static ChromeRenderState readChromeRenderState()
     return state;
 }
 
-static uint32_t chromeReservedTopInset(uint32_t panelHeight)
-{
-    if (!panelHeight)
-        return 0;
-    auto chrome = readChromeRenderState();
-    if (!chrome.enabled)
-        return 0;
-    auto chromeHeight = std::min<uint32_t>(std::clamp<unsigned>(chrome.height, 24, 80), panelHeight - 1);
-    bool hasPanel = chrome.panel[0] && strcmp(chrome.panel, "none");
-    if (chromeLayoutResizeEnabled())
-        return (chrome.visible || hasPanel) ? chromeHeight : 0;
-
-    double fraction = chrome.visible ? 1.0 : 0.0;
-    if (chrome.transitionUS > 0) {
-        const char* value = getenv("WPE_CHROME_ANIMATION_MS");
-        char* end = nullptr;
-        auto durationMS = value && *value ? strtol(value, &end, 10) : 160;
-        if (end == value || durationMS <= 0)
-            durationMS = 160;
-        auto elapsedUS = std::max<gint64>(0, g_get_monotonic_time() - chrome.transitionUS);
-        double t = std::min<double>(1.0, static_cast<double>(elapsedUS) / (durationMS * 1000.0));
-        double eased = 1.0 - std::pow(1.0 - t, 3.0);
-        fraction = chrome.visible ? eased : (1.0 - eased);
-    }
-    return std::min<uint32_t>(chromeHeight, static_cast<uint32_t>(std::lround(chromeHeight * fraction)));
-}
-
-static bool chromeAnimationActive()
-{
-    auto chrome = readChromeRenderState();
-    if (!chrome.enabled || chrome.transitionUS <= 0)
-        return false;
-    const char* value = getenv("WPE_CHROME_ANIMATION_MS");
-    char* end = nullptr;
-    auto durationMS = value && *value ? strtol(value, &end, 10) : 160;
-    if (end == value || durationMS <= 0)
-        durationMS = 160;
-    return g_get_monotonic_time() - chrome.transitionUS < durationMS * 1000;
-}
-
-static double chromeShownFraction(const ChromeRenderState& chrome)
-{
-    double fraction = chrome.visible ? 1.0 : 0.0;
-    if (chrome.transitionUS <= 0)
-        return fraction;
-    const char* value = getenv("WPE_CHROME_ANIMATION_MS");
-    char* end = nullptr;
-    auto durationMS = value && *value ? strtol(value, &end, 10) : 160;
-    if (end == value || durationMS <= 0)
-        durationMS = 160;
-    auto elapsedUS = std::max<gint64>(0, g_get_monotonic_time() - chrome.transitionUS);
-    double t = std::min<double>(1.0, static_cast<double>(elapsedUS) / (durationMS * 1000.0));
-    double eased = 1.0 - std::pow(1.0 - t, 3.0);
-    return chrome.visible ? eased : (1.0 - eased);
-}
-
 static guint chromeRenderStateHash()
 {
     char* contents = nullptr;
@@ -502,6 +512,77 @@ static guint chromeRenderStateHash()
     hash ^= static_cast<guint>(length);
     g_free(contents);
     return hash;
+}
+
+// chrome 渲染状态缓存：INI 只在文件内容（hash）变化时重新解析。
+// 之前每一渲染帧至少全量读+解析 2 次，另有 33ms 轮询再读 1 次，
+// 空闲时也有约 60 次磁盘读/秒，而这一切都发生在软件拷贝主循环里。
+struct ChromeStateCache {
+    ChromeRenderState state;
+    guint hash { 0 };
+    bool valid { false };
+};
+
+static ChromeStateCache& chromeStateCache()
+{
+    static ChromeStateCache cache;
+    return cache;
+}
+
+// 由 chrome 轮询调用：探测文件变化并刷新缓存，返回是否有变化。
+static bool refreshChromeRenderState()
+{
+    auto& cache = chromeStateCache();
+    guint hash = chromeRenderStateHash();
+    if (cache.valid && hash == cache.hash)
+        return false;
+    cache.hash = hash;
+    cache.state = readChromeRenderState();
+    cache.valid = true;
+    return true;
+}
+
+static const ChromeRenderState& cachedChromeRenderState()
+{
+    auto& cache = chromeStateCache();
+    if (!cache.valid)
+        refreshChromeRenderState();
+    return cache.state;
+}
+
+static double chromeShownFraction(const ChromeRenderState& chrome)
+{
+    double fraction = chrome.visible ? 1.0 : 0.0;
+    if (chrome.transitionUS <= 0)
+        return fraction;
+    auto durationMS = chromeAnimationDurationMS();
+    auto elapsedUS = std::max<gint64>(0, g_get_monotonic_time() - chrome.transitionUS);
+    double t = std::min<double>(1.0, static_cast<double>(elapsedUS) / (durationMS * 1000.0));
+    double eased = 1.0 - std::pow(1.0 - t, 3.0);
+    return chrome.visible ? eased : (1.0 - eased);
+}
+
+static uint32_t chromeReservedTopInset(uint32_t panelHeight)
+{
+    if (!panelHeight)
+        return 0;
+    const auto& chrome = cachedChromeRenderState();
+    if (!chrome.enabled)
+        return 0;
+    auto chromeHeight = std::min<uint32_t>(std::clamp<unsigned>(chrome.height, 24, 80), panelHeight - 1);
+    bool hasPanel = chrome.panel[0] && strcmp(chrome.panel, "none");
+    if (chromeLayoutResizeEnabled())
+        return (chrome.visible || hasPanel) ? chromeHeight : 0;
+
+    return std::min<uint32_t>(chromeHeight, static_cast<uint32_t>(std::lround(chromeHeight * chromeShownFraction(chrome))));
+}
+
+static bool chromeAnimationActive()
+{
+    const auto& chrome = cachedChromeRenderState();
+    if (!chrome.enabled || chrome.transitionUS <= 0)
+        return false;
+    return g_get_monotonic_time() - chrome.transitionUS < chromeAnimationDurationMS() * 1000;
 }
 
 static void fontRows(char c, uint8_t rows[7])
@@ -658,7 +739,7 @@ private:
 
 static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
 {
-    auto chrome = readChromeRenderState();
+    const auto& chrome = cachedChromeRenderState();
     if (!chrome.enabled)
         return;
     static bool loggedChromeOverlay;
@@ -727,6 +808,30 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
 
     if (chrome.touchDebug)
         painter.drawText(panelWidth - 140, panelY + 10, "TOUCH DEBUG", accent, 1, 130);
+}
+
+class DRMScanoutBuffer;
+
+// 挂在 WPEBuffer user_data 上的缓存：直扫路径缓存 scanout buffer（原有行为），
+// 旋转路径缓存源 dmabuf 的 mmap 映射，避免每帧 mmap/munmap（WebKit 复用一个
+// 小 buffer 池，映射可以跟随 buffer 生命周期）。
+struct WPEBufferDRMUserData {
+    DRMScanoutBuffer* scanoutBuffer { nullptr }; // owned
+    void* sourceMapping { nullptr };
+    size_t sourceMappingSize { 0 };
+    ~WPEBufferDRMUserData();
+};
+
+static WPEBufferDRMUserData* ensureBufferUserData(WPEBuffer* buffer)
+{
+    auto* userData = static_cast<WPEBufferDRMUserData*>(wpe_buffer_get_user_data(buffer));
+    if (!userData) {
+        userData = new WPEBufferDRMUserData();
+        wpe_buffer_set_user_data(buffer, userData, reinterpret_cast<GDestroyNotify>(+[](void* data) {
+            delete static_cast<WPEBufferDRMUserData*>(data);
+        }));
+    }
+    return userData;
 }
 
 class DRMScanoutBuffer {
@@ -1006,8 +1111,12 @@ public:
         auto* destination = static_cast<uint8_t*>(m_mapping);
         auto topInset = chromeReservedTopInset(m_height);
         if (topInset) {
-            for (uint32_t y = 0; y < m_height; ++y)
-                memset(destination + static_cast<size_t>(y) * m_pitch, 0xff, rowBytes);
+            // 只清顶部 chrome 让位带；其余行随后被内容整行覆盖，无需先 memset。
+            // 填色与旋转路径统一为不透明黑。
+            for (uint32_t y = 0; y < topInset && y < m_height; ++y) {
+                auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(y) * m_pitch);
+                std::fill(row, row + m_width, 0xff000000);
+            }
             uint32_t copyHeight = m_height > topInset ? m_height - topInset : 0;
             for (uint32_t y = 0; y < copyHeight; ++y)
                 memcpy(destination + static_cast<size_t>(y + topInset) * m_pitch, source + static_cast<size_t>(y) * sourceStride, rowBytes);
@@ -1072,16 +1181,26 @@ public:
 
         size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
         int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
-        void* mappedSource = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, sourceFD, 0);
-        if (mappedSource == MAP_FAILED) {
-            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap source failed: %s", strerror(errno));
-            return false;
+        auto* userData = ensureBufferUserData(buffer);
+        if (userData->sourceMapping && userData->sourceMappingSize != mapSize) {
+            munmap(userData->sourceMapping, userData->sourceMappingSize);
+            userData->sourceMapping = nullptr;
+            userData->sourceMappingSize = 0;
+        }
+        if (!userData->sourceMapping) {
+            void* mappedSource = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, sourceFD, 0);
+            if (mappedSource == MAP_FAILED) {
+                g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap source failed: %s", strerror(errno));
+                return false;
+            }
+            userData->sourceMapping = mappedSource;
+            userData->sourceMappingSize = mapSize;
         }
 
         struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncStart);
 
-        const auto* source = static_cast<const uint8_t*>(mappedSource) + sourceOffset;
+        const auto* source = static_cast<const uint8_t*>(userData->sourceMapping) + sourceOffset;
         auto* destination = static_cast<uint8_t*>(m_mapping);
         auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
         copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
@@ -1089,7 +1208,6 @@ public:
 
         struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
-        munmap(mappedSource, mapSize);
         return true;
     }
 
@@ -1130,6 +1248,13 @@ private:
     mutable UnixFileDescriptor m_fenceFD;
 };
 
+WPEBufferDRMUserData::~WPEBufferDRMUserData()
+{
+    delete scanoutBuffer;
+    if (sourceMapping)
+        munmap(sourceMapping, sourceMappingSize);
+}
+
 /**
  * WPEViewDRM:
  *
@@ -1155,7 +1280,6 @@ struct _WPEViewDRMPrivate {
     Vector<drm_mode_rect> queuedDamageRects;
     drmEventContext eventContext;
     GRefPtr<GSource> eventSource;
-    GRefPtr<GSource> rotationSource;
     GRefPtr<GSource> chromeSource;
     GRefPtr<GSource> frameThrottleSource;
     OptionSet<UpdateFlags> updateFlags;
@@ -1168,7 +1292,7 @@ struct _WPEViewDRMPrivate {
     gint64 statsStartUS { 0 };
     gint64 lastFrameCommitUS { 0 };
     gint64 frameThrottleIntervalUS { 0 };
-    guint chromeStateHash { 0 };
+    unsigned chromePollTick { 0 };
     OutputRotation outputRotation { OutputRotation::Rotate0 };
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEViewDRM, wpe_view_drm, WPE_TYPE_VIEW, WPEView)
@@ -1311,6 +1435,8 @@ static void wpeViewDRMConstructed(GObject* object)
     auto* priv = WPE_VIEW_DRM(view)->priv;
     priv->refreshDuration = Seconds(1 / (wpe_screen_get_refresh_rate(wpeDisplayDRMGetScreen(display)) / 1000.));
     priv->statsStartUS = g_get_monotonic_time();
+    // 注意：生产 run.sh 设 WPE_DRM_MAX_FPS=0，此节流机制全程不生效，
+    // 实际限帧由 WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS 承担。
     if (auto maxFPS = configuredMaxFPS())
         priv->frameThrottleIntervalUS = G_USEC_PER_SEC / maxFPS;
 
@@ -1341,38 +1467,27 @@ static void wpeViewDRMConstructed(GObject* object)
     })), object, nullptr);
     g_source_attach(priv->eventSource.get(), g_main_context_get_thread_default());
 
-    priv->rotationSource = adoptGRef(g_timeout_source_new(250));
-    g_source_set_name(priv->rotationSource.get(), "WPE DRM rotation poll");
-    g_source_set_callback(priv->rotationSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](gpointer userData) -> gboolean {
-        auto* view = WPE_VIEW_DRM(userData);
-        auto* priv = view->priv;
-        auto rotation = configuredOutputRotation();
-        if (rotation == priv->outputRotation)
-            return G_SOURCE_CONTINUE;
-
-        priv->outputRotation = rotation;
-        g_message("WPEViewDRM output_rotation=%u", static_cast<unsigned>(rotation));
-        if (priv->committedBuffer && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
-            if (wpeViewDRMRequestUpdate(view, nullptr)) {
-                priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
-                wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
-            }
-        }
-        return G_SOURCE_CONTINUE;
-    })), object, nullptr);
-    g_source_attach(priv->rotationSource.get(), g_main_context_get_thread_default());
-
-    priv->chromeStateHash = chromeRenderStateHash();
+    refreshChromeRenderState();
     priv->chromeSource = adoptGRef(g_timeout_source_new(33));
     g_source_set_name(priv->chromeSource.get(), "WPE DRM chrome state poll");
     g_source_set_callback(priv->chromeSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](gpointer userData) -> gboolean {
         auto* view = WPE_VIEW_DRM(userData);
         auto* priv = view->priv;
-        auto hash = chromeRenderStateHash();
-        bool animationActive = chromeAnimationActive();
-        if (hash == priv->chromeStateHash && !animationActive)
+        bool needsUpdate = refreshChromeRenderState() || chromeAnimationActive();
+
+        // 旋转文件极少变化：与 chrome 轮询共用一个定时器，每 8 tick（约 264ms）读一次，
+        // 取代原先独立的 250ms rotation GSource。
+        if (!(++priv->chromePollTick % 8)) {
+            auto rotation = configuredOutputRotation();
+            if (rotation != priv->outputRotation) {
+                priv->outputRotation = rotation;
+                g_message("WPEViewDRM output_rotation=%u", static_cast<unsigned>(rotation));
+                needsUpdate = true;
+            }
+        }
+
+        if (!needsUpdate)
             return G_SOURCE_CONTINUE;
-        priv->chromeStateHash = hash;
         if (priv->committedBuffer && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
             if (wpeViewDRMRequestUpdate(view, nullptr)) {
                 priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
@@ -1399,11 +1514,6 @@ static void wpeViewDRMDispose(GObject* object)
     if (priv->eventSource) {
         g_source_destroy(priv->eventSource.get());
         priv->eventSource = nullptr;
-    }
-
-    if (priv->rotationSource) {
-        g_source_destroy(priv->rotationSource.get());
-        priv->rotationSource = nullptr;
     }
 
     if (priv->chromeSource) {
@@ -1467,8 +1577,11 @@ static void logBufferPathOnce(DRMScanoutBuffer::Kind kind)
 
 static bool forceDMAHeapBufferPath()
 {
-    const char* bufferPath = getenv("WPE_DRM_BUFFER_PATH");
-    return bufferPath && !strcmp(bufferPath, "dma_heap");
+    static bool force = []() {
+        const char* bufferPath = getenv("WPE_DRM_BUFFER_PATH");
+        return bufferPath && !strcmp(bufferPath, "dma_heap");
+    }();
+    return force;
 }
 
 static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer, bool modifiersSupported, GError** error)
@@ -1482,12 +1595,10 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
         if (!scanoutBuffer)
             return nullptr;
 
-        auto* scanoutBufferPtr = scanoutBuffer.get();
-        wpe_buffer_set_user_data(buffer, scanoutBuffer.release(), reinterpret_cast<GDestroyNotify>(+[](void* userData) {
-            delete static_cast<DRMScanoutBuffer*>(userData);
-        }));
+        auto* userData = ensureBufferUserData(buffer);
+        userData->scanoutBuffer = scanoutBuffer.release();
         logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufDirect);
-        return scanoutBufferPtr;
+        return userData->scanoutBuffer;
     }
 
     struct gbm_bo* bo;
@@ -1539,12 +1650,10 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
     }
 
     auto scanoutBuffer = DRMScanoutBuffer::createDMABuf(WTF::move(drmBuffer));
-    auto* scanoutBufferPtr = scanoutBuffer.get();
-    wpe_buffer_set_user_data(buffer, scanoutBuffer.release(), reinterpret_cast<GDestroyNotify>(+[](void* userData) {
-        delete static_cast<DRMScanoutBuffer*>(userData);
-    }));
+    auto* userData = ensureBufferUserData(buffer);
+    userData->scanoutBuffer = scanoutBuffer.release();
     logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufGBM);
-    return scanoutBufferPtr;
+    return userData->scanoutBuffer;
 }
 
 static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer, GError** error)
@@ -1647,7 +1756,8 @@ static DRMScanoutBuffer* drmScanoutBufferForRender(WPEViewDRM* view, WPEBuffer* 
         if (rotation != OutputRotation::Rotate0)
             return nextRotatedDMABufBuffer(view, buffer, rotation, error);
 
-        auto* scanoutBuffer = static_cast<DRMScanoutBuffer*>(wpe_buffer_get_user_data(buffer));
+        auto* userData = static_cast<WPEBufferDRMUserData*>(wpe_buffer_get_user_data(buffer));
+        auto* scanoutBuffer = userData ? userData->scanoutBuffer : nullptr;
         if (!scanoutBuffer)
             scanoutBuffer = drmBufferCreateDMABuf(WPE_VIEW(view), buffer, wpe_display_drm_supports_modifiers(display), error);
         return scanoutBuffer;
@@ -1723,15 +1833,19 @@ static bool shouldUsePanelNativeFit()
 
 static std::optional<uint32_t> configuredRotatedXOffset(uint32_t maxOffset)
 {
-    const char* value = getenv("WPE_DRM_ROTATED_X");
-    if (!value || !*value)
+    static std::optional<long> offset = []() -> std::optional<long> {
+        const char* value = getenv("WPE_DRM_ROTATED_X");
+        if (!value || !*value)
+            return std::nullopt;
+        char* end = nullptr;
+        auto parsed = strtol(value, &end, 10);
+        if (end == value || parsed < 0)
+            return std::nullopt;
+        return parsed;
+    }();
+    if (!offset)
         return std::nullopt;
-
-    char* end = nullptr;
-    auto offset = strtol(value, &end, 10);
-    if (end == value || offset < 0)
-        return std::nullopt;
-    return std::min<uint32_t>(static_cast<uint32_t>(offset), maxOffset);
+    return std::min<uint32_t>(static_cast<uint32_t>(*offset), maxOffset);
 }
 
 static void destinationRectForBuffer(drmModeModeInfo* mode, const DRMScanoutBuffer& buffer, uint32_t& x, uint32_t& y, uint32_t& width, uint32_t& height)

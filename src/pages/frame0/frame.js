@@ -3,7 +3,7 @@ import FrameComponent from '../frame/frame.vue'
 
 class PageFrameAlias extends BasePage {
   onLoad(options) {
-    super.onLoad(Object.assign({}, options || {}, { miniappRotation: 0 }))
+    super.onLoad(options)
     this.setRootComponent(FrameComponent)
   }
 }

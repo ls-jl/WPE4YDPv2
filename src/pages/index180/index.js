@@ -3,7 +3,7 @@ import IndexComponent from '../index/index.vue'
 
 class PageIndexAlias extends BasePage {
   onLoad(options) {
-    super.onLoad(Object.assign({}, options || {}, { miniappRotation: 180 }))
+    super.onLoad(options)
     this.setRootComponent(IndexComponent)
   }
 }

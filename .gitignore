@@ -7,12 +7,13 @@ node_modules/
 .falcon_/
 .falcon_tmp/
 .cache/
+.rollback/
 dist/
 build/
+build-jsapi-host/
 
 # MiniApp packaged artifacts
 *.amr
-!8001779591038449.1_0_0.amr
 
 # Device/runtime archives
 *.tar
@@ -30,6 +31,8 @@ tools/*.zip
 libs/**/*.so
 !libs/
 !libs/**
+# libs/libjsapi_browser_12345.so 由 prebuild 从 libs/arm64-orange/libjsapi_browser.so 拷贝生成
+libs/libjsapi_browser_12345.so
 !assets/mesa/
 !assets/mesa/**
 !assets/wpe-runtime/

@@ -29,10 +29,10 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `src/utils/keyboard.js`：HaasUI 系统键盘封装。
 - `jsapi/`：MiniApp native JSAPI 源码，模块名 `browser`。
 - `libs/`：打包用 JSAPI so。
-  - `libs/libjsapi_browser_12345.so`：MiniApp 模块加载入口用命名。
-  - `libs/arm64-orange/libjsapi_browser.so`：设备 ABI 目录下的实际 so。
+  - `libs/arm64-orange/libjsapi_browser.so`：设备 ABI 目录下的实际 so（唯一入库源）。
+  - `libs/libjsapi_browser_12345.so`：MiniApp 模块加载入口用命名，由 `scripts/sync_generated.sh` 在构建前从上面拷贝生成，不入库。
 - `assets/wpe-runtime/`：包内直跑 WPE runtime。
-  - `run.sh`：WPE 启动脚本。
+  - `run.sh`：WPE 启动脚本，由 `scripts/sync_generated.sh` 从 `wpe-drm/run.sh`（唯一维护源）拷贝生成。
   - `wpe-drm-minimal`：Direct DRM WPE 启动器。
   - `lib/`、`libexec/`、`share/`：WPE/WebKit/Mesa/GStreamer 等运行依赖。
   - `etc/ssl/certs/ca-certificates.crt`：HTTPS 证书包。
@@ -42,14 +42,16 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `tools/DRM_HOLE_RENDERING_PIPELINE.md`：DRM 出屏到 MiniApp `<hole>` 展示的完整链路文档。
   - `tools/KEYBOARD_INPUT.md`：系统键盘调用参考。
   - `tools/miniapp_docs.md`：MiniApp 文档整理。
-- `debug/`：本地调试页面和触摸校准辅助文件。
-- `8001779591038449.1_0_0.amr`：当前打包产物。
+- `debug/`：本地调试页面（含 benchmark/*-test.html 等测试页，不随 runtime 打包）和触摸校准辅助文件。
+- `8001779591038449.1_0_0.amr`：当前打包产物（不入库）。
 
 ## 构建
 
 ```sh
 npm run build
 ```
+
+构建前会自动执行 `scripts/sync_generated.sh`，把单源文件（`wpe-drm/run.sh`、`libs/arm64-orange/libjsapi_browser.so`）同步到打包位置。
 
 如果构建缓存中存在损坏的 runtime symlink，先清理缓存再构建：
 
@@ -147,8 +149,9 @@ adb shell "hal-screen keep"
 
 本仓库使用 Git LFS 保存超大产物：
 
-- `*.amr`
 - `assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2`
+
+打包产物 `*.amr`、CMake 构建目录 `build-jsapi-host/` 与生成的 `libs/libjsapi_browser_12345.so` 均不入库。
 
 首次克隆后需要确保本机可用 Git LFS：
 

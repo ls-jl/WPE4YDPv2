@@ -63,18 +63,23 @@ LINK_LIBSTDCXX="/opt/wpe-hostabi-link/lib"
 WORK="${WORK:-/root/wpe-hostabi-work}"
 JOBS="${JOBS:-1}"
 
-apt-get update
-apt-get install -y \
-  build-essential gcc-11 g++-11 cmake ninja-build meson pkg-config \
-  curl ca-certificates xz-utils gzip tar patch patchelf file git \
-  python3 python3-distutils ruby bison flex gperf gettext-base perl \
-  libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  libsoup-3.0-dev libcairo2-dev libfreetype6-dev libharfbuzz-dev \
-  libatk1.0-dev libseccomp-dev libepoxy-dev libsystemd-dev \
-  libxml2-dev libsqlite3-dev libxslt1-dev liblcms2-dev libwoff-dev \
-  libjpeg-dev libpng-dev libopenjp2-7-dev libwebp-dev libtasn1-6-dev \
-  libfontconfig1-dev libgcrypt20-dev libegl1-mesa-dev libgles2-mesa-dev \
-  libgbm-dev libdrm-dev libwayland-dev libxkbcommon-dev
+# 依赖不变时跳过 apt（联网最慢的一步）；需要重装时删除 stamp 文件
+APT_STAMP="/var/lib/wpe-hostabi-apt.stamp"
+if [ ! -f "$APT_STAMP" ]; then
+  apt-get update
+  apt-get install -y \
+    build-essential gcc-11 g++-11 cmake ninja-build meson pkg-config \
+    curl ca-certificates xz-utils gzip tar patch patchelf file git \
+    python3 python3-distutils ruby bison flex gperf gettext-base perl \
+    libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libsoup-3.0-dev libcairo2-dev libfreetype6-dev libharfbuzz-dev \
+    libatk1.0-dev libseccomp-dev libepoxy-dev libsystemd-dev \
+    libxml2-dev libsqlite3-dev libxslt1-dev liblcms2-dev libwoff-dev \
+    libjpeg-dev libpng-dev libopenjp2-7-dev libwebp-dev libtasn1-6-dev \
+    libfontconfig1-dev libgcrypt20-dev libegl1-mesa-dev libgles2-mesa-dev \
+    libgbm-dev libdrm-dev libwayland-dev libxkbcommon-dev
+  touch "$APT_STAMP"
+fi
 
 mkdir -p "$WORK/src" "$WORK/build" "$PREFIX"
 cd "$WORK/src"
@@ -227,7 +232,8 @@ copy_runtime_dependency_closure() {
           ;;
       esac
 
-      for src in "$root_lib/$lib_name"* "$lib_path"*; do
+      # 只拷贝该库本体及其版本后缀变体，避免同前缀的无关库被通配带入
+      for src in "$root_lib/$lib_name" "$root_lib/$lib_name".* "$lib_path" "$lib_path".*; do
         [ -e "$src" ] && cp -a "$src" "$PREFIX/lib"/
       done
     done

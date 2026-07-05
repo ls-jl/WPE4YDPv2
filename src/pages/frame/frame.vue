@@ -221,18 +221,20 @@ export default {
     return {
       browserRunning: false,
       browserStarting: false,
-      watchdogTimer: null,
+      watchdogActive: false,
       leavingFrame: false,
       startToken: 0,
       keyboardSession: null,
-      keyboardPollTimer: null,
+      pollTimer: null,
+      pollTick: 0,
+      keyboardActiveUntil: 0,
       activeKeyboardRequest: null,
     }
   },
   mounted() {
     this.setupKeyboard()
     this.startBrowser()
-    this.startKeyboardPoller()
+    this.startPolling()
   },
   beforeDestroy() {
     this.teardownKeyboard()
@@ -441,22 +443,35 @@ export default {
       this.keyboardSession.mount()
     },
     teardownKeyboard() {
-      this.stopKeyboardPoller()
+      this.stopPolling()
       this.cancelActiveKeyboardRequest('teardown')
       if (this.keyboardSession) {
         this.keyboardSession.unmount()
         this.keyboardSession = null
       }
     },
-    startKeyboardPoller() {
-      if (this.keyboardPollTimer) return
-      this.keyboardPollTimer = setInterval(() => this.pollKeyboardRequest(), 200)
+    // 单一 200ms tick 承担键盘桥轮询与 watchdog，替代原先两个独立定时器：
+    // 键盘桥近期有活动时保持 200ms 灵敏度，空闲降到 600ms（C++ 侧每次轮询都是一次目录扫描）；
+    // watchdog 维持原有 1s 节奏。
+    startPolling() {
+      if (this.pollTimer) return
+      this.pollTimer = setInterval(() => this.onPollTick(), 200)
       this.pollKeyboardRequest()
     },
-    stopKeyboardPoller() {
-      if (this.keyboardPollTimer) {
-        clearInterval(this.keyboardPollTimer)
-        this.keyboardPollTimer = null
+    stopPolling() {
+      if (this.pollTimer) {
+        clearInterval(this.pollTimer)
+        this.pollTimer = null
+      }
+    },
+    onPollTick() {
+      this.pollTick += 1
+      const keyboardActive = Date.now() < this.keyboardActiveUntil
+      if (keyboardActive || this.pollTick % 3 === 0) {
+        this.pollKeyboardRequest()
+      }
+      if (this.watchdogActive && this.pollTick % 5 === 0) {
+        this.watchBrowser()
       }
     },
     keyboardOptionsForRequest(request) {
@@ -490,6 +505,7 @@ export default {
         return
       }
       if (!raw) return
+      this.keyboardActiveUntil = Date.now() + 10000
 
       let request = null
       try {
@@ -511,6 +527,7 @@ export default {
       const request = this.activeKeyboardRequest
       if (!request || !request.id) return
       this.activeKeyboardRequest = null
+      this.keyboardActiveUntil = Date.now() + 10000
       try {
         browserPlayer.respondKeyboardRequest({
           workdir: this.browserWorkdir(),
@@ -569,28 +586,25 @@ export default {
       }, 0)
     },
     startWatchdog() {
-      this.stopWatchdog()
-      this.watchdogTimer = setInterval(() => {
-        if (this.browserStarting || this.leavingFrame) return
-        let running = false
-        try {
-          running = browserPlayer.isBrowserRunning({ workdir: this.browserWorkdir() })
-        } catch (err) {
-          console.warn(`watch browser failed ${err}`)
-        }
-        if (running) {
-          this.browserRunning = true
-          return
-        }
-        this.browserRunning = false
-        this.leaveFrame('browser exited')
-      }, 1000)
+      this.watchdogActive = true
     },
     stopWatchdog() {
-      if (this.watchdogTimer) {
-        clearInterval(this.watchdogTimer)
-        this.watchdogTimer = null
+      this.watchdogActive = false
+    },
+    watchBrowser() {
+      if (this.browserStarting || this.leavingFrame) return
+      let running = false
+      try {
+        running = browserPlayer.isBrowserRunning({ workdir: this.browserWorkdir() })
+      } catch (err) {
+        console.warn(`watch browser failed ${err}`)
       }
+      if (running) {
+        this.browserRunning = true
+        return
+      }
+      this.browserRunning = false
+      this.leaveFrame('browser exited')
     },
     stopBrowser() {
       this.stopWatchdog()

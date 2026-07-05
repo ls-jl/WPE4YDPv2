@@ -84,7 +84,6 @@ typedef struct {
     gboolean loading;
     gboolean touch_debug;
     int height;
-    int touch_height;
     double hide_down_px;
     double show_up_px;
     double show_up_min_velocity_px_s;
@@ -429,6 +428,23 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
     g_key_file_set_integer(key_file, "panel", "line_count", line_count);
 }
 
+/* 内容未变化时跳过写盘：chrome 状态在 load/title/滚动等事件里高频重写，
+ * 而合成器侧按文件 hash 轮询，重复写既浪费 IO 又触发无谓的重绘检查。 */
+static gboolean chrome_write_file_if_changed(const char *path, const char *data, gsize length, gchar **last_written, gsize *last_length)
+{
+    if (*last_written && *last_length == length && !memcmp(*last_written, data, length))
+        return TRUE;
+    char *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+    if (!g_file_set_contents(path, data, length, NULL))
+        return FALSE;
+    g_free(*last_written);
+    *last_written = g_strndup(data, length);
+    *last_length = length;
+    return TRUE;
+}
+
 static void chrome_update_render_state(AppState *state)
 {
     if (!state)
@@ -446,7 +462,6 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_boolean(key_file, "chrome", "can_forward", tab && tab->forward_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "touch_debug", chrome->touch_debug);
     g_key_file_set_integer(key_file, "chrome", "height", chrome->height);
-    g_key_file_set_integer(key_file, "chrome", "touch_height", chrome->touch_height);
     g_key_file_set_integer(key_file, "chrome", "tab_count", chrome->tab_count);
     g_key_file_set_integer(key_file, "chrome", "active_tab", chrome->active);
     char *transition_us = g_strdup_printf("%" G_GINT64_FORMAT, chrome->transition_us);
@@ -460,10 +475,9 @@ static void chrome_update_render_state(AppState *state)
     gsize length = 0;
     gchar *data = g_key_file_to_data(key_file, &length, NULL);
     if (data) {
-        char *dir = g_path_get_dirname(chrome->render_state_path);
-        g_mkdir_with_parents(dir, 0700);
-        g_free(dir);
-        if (!g_file_set_contents(chrome->render_state_path, data, length, NULL))
+        static gchar *last_render_state;
+        static gsize last_render_state_length;
+        if (!chrome_write_file_if_changed(chrome->render_state_path, data, length, &last_render_state, &last_render_state_length))
             g_warning("Failed to write chrome render state: %s", chrome->render_state_path);
     }
     g_free(data);
@@ -501,10 +515,9 @@ static void chrome_save_state(AppState *state)
     gsize length = 0;
     gchar *data = g_key_file_to_data(key_file, &length, NULL);
     if (data) {
-        char *dir = g_path_get_dirname(chrome->state_path);
-        g_mkdir_with_parents(dir, 0700);
-        g_free(dir);
-        if (!g_file_set_contents(chrome->state_path, data, length, NULL))
+        static gchar *last_saved_state;
+        static gsize last_saved_state_length;
+        if (!chrome_write_file_if_changed(chrome->state_path, data, length, &last_saved_state, &last_saved_state_length))
             g_warning("Failed to write chrome state: %s", chrome->state_path);
     }
     g_free(data);
@@ -1337,11 +1350,6 @@ static void chrome_load_state(AppState *state, const char *initial_url)
         chrome->height = 24;
     if (chrome->height > 80)
         chrome->height = 80;
-    chrome->touch_height = (int)env_double("WPE_CHROME_TOUCH_HEIGHT", 96);
-    if (chrome->touch_height < chrome->height)
-        chrome->touch_height = chrome->height;
-    if (chrome->touch_height > 140)
-        chrome->touch_height = 140;
     chrome->hide_down_px = env_double("WPE_CHROME_HIDE_DOWN_PX", 96);
     chrome->show_up_px = env_double("WPE_CHROME_SHOW_UP_PX", 180);
     chrome->show_up_min_velocity_px_s = env_double("WPE_CHROME_SHOW_UP_MIN_VELOCITY", 700);
@@ -1353,8 +1361,8 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     chrome->next_tab_id = 2;
     chrome->tabs[0].id = 1;
     chrome_set_tab_url(&chrome->tabs[0], initial_url && initial_url[0] ? initial_url : chrome->home_url);
-    g_print("Chrome config: enabled=%d height=%d touch_height=%d hide_down=%.1f show_up=%.1f show_min_velocity=%.1f\n",
-            chrome->enabled, chrome->height, chrome->touch_height,
+    g_print("Chrome config: enabled=%d height=%d hide_down=%.1f show_up=%.1f show_min_velocity=%.1f\n",
+            chrome->enabled, chrome->height,
             chrome->hide_down_px, chrome->show_up_px, chrome->show_up_min_velocity_px_s);
 
     GKeyFile *key_file = g_key_file_new();
@@ -1907,9 +1915,9 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             slot->max_move_sq = 0;
             slot->scrolling = FALSE;
             slot->chrome_consumed = chrome_touch_down_consumes(state, slot->x, slot->y);
-            g_print("Touch down: raw=%d,%d mapped=%.1f,%.1f chrome=%d visible=%d panel=%s touch_height=%d\n",
+            g_print("Touch down: raw=%d,%d mapped=%.1f,%.1f chrome=%d visible=%d panel=%s\n",
                     slot->raw_x, slot->raw_y, slot->x, slot->y, slot->chrome_consumed,
-                    state->chrome.visible, chrome_panel_name(state->chrome.panel), state->chrome.touch_height);
+                    state->chrome.visible, chrome_panel_name(state->chrome.panel));
             if (!slot->chrome_consumed && !state->touch_scroll_fallback)
                 send_touch_event(state, WPE_EVENT_TOUCH_DOWN, i, slot->x, slot->y, time_ms);
         } else if (slot->just_up) {

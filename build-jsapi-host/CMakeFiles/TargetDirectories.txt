@@ -1,3 +1,0 @@
-/Users/me/Documents/iot_miniapp/projects/web_browser_v2/WPE4YDPv2/build-jsapi-host/CMakeFiles/jsapi_browser.dir
-/Users/me/Documents/iot_miniapp/projects/web_browser_v2/WPE4YDPv2/build-jsapi-host/CMakeFiles/edit_cache.dir
-/Users/me/Documents/iot_miniapp/projects/web_browser_v2/WPE4YDPv2/build-jsapi-host/CMakeFiles/rebuild_cache.dir

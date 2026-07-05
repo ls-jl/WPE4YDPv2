@@ -46,7 +46,6 @@ export WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS="${WEBKIT_DISPLAY_REFRESH_THROTTLE_FP
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
 export WPE_CHROME_ENABLED="${WPE_CHROME_ENABLED:-1}"
 export WPE_CHROME_HEIGHT="${WPE_CHROME_HEIGHT:-44}"
-export WPE_CHROME_TOUCH_HEIGHT="${WPE_CHROME_TOUCH_HEIGHT:-52}"
 export WPE_CHROME_HIT_SLOP="${WPE_CHROME_HIT_SLOP:-6}"
 export WPE_CHROME_REVEAL_HEIGHT="${WPE_CHROME_REVEAL_HEIGHT:-22}"
 export WPE_CHROME_TAP_MAX_MOVE="${WPE_CHROME_TAP_MAX_MOVE:-32}"
@@ -92,50 +91,60 @@ BUNDLED_FONT_ROOT="${WPE_BUNDLED_FONT_ROOT:-$DIR/assets/fonts}"
 FONT_DIRS_FILE="$VAR_DIR/font-dirs.txt"
 FONT_DIRS_TMP="$VAR_DIR/font-dirs.tmp"
 MINIAPP_FONT_DIR="$BUNDLED_FONT_ROOT/miniapp"
-: >"$FONT_DIRS_TMP"
-if [ -d "$MINIAPP_FONT_DIR" ]; then
-    find "$MINIAPP_FONT_DIR" -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' -o -name '*.pcf' -o -name '*.pcf.gz' -o -name '*.woff' -o -name '*.woff2' \) -exec dirname {} \; 2>/dev/null | sort -u >>"$FONT_DIRS_TMP"
-fi
-find "$BUNDLED_FONT_ROOT" -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' -o -name '*.pcf' -o -name '*.pcf.gz' -o -name '*.woff' -o -name '*.woff2' \) -exec dirname {} \; 2>/dev/null | sort -u >>"$FONT_DIRS_TMP"
-awk '!seen[$0]++' "$FONT_DIRS_TMP" >"$FONT_DIRS_FILE"
-rm -f "$FONT_DIRS_TMP"
-if [ ! -s "$FONT_DIRS_FILE" ]; then
-    echo "WPE fatal: bundled fonts missing dir=$BUNDLED_FONT_ROOT"
-    exit 86
-fi
-CJK_FONT="$MINIAPP_FONT_DIR/NotoSansSC-Regular.otf"
-if [ -f "$CJK_FONT" ]; then
-    echo "WPE fonts: root=$BUNDLED_FONT_ROOT cjk=$CJK_FONT"
-else
-    echo "WPE warning: CJK font missing: $CJK_FONT"
-fi
 mkdir -p "$FONTCONFIG_CACHE_DIR"
-{
-    echo '<?xml version="1.0"?>'
-    echo '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">'
-    echo '<fontconfig>'
-    while IFS= read -r font_dir; do
-        [ -n "$font_dir" ] && echo "  <dir>$font_dir</dir>"
-    done <"$FONT_DIRS_FILE"
-    echo "  <cachedir>$FONTCONFIG_CACHE_DIR</cachedir>"
-    echo '  <match target="pattern">'
-    echo '    <test qual="any" name="family"><string>serif</string></test>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Serif</string></edit>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>Noto Sans SC</string></edit>'
-    echo '  </match>'
-    echo '  <match target="pattern">'
-    echo '    <test qual="any" name="family"><string>sans-serif</string></test>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>HarmonyOS Sans SC</string></edit>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>Noto Sans SC</string></edit>'
-    echo '  </match>'
-    echo '  <match target="pattern">'
-    echo '    <test qual="any" name="family"><string>monospace</string></test>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans Mono</string></edit>'
-    echo '    <edit name="family" mode="prepend" binding="strong"><string>Noto Sans SC</string></edit>'
-    echo '  </match>'
-    echo '</fontconfig>'
-} >"$FONTCONFIG_RUNTIME_FILE"
+# 字体目录扫描与 fonts.conf 生成结果缓存：runtime 字体集不变时直接复用，
+# 避免每次启动都全量 find 字体目录并重写配置。
+REBUILD_FONTCONFIG=1
+if [ -s "$FONT_DIRS_FILE" ] && [ -s "$FONTCONFIG_RUNTIME_FILE" ] \
+    && grep -q "$BUNDLED_FONT_ROOT" "$FONTCONFIG_RUNTIME_FILE" 2>/dev/null \
+    && [ -z "$(find "$BUNDLED_FONT_ROOT" -newer "$FONTCONFIG_RUNTIME_FILE" -print 2>/dev/null | head -n 1)" ]; then
+    REBUILD_FONTCONFIG=0
+fi
+if [ "$REBUILD_FONTCONFIG" = 1 ]; then
+    : >"$FONT_DIRS_TMP"
+    if [ -d "$MINIAPP_FONT_DIR" ]; then
+        find "$MINIAPP_FONT_DIR" -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' -o -name '*.pcf' -o -name '*.pcf.gz' -o -name '*.woff' -o -name '*.woff2' \) -exec dirname {} \; 2>/dev/null | sort -u >>"$FONT_DIRS_TMP"
+    fi
+    find "$BUNDLED_FONT_ROOT" -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' -o -name '*.pcf' -o -name '*.pcf.gz' -o -name '*.woff' -o -name '*.woff2' \) -exec dirname {} \; 2>/dev/null | sort -u >>"$FONT_DIRS_TMP"
+    awk '!seen[$0]++' "$FONT_DIRS_TMP" >"$FONT_DIRS_FILE"
+    rm -f "$FONT_DIRS_TMP"
+    if [ ! -s "$FONT_DIRS_FILE" ]; then
+        echo "WPE fatal: bundled fonts missing dir=$BUNDLED_FONT_ROOT"
+        exit 86
+    fi
+    CJK_FONT="$MINIAPP_FONT_DIR/NotoSansSC-Regular.otf"
+    if [ -f "$CJK_FONT" ]; then
+        echo "WPE fonts: root=$BUNDLED_FONT_ROOT cjk=$CJK_FONT"
+    else
+        echo "WPE warning: CJK font missing: $CJK_FONT"
+    fi
+    {
+        echo '<?xml version="1.0"?>'
+        echo '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">'
+        echo '<fontconfig>'
+        while IFS= read -r font_dir; do
+            [ -n "$font_dir" ] && echo "  <dir>$font_dir</dir>"
+        done <"$FONT_DIRS_FILE"
+        echo "  <cachedir>$FONTCONFIG_CACHE_DIR</cachedir>"
+        echo '  <match target="pattern">'
+        echo '    <test qual="any" name="family"><string>serif</string></test>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Serif</string></edit>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>Noto Sans SC</string></edit>'
+        echo '  </match>'
+        echo '  <match target="pattern">'
+        echo '    <test qual="any" name="family"><string>sans-serif</string></test>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans</string></edit>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>HarmonyOS Sans SC</string></edit>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>Noto Sans SC</string></edit>'
+        echo '  </match>'
+        echo '  <match target="pattern">'
+        echo '    <test qual="any" name="family"><string>monospace</string></test>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>DejaVu Sans Mono</string></edit>'
+        echo '    <edit name="family" mode="prepend" binding="strong"><string>Noto Sans SC</string></edit>'
+        echo '  </match>'
+        echo '</fontconfig>'
+    } >"$FONTCONFIG_RUNTIME_FILE"
+fi
 export FONTCONFIG_PATH="$(dirname "$FONTCONFIG_RUNTIME_FILE")"
 export FONTCONFIG_FILE="$FONTCONFIG_RUNTIME_FILE"
 unset FONTCONFIG_SYSROOT
