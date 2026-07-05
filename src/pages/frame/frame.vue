@@ -1,6 +1,27 @@
 <template>
   <div class="frame-page">
     <hole ref="browserHole" class="browser-hole"></hole>
+    <textarea
+      v-if="keyboardTextareaVisible"
+      ref="keyboardTextarea"
+      class="keyboard-bridge-textarea"
+      :value="keyboardTextareaValue"
+      :focus="keyboardTextareaFocused"
+      :maxlength="keyboardTextareaMaxlength"
+      :inputType="keyboardTextareaInputType"
+      :showCursor="true"
+      :softInputEnable="true"
+      placeholder="请输入内容"
+      placeholderColor="#878A99"
+      cursorColor="#008CFF"
+      :cursorSize="3"
+      @input="onKeyboardTextareaInput"
+      @confirm="onKeyboardTextareaConfirm"
+      @textChanged="onKeyboardTextareaInput"
+      @textEditFinished="onKeyboardTextareaConfirm"
+      @focus="onKeyboardTextareaFocus"
+      @blur="onKeyboardTextareaBlur"
+    ></textarea>
   </div>
 </template>
 
@@ -178,6 +199,26 @@ function normalizeDisplayConfig(value) {
   }
 }
 
+function normalizeKeyboardText(value) {
+  if (value && typeof value === 'object') {
+    if (typeof value.value === 'string') return value.value
+    if (typeof value.text === 'string') return value.text
+    if (typeof value.contents === 'string') return value.contents
+    if (value.records && value.records[0] && typeof value.records[0].text === 'string') {
+      return value.records[0].text
+    }
+  }
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return normalizeKeyboardText(parsed) || value
+    } catch (err) {
+      return value
+    }
+  }
+  return value == null ? '' : `${value}`
+}
+
 function dataRootPath() {
   if (typeof $dataDir === 'string' && $dataDir) return $dataDir
   if (typeof $falcon !== 'undefined' && $falcon && typeof $falcon.$dataDir === 'string' && $falcon.$dataDir) {
@@ -226,9 +267,17 @@ export default {
       startToken: 0,
       keyboardSession: null,
       pollTimer: null,
+      keyboardGlobalOpenTimer: null,
       pollTick: 0,
       keyboardActiveUntil: 0,
       activeKeyboardRequest: null,
+      keyboardTextareaVisible: false,
+      keyboardTextareaFocused: false,
+      keyboardTextareaValue: '',
+      keyboardTextareaInputType: 'ZhCNPreferred',
+      keyboardTextareaMaxlength: 512,
+      keyboardTextareaActive: false,
+      keyboardTextareaSeenInput: false,
     }
   },
   mounted() {
@@ -436,8 +485,10 @@ export default {
     setupKeyboard() {
       if (this.keyboardSession) return
       this.keyboardSession = new KeyboardSession({
-        getAm: () => this.$am || (this.$page && this.$page.$am),
-        onConfirm: (text) => this.finishKeyboardRequest(true, text),
+        onConfirm: (text) => {
+          const value = this.keyboardTextareaSeenInput ? this.keyboardTextareaValue : text
+          this.finishKeyboardRequest(true, value)
+        },
         onCancel: () => this.finishKeyboardRequest(false, ''),
       })
       this.keyboardSession.mount()
@@ -445,6 +496,7 @@ export default {
     teardownKeyboard() {
       this.stopPolling()
       this.cancelActiveKeyboardRequest('teardown')
+      this.closeKeyboardTextarea()
       if (this.keyboardSession) {
         this.keyboardSession.unmount()
         this.keyboardSession = null
@@ -492,6 +544,99 @@ export default {
         enterButtonText: '确认',
       }
     },
+    openKeyboardTextarea(request) {
+      if (!request || !request.id) return false
+      const options = this.keyboardOptionsForRequest(request)
+      this.keyboardTextareaValue = options.text || ''
+      this.keyboardTextareaInputType = options.inputType || 'ZhCNPreferred'
+      this.keyboardTextareaMaxlength = options.maxlength || 512
+      this.keyboardTextareaVisible = true
+      this.keyboardTextareaFocused = false
+      this.keyboardTextareaActive = true
+      this.keyboardTextareaSeenInput = false
+      console.warn(`keyboard textarea request id=${request.id} kind=${request.kind || ''} type=${this.keyboardTextareaInputType}`)
+      setTimeout(() => {
+        if (!this.activeKeyboardRequest || this.activeKeyboardRequest.id !== request.id) return
+        this.keyboardTextareaFocused = true
+        try {
+          const field = this.$refs.keyboardTextarea
+          if (field && field.focus) field.focus()
+        } catch (err) {
+          console.warn(`keyboard textarea focus failed ${err}`)
+        }
+      }, 0)
+      return true
+    },
+    closeKeyboardTextarea() {
+      this.keyboardTextareaFocused = false
+      this.keyboardTextareaActive = false
+      this.keyboardTextareaVisible = false
+      this.keyboardTextareaSeenInput = false
+    },
+    clearKeyboardGlobalOpenTimer() {
+      if (this.keyboardGlobalOpenTimer) {
+        clearTimeout(this.keyboardGlobalOpenTimer)
+        this.keyboardGlobalOpenTimer = null
+      }
+    },
+    scheduleGlobalKeyboardOpen(request, options, textareaStarted) {
+      this.clearKeyboardGlobalOpenTimer()
+      this.keyboardGlobalOpenTimer = setTimeout(() => {
+        this.keyboardGlobalOpenTimer = null
+        if (!this.activeKeyboardRequest || this.activeKeyboardRequest.id !== request.id) return
+        const uuid = this.keyboardSession.open(options)
+        if (!uuid && !textareaStarted) {
+          this.finishKeyboardRequest(false, '')
+        }
+      }, 80)
+    },
+    onKeyboardTextareaInput(value) {
+      this.keyboardTextareaValue = normalizeKeyboardText(value)
+      this.keyboardTextareaSeenInput = true
+      console.warn(`keyboard textarea input ${this.keyboardTextareaValue || ''}`)
+      this.updateKeyboardRequest(this.keyboardTextareaValue)
+    },
+    onKeyboardTextareaConfirm(value) {
+      if (!this.activeKeyboardRequest) return
+      const text = this.keyboardTextareaSeenInput ? this.keyboardTextareaValue : normalizeKeyboardText(value)
+      this.keyboardTextareaValue = text
+      console.warn(`keyboard textarea confirm ${text || ''}`)
+      this.finishKeyboardRequest(true, text)
+      if (this.keyboardSession && this.keyboardSession.isActive()) {
+        this.keyboardSession.close()
+      }
+      this.closeKeyboardTextarea()
+    },
+    onKeyboardTextareaFocus() {
+      this.keyboardTextareaActive = true
+      console.warn('keyboard textarea focused')
+    },
+    onKeyboardTextareaBlur() {
+      this.keyboardTextareaFocused = false
+      console.warn('keyboard textarea blurred')
+      setTimeout(() => {
+        if (!this.activeKeyboardRequest) return
+        if (this.keyboardSession && this.keyboardSession.isActive()) return
+        if (this.keyboardTextareaFocused) return
+        console.warn(`keyboard textarea cancel id=${this.activeKeyboardRequest.id}`)
+        this.finishKeyboardRequest(false, '')
+        this.closeKeyboardTextarea()
+      }, 250)
+    },
+    updateKeyboardRequest(text) {
+      const request = this.activeKeyboardRequest
+      if (!request || !request.id || !browserPlayer.updateKeyboardRequest) return
+      try {
+        browserPlayer.updateKeyboardRequest({
+          workdir: this.browserWorkdir(),
+          id: request.id,
+          text: `${text || ''}`,
+        })
+        console.warn(`keyboard update id=${request.id} kind=${request.kind || ''} bytes=${`${text || ''}`.length}`)
+      } catch (err) {
+        console.warn(`update keyboard request failed ${err}`)
+      }
+    },
     pollKeyboardRequest() {
       if (this.leavingFrame || this.activeKeyboardRequest) return
       if (!browserPlayer.pollKeyboardRequest || !this.keyboardSession) return
@@ -518,14 +663,14 @@ export default {
 
       this.activeKeyboardRequest = request
       console.warn(`keyboard request id=${request.id} kind=${request.kind || ''}`)
-      const uuid = this.keyboardSession.open(this.keyboardOptionsForRequest(request))
-      if (!uuid) {
-        this.finishKeyboardRequest(false, '')
-      }
+      const options = this.keyboardOptionsForRequest(request)
+      const textareaStarted = this.openKeyboardTextarea(request)
+      this.scheduleGlobalKeyboardOpen(request, options, textareaStarted)
     },
     finishKeyboardRequest(confirmed, text) {
       const request = this.activeKeyboardRequest
       if (!request || !request.id) return
+      this.clearKeyboardGlobalOpenTimer()
       this.activeKeyboardRequest = null
       this.keyboardActiveUntil = Date.now() + 10000
       try {
@@ -539,8 +684,10 @@ export default {
       } catch (err) {
         console.warn(`respond keyboard request failed ${err}`)
       }
+      this.closeKeyboardTextarea()
     },
     cancelActiveKeyboardRequest(reason) {
+      this.clearKeyboardGlobalOpenTimer()
       if (this.activeKeyboardRequest) {
         console.warn(`keyboard cancel active reason=${reason || ''} id=${this.activeKeyboardRequest.id}`)
         this.finishKeyboardRequest(false, '')
@@ -548,6 +695,7 @@ export default {
       if (this.keyboardSession && this.keyboardSession.isActive()) {
         this.keyboardSession.close()
       }
+      this.closeKeyboardTextarea()
     },
     startBrowser() {
       if (this.browserStarting || this.leavingFrame) return
@@ -642,7 +790,7 @@ export default {
     },
     onHide() {
       console.warn('wpe frame onHide')
-      if (this.keyboardSession && this.keyboardSession.isActive()) {
+      if ((this.keyboardSession && this.keyboardSession.isActive()) || this.keyboardTextareaActive) {
         console.warn('wpe frame onHide ignored while keyboard active')
         return
       }
@@ -667,5 +815,17 @@ export default {
 .browser-hole {
   width: 100vw;
   height: 100vh;
+}
+
+.keyboard-bridge-textarea {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 2px;
+  height: 2px;
+  opacity: 0.01;
+  color: transparent;
+  background-color: transparent;
+  font-size: 1px;
 }
 </style>

@@ -168,6 +168,7 @@ typedef struct {
     guint64 keyboard_next_id;
     char *keyboard_active_id;
     char *keyboard_active_kind;
+    char *keyboard_pending_text;
     gint64 keyboard_active_us;
     gint64 last_pointer_tap_us;
     BrowserChrome chrome;
@@ -805,29 +806,46 @@ static void keyboard_clear_active(AppState *state)
     }
     g_clear_pointer(&state->keyboard_active_id, g_free);
     g_clear_pointer(&state->keyboard_active_kind, g_free);
+    g_clear_pointer(&state->keyboard_pending_text, g_free);
     state->keyboard_active_us = 0;
 }
 
-static void keyboard_insert_web_text(AppState *state, const char *text)
+static void keyboard_insert_web_text(AppState *state, const char *text, gboolean commit)
 {
     if (!state || !state->web_view)
         return;
     char *quoted = js_quote_string(text ? text : "");
     char *script = g_strdup_printf(
-        "(function(text){"
-        "if(window.__haasKeyboardSetText)return window.__haasKeyboardSetText(text);"
+        "(function(text,commit){"
+        "if(window.__haasKeyboardSetText)return window.__haasKeyboardSetText(text,commit);"
         "var el=document.activeElement;"
         "function editable(n){return n&&(n.tagName==='INPUT'||n.tagName==='TEXTAREA'||n.isContentEditable);}"
         "if(!editable(el))return false;"
         "if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(text.length,text.length);}catch(e){}}}"
         "function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}"
-        "fire('input');fire('change');return true;"
-        "})(%s)",
-        quoted);
-    g_print("Keyboard insert web text: bytes=%zu\n", strlen(text ? text : ""));
+        "fire('input');if(commit)fire('change');return true;"
+        "})(%s,%s)",
+        quoted, commit ? "true" : "false");
+    g_print("Keyboard insert web text: bytes=%zu commit=%d\n", strlen(text ? text : ""), commit);
     webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL, NULL);
     g_free(script);
     g_free(quoted);
+}
+
+static void keyboard_handle_update(AppState *state, const char *text)
+{
+    if (!state || !state->keyboard_active_id || !state->keyboard_active_kind)
+        return;
+
+    g_free(state->keyboard_pending_text);
+    state->keyboard_pending_text = g_strdup(text ? text : "");
+    g_print("Keyboard update: id=%s kind=%s bytes=%zu\n",
+            state->keyboard_active_id,
+            state->keyboard_active_kind,
+            strlen(text ? text : ""));
+
+    if (!g_strcmp0(state->keyboard_active_kind, "web_input"))
+        keyboard_insert_web_text(state, text, FALSE);
 }
 
 static void keyboard_handle_response(AppState *state, gboolean confirmed, const char *text)
@@ -835,26 +853,30 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
     if (!state || !state->keyboard_active_id || !state->keyboard_active_kind)
         return;
 
+    const char *final_text = text ? text : "";
+    if (confirmed && state->keyboard_pending_text && state->keyboard_pending_text[0])
+        final_text = state->keyboard_pending_text;
+
     g_print("Keyboard %s: id=%s kind=%s bytes=%zu\n",
             confirmed ? "confirmed" : "cancelled",
             state->keyboard_active_id,
             state->keyboard_active_kind,
-            strlen(text ? text : ""));
+            strlen(final_text));
 
     if (confirmed) {
         if (!g_strcmp0(state->keyboard_active_kind, "address")) {
-            char *url = normalize_user_url(text);
+            char *url = normalize_user_url(final_text);
             chrome_load_url(state, url, TRUE);
             g_free(url);
         } else if (!g_strcmp0(state->keyboard_active_kind, "home_url")) {
-            char *url = normalize_user_url(text);
+            char *url = normalize_user_url(final_text);
             g_free(state->chrome.home_url);
             state->chrome.home_url = url;
             state->chrome.panel = CHROME_PANEL_NONE;
             chrome_save_state(state);
             chrome_request_frame(state);
         } else if (!g_strcmp0(state->keyboard_active_kind, "web_input"))
-            keyboard_insert_web_text(state, text);
+            keyboard_insert_web_text(state, final_text, TRUE);
     }
 
     keyboard_clear_active(state);
@@ -881,13 +903,24 @@ static gboolean keyboard_response_tick(gpointer user_data)
 
     char *ok_name = g_strdup_printf("%s.ok", state->keyboard_active_id);
     char *cancel_name = g_strdup_printf("%s.cancel", state->keyboard_active_id);
+    char *update_name = g_strdup_printf("%s.update", state->keyboard_active_id);
     char *ok_path = keyboard_path(state, "responses", ok_name);
     char *cancel_path = keyboard_path(state, "responses", cancel_name);
+    char *update_path = keyboard_path(state, "responses", update_name);
     g_free(ok_name);
     g_free(cancel_name);
+    g_free(update_name);
 
     char *contents = NULL;
     gsize length = 0;
+    if (update_path && g_file_get_contents(update_path, &contents, &length, NULL)) {
+        g_unlink(update_path);
+        keyboard_handle_update(state, contents ? contents : "");
+        g_free(contents);
+        contents = NULL;
+    }
+    g_free(update_path);
+
     if (ok_path && g_file_get_contents(ok_path, &contents, &length, NULL)) {
         g_unlink(ok_path);
         g_free(ok_path);
@@ -960,6 +993,7 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
     if (ok) {
         state->keyboard_active_id = g_strdup(id);
         state->keyboard_active_kind = g_strdup(kind ? kind : "");
+        state->keyboard_pending_text = g_strdup(text ? text : "");
         state->keyboard_active_us = g_get_monotonic_time();
         state->keyboard_response_source_id = g_timeout_add(150, keyboard_response_tick, state);
         g_print("Keyboard request: id=%s kind=%s placeholder=%s maxlength=%d multiline=%d\n",
@@ -1096,7 +1130,7 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "function typeOf(el){var t=String(el.getAttribute('type')||'').toLowerCase();if(t==='number'||t==='tel')return 'Number';if(t==='email'||t==='url'||t==='password')return 'EnUSPreferred';return 'ZhCNPreferred';}"
         "function request(el){if(!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;var now=Date.now();if(window.__haasKeyboardTarget===el&&now-window.__haasKeyboardLastAt<600)return;window.__haasKeyboardTarget=el;window.__haasKeyboardLastAt=now;var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
         "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var el=e.target;if(editable(el))setTimeout(function(){request(el);},0);},true);"
-        "window.__haasKeyboardSetText=function(text){var el=window.__haasKeyboardTarget||document.activeElement;if(!editable(el))return false;try{el.focus();}catch(e){}if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(String(text).length,String(text).length);}catch(e){}}}function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}fire('input');fire('change');return true;};"
+        "window.__haasKeyboardSetText=function(text,commit){var el=window.__haasKeyboardTarget||document.activeElement;if(!editable(el))return false;try{el.focus();}catch(e){}if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(String(text).length,String(text).length);}catch(e){}}}function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}fire('input');if(commit)fire('change');return true;};"
         "})();";
     WebKitUserScript *script = webkit_user_script_new(source,
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,

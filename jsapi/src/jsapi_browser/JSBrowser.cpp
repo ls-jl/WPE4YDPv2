@@ -891,6 +891,37 @@ public:
         info.GetReturnValue().Set(true);
     }
 
+    void updateKeyboardRequest(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        const std::string id = getStringProperty(ctx, options, "id", "");
+        const std::string text = getStringProperty(ctx, options, "text", "");
+
+        if (workdir.empty()) {
+            throwError(info, "workdir is empty");
+            return;
+        }
+        if (!isSafeKeyboardId(id)) {
+            throwError(info, "invalid keyboard request id");
+            return;
+        }
+        if (!prepareKeyboardDirs(workdir)) {
+            throwError(info, std::string("keyboard dir mkdir failed: ") + keyboardDirForWorkdir(workdir));
+            return;
+        }
+
+        const std::string keyboardDir = keyboardDirForWorkdir(workdir);
+        const std::string updatePath = joinPath(joinPath(keyboardDir, "responses"), id + ".update");
+        if (!writeFile(updatePath, text, 0666)) {
+            throwError(info, std::string("keyboard update write failed: ") + updatePath + ": " + std::strerror(errno));
+            return;
+        }
+        publishState("keyboard_update", id);
+        info.GetReturnValue().Set(true);
+    }
+
     void getSystemDisplayConfig(JQFunctionInfo& info)
     {
         const std::string cfg = readFile("/etc/miniapp/resources/cfg.json");
@@ -1036,6 +1067,7 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("stopBrowser", &JSBrowserPlayer::stopBrowser);
     tpl->SetProtoMethod("isBrowserRunning", &JSBrowserPlayer::isBrowserRunning);
     tpl->SetProtoMethod("pollKeyboardRequest", &JSBrowserPlayer::pollKeyboardRequest);
+    tpl->SetProtoMethod("updateKeyboardRequest", &JSBrowserPlayer::updateKeyboardRequest);
     tpl->SetProtoMethod("respondKeyboardRequest", &JSBrowserPlayer::respondKeyboardRequest);
     tpl->SetProtoMethod("getSystemDisplayConfig", &JSBrowserPlayer::getSystemDisplayConfig);
     tpl->SetProtoMethod("getDrmScreenSize", &JSBrowserPlayer::getDrmScreenSize);
