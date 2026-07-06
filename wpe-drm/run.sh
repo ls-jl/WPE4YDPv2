@@ -15,13 +15,18 @@ export GBM_BACKEND="${GBM_BACKEND:-drm}"
 export GALLIUM_DRIVER="${GALLIUM_DRIVER:-softpipe}"
 export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-kms_swrast}"
 GST_PRIVATE_PLUGIN_DIR="$DIR/lib/gstreamer-1.0"
-GST_SYSTEM_PLUGIN_DIR="${WPE_SYSTEM_GST_PLUGIN_DIR:-${WPE_VPU_PLUGIN_DIR:-/usr/lib/gstreamer-1.0}}"
-# 系统插件目录提供 VPU 硬解（rockchipmpp）和整套音频栈（alsasink/autodetect/
-# faad/mpg123/opus/vorbis 等，打包 runtime 未带音频插件）。目录存在即引入，
-# 不再以 rockchipmpp 存在为前置条件。
-if [ -d "$GST_SYSTEM_PLUGIN_DIR" ]; then
+GST_SOURCE="bundled"
+# 默认只使用包内 GStreamer 插件，保证 AMR 自包含。需要调试系统 VPU/音频插件时，
+# 显式设置 WPE_USE_SYSTEM_GST=1，并可用 WPE_SYSTEM_GST_PLUGIN_DIR 覆盖系统目录。
+if [ "${WPE_USE_SYSTEM_GST:-0}" = "1" ]; then
+    GST_SYSTEM_PLUGIN_DIR="${WPE_SYSTEM_GST_PLUGIN_DIR:-${WPE_VPU_PLUGIN_DIR:-/usr/lib/gstreamer-1.0}}"
+else
+    GST_SYSTEM_PLUGIN_DIR=""
+fi
+if [ -n "$GST_SYSTEM_PLUGIN_DIR" ] && [ -d "$GST_SYSTEM_PLUGIN_DIR" ]; then
     export GST_PLUGIN_PATH="$GST_SYSTEM_PLUGIN_DIR:$GST_PRIVATE_PLUGIN_DIR"
     export GST_PLUGIN_SYSTEM_PATH="$GST_SYSTEM_PLUGIN_DIR:$GST_PRIVATE_PLUGIN_DIR"
+    GST_SOURCE="system"
 else
     export GST_PLUGIN_PATH="$GST_PRIVATE_PLUGIN_DIR"
     export GST_PLUGIN_SYSTEM_PATH="$GST_PRIVATE_PLUGIN_DIR"
@@ -52,17 +57,45 @@ export WEBKIT_WEBGL_DISABLE_GBM="${WEBKIT_WEBGL_DISABLE_GBM:-1}"
 export WEBKIT_DISABLE_DMABUF_ATLAS="${WEBKIT_DISABLE_DMABUF_ATLAS:-1}"
 export WEBKIT_FORCE_VBLANK_TIMER="${WEBKIT_FORCE_VBLANK_TIMER:-1}"
 # 低配设备（1GB/4xA53/无GPU）调优：
-# - 恢复系统级内存压力监控（原先 =1 关闭；关闭会同时使 tile 预取恒 2x）
+# - 恢复系统级内存压力监控（关闭会同时使 tile 预取恒 2x）
 # - Skia 走原生 CPU 光栅化，不再经 softpipe 软件 GL 模拟的 GPU 路径（收益最大）
-# - 刷新节流 30→20 fps（须为刷新率 60 的因子），线性省 CPU
-# - JSC：FTL JIT 关（最耗内存层）、JS 堆封顶 64MB、脚本看门狗 8s 防死循环
+# - 刷新节流 30 fps（须为刷新率 60 的因子）：视频是核心场景，20 会卡 25/30fps 视频
+# - JSC：FTL JIT 关（最耗内存层）、看门狗 8s 防死循环；
+#   forceRAMSize 让 JSC 按 512MB 预算做比例式堆增长（gcMaxHeapSize 非硬上限已弃用）；
+#   GC marker 降 2、mutator 时间片上调、JIT warmup 阈值上调减少编译抖动
+# - MSE_MAX_BUFFER_SIZE：MSE 每 SourceBuffer 默认 304MB，抖音多 video 同时
+#   buffer 会吃掉几百 MB，收紧到 视频40M/音频8M
 export WEBKIT_SKIA_ENABLE_CPU_RENDERING="${WEBKIT_SKIA_ENABLE_CPU_RENDERING:-1}"
 export WEBKIT_SKIA_CPU_PAINTING_THREADS="${WEBKIT_SKIA_CPU_PAINTING_THREADS:-3}"
-export WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS="${WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS:-20}"
+export WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS="${WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS:-30}"
 export JSC_useFTLJIT="${JSC_useFTLJIT:-false}"
-export JSC_gcMaxHeapSize="${JSC_gcMaxHeapSize:-67108864}"
 export JSC_watchdog="${JSC_watchdog:-8000}"
+export JSC_forceRAMSize="${JSC_forceRAMSize:-536870912}"
+export JSC_numberOfGCMarkers="${JSC_numberOfGCMarkers:-2}"
+export JSC_maximumMutatorUtilization="${JSC_maximumMutatorUtilization:-0.85}"
+export JSC_thresholdForJITAfterWarmUp="${JSC_thresholdForJITAfterWarmUp:-2000}"
+export JSC_thresholdForOptimizeAfterWarmUp="${JSC_thresholdForOptimizeAfterWarmUp:-6000}"
+export MSE_MAX_BUFFER_SIZE="${MSE_MAX_BUFFER_SIZE:-V:40M,A:8M}"
+export WPE_TOUCH_HORIZONTAL_SCROLL="${WPE_TOUCH_HORIZONTAL_SCROLL:-1}"
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
+
+# 单任务内存倾斜：浏览器是前台唯一任务，把内存尽量让给它。
+# - oom_score_adj -600：内核 OOM 时优先杀其他进程（子进程继承）
+# - drop_caches：启动前释放系统攒的页缓存
+# - swappiness 100：把后台进程冷页压进 swap，物理内存留给浏览器（退出恢复）
+echo -600 > /proc/self/oom_score_adj 2>/dev/null || true
+sync 2>/dev/null || true
+echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+WPE_SAVED_SWAPPINESS="$(cat /proc/sys/vm/swappiness 2>/dev/null)"
+if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
+    echo 100 > /proc/sys/vm/swappiness 2>/dev/null || WPE_SAVED_SWAPPINESS=""
+fi
+restore_swappiness() {
+    if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
+        echo "$WPE_SAVED_SWAPPINESS" > /proc/sys/vm/swappiness 2>/dev/null || true
+    fi
+}
+trap restore_swappiness EXIT INT TERM
 export WPE_CHROME_ENABLED="${WPE_CHROME_ENABLED:-1}"
 export WPE_CHROME_HEIGHT="${WPE_CHROME_HEIGHT:-44}"
 export WPE_CHROME_HIT_SLOP="${WPE_CHROME_HIT_SLOP:-6}"
@@ -72,7 +105,7 @@ export WPE_CHROME_ANIMATION_MS="${WPE_CHROME_ANIMATION_MS:-160}"
 export WPE_CHROME_HIDE_DOWN_PX="${WPE_CHROME_HIDE_DOWN_PX:-96}"
 export WPE_CHROME_SHOW_UP_PX="${WPE_CHROME_SHOW_UP_PX:-180}"
 export WPE_CHROME_SHOW_UP_MIN_VELOCITY="${WPE_CHROME_SHOW_UP_MIN_VELOCITY:-700}"
-export WPE_CHROME_LAYOUT="${WPE_CHROME_LAYOUT:-resize}"
+export WPE_CHROME_LAYOUT="${WPE_CHROME_LAYOUT:-inset}"
 export WPE_CHROME_STATE="${WPE_CHROME_STATE:-$VAR_DIR/browser-state.ini}"
 export WPE_CHROME_RENDER_STATE="${WPE_CHROME_RENDER_STATE:-$VAR_DIR/chrome-render-state.ini}"
 export WPE_PANEL_SIZE="${WPE_PANEL_SIZE:-${WPE_VIEWPORT:-960x266}}"
@@ -214,7 +247,7 @@ if [ -z "$WPE_DRM_DMA_HEAP" ]; then
 fi
 export WPE_DRM_DMA_HEAP
 printf '%s\n' "$ROTATION" >"$WPE_DRM_ROTATION_FILE" 2>/dev/null || true
-echo "WPE launch: url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP keyboard_dir=$WPE_KEYBOARD_DIR"
+echo "WPE launch: url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP keyboard_dir=$WPE_KEYBOARD_DIR"
 
 KEEP_PID=
 if command -v hal-screen >/dev/null 2>&1; then

@@ -29,7 +29,11 @@ static void syn(int fd)
 
 int main(int argc, char** argv)
 {
-    const char* device = argc > 1 ? argv[1] : "/dev/input/event5";
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s /dev/input/eventX [x y0 y1 steps delay_us]\n", argv[0]);
+        return 2;
+    }
+    const char* device = argv[1];
     int x = argc > 2 ? atoi(argv[2]) : 240;
     int y0 = argc > 3 ? atoi(argv[3]) : 780;
     int y1 = argc > 4 ? atoi(argv[4]) : 180;

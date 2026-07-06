@@ -23,8 +23,9 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 ## 目录结构
 
 - `src/`：MiniApp 前端壳。
-  - `src/pages/index/`：启动页，显示模式选择、键盘测试、启动入口。
+  - `src/pages/index/`：启动页，显示模式选择、启动入口。
   - `src/pages/frame/`：全屏 `<hole>` 承载页，负责启动/停止 WPE、watchdog、键盘桥轮询。
+  - `src/utils/display-resolver.js`、`browser-lifecycle.js`、`keyboard-bridge.js`：显示解析、WPE 生命周期和键盘桥逻辑。
   - `src/utils/keyboard.js`：HaasUI 系统键盘封装。
 - `jsapi/`：MiniApp native JSAPI 源码，模块名 `browser`。
 - `libs/`：打包用 JSAPI so。
@@ -37,6 +38,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `etc/ssl/certs/ca-certificates.crt`：HTTPS 证书包。
   - `assets/fonts/`：内置字体。
 - `wpe-drm/`：Direct DRM WPE 启动器和 DRM view 源码镜像。
+- `tools/RUNTIME_SIZE_REPORT.md`：当前 runtime 体积清单和后续瘦身建议。
 - `tools/`：开发文档。
   - `tools/DRM_HOLE_RENDERING_PIPELINE.md`：DRM 出屏到 MiniApp `<hole>` 展示的完整链路文档。
   - `tools/KEYBOARD_INPUT.md`：系统键盘调用参考。
@@ -110,6 +112,18 @@ $dataDir/browser/gst-registry.bin
 /userdisk/mesa
 /userdisk/chroot/rootfs/debian-12-arm64/opt/wpe-hostabi
 ```
+
+默认也不加载系统 GStreamer 插件目录。需要调试系统 VPU/音频插件时显式设置：
+
+```sh
+WPE_USE_SYSTEM_GST=1
+```
+
+此时可通过 `WPE_SYSTEM_GST_PLUGIN_DIR` 指定系统插件目录；否则只使用包内 `assets/wpe-runtime/lib/gstreamer-1.0`。
+
+`WPE_CHROME_LAYOUT` 默认是 `inset`：WPE 原生工具栏显示/隐藏时不 resize WebView，只在 WPE framebuffer 合成阶段做视觉让位和坐标扣减。`resize` 仅作为调试开关保留。
+
+注意：`rotation=0` 且走 `dma_heap` zero-copy 直扫时不会绘制 WPE native toolbar，这是当前性能优先路径的预期行为；需要工具栏时使用旋转/CPU 合成路径，或后续实现独立 DRM plane toolbar。
 
 ## 设备调试
 

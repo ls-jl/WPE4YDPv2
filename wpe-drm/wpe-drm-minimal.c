@@ -27,7 +27,9 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
 static GMainLoop *main_loop = NULL;
@@ -228,10 +230,12 @@ static gboolean chrome_layout_resize_enabled(void)
 {
     const char *value = g_getenv("WPE_CHROME_LAYOUT");
     if (!value || !value[0])
-        return TRUE;
+        return FALSE;
     if (!g_ascii_strcasecmp(value, "resize"))
         return TRUE;
-    if (!g_ascii_strcasecmp(value, "overlay"))
+    if (!g_ascii_strcasecmp(value, "inset") ||
+        !g_ascii_strcasecmp(value, "visual-inset") ||
+        !g_ascii_strcasecmp(value, "overlay"))
         return FALSE;
     return env_enabled("WPE_CHROME_LAYOUT", TRUE);
 }
@@ -441,6 +445,7 @@ static gboolean chrome_write_file_if_changed(const char *path, const char *data,
     g_free(dir);
     if (!g_file_set_contents(path, data, length, NULL))
         return FALSE;
+    chmod(path, 0600);
     g_free(*last_written);
     *last_written = g_strndup(data, length);
     *last_length = length;
@@ -738,7 +743,9 @@ static char *json_escape_string(const char *value)
             break;
         }
     }
-    return g_string_free(out, FALSE);
+    char *result = out->str;
+    g_slice_free(GString, out);
+    return result;
 }
 
 static char *js_quote_string(const char *value)
@@ -800,12 +807,10 @@ static void keyboard_clear_active(AppState *state)
         state->keyboard_response_source_id = 0;
     }
     if (state->keyboard_active_id) {
-        char *request_name = g_strdup_printf("%s.json", state->keyboard_active_id);
-        char *request_path = keyboard_path(state, "requests", request_name);
+        char *request_path = keyboard_path(state, "requests", "current.json");
         if (request_path)
             g_unlink(request_path);
         g_free(request_path);
-        g_free(request_name);
     }
     g_clear_pointer(&state->keyboard_active_id, g_free);
     g_clear_pointer(&state->keyboard_active_kind, g_free);
@@ -992,9 +997,7 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
     state->keyboard_next_id++;
     char *id = g_strdup_printf("%" G_GUINT64_FORMAT "_%" G_GINT64_FORMAT,
                                state->keyboard_next_id, g_get_monotonic_time());
-    char *name = g_strdup_printf("%s.json", id);
-    char *path = keyboard_path(state, "requests", name);
-    g_free(name);
+    char *path = keyboard_path(state, "requests", "current.json");
 
     char *kind_json = json_escape_string(kind ? kind : "");
     char *text_json = json_escape_string(text ? text : "");
@@ -2098,12 +2101,12 @@ static void setup_raw_touch(AppState *state)
     }
 
     const char *device = g_getenv("WPE_TOUCH_DEVICE");
-    if (!device || !device[0])
-        device = "/dev/input/by-path/hyn_ts";
+    if (!device || !device[0]) {
+        g_warning("Raw touch disabled: WPE_TOUCH_DEVICE is empty");
+        return;
+    }
 
     int fd = open(device, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0 && strcmp(device, "/dev/input/event5"))
-        fd = open("/dev/input/event5", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         g_warning("Raw touch open failed: %s errno=%d (%s)", device, errno, strerror(errno));
         return;
@@ -2550,14 +2553,41 @@ static void on_web_process_terminated(WebKitWebView *web_view,
                                       WebKitWebProcessTerminationReason reason,
                                       gpointer user_data)
 {
+    /* 熔断：同一 URL 在 120s 窗口内第 3 次被杀（典型是重型站反复撞内存上限）
+     * 时不再原样重载——那只会杀→载→杀无限循环。回主页并提示。 */
+    static char *last_crash_uri;
+    static gint64 crash_window_start_us;
+    static int crash_count_in_window;
+
     (void)user_data;
+    const char *uri = webkit_web_view_get_uri(web_view);
     g_warning("Web process terminated: reason=%s(%d) uri=%s title=%s",
               termination_reason_name(reason), reason,
-              webkit_web_view_get_uri(web_view) ? webkit_web_view_get_uri(web_view) : "(null)",
+              uri ? uri : "(null)",
               webkit_web_view_get_title(web_view) ? webkit_web_view_get_title(web_view) : "(null)");
+
+    gint64 now_us = g_get_monotonic_time();
+    if (uri && last_crash_uri && !strcmp(uri, last_crash_uri) &&
+        now_us - crash_window_start_us < 120 * G_USEC_PER_SEC) {
+        crash_count_in_window++;
+    } else {
+        g_free(last_crash_uri);
+        last_crash_uri = g_strdup(uri ? uri : "");
+        crash_window_start_us = now_us;
+        crash_count_in_window = 1;
+    }
+
     ReloadRequest *request = g_new0(ReloadRequest, 1);
     request->web_view = WEBKIT_WEB_VIEW(g_object_ref(web_view));
-    request->uri = g_strdup(webkit_web_view_get_uri(web_view));
+    if (crash_count_in_window >= 3) {
+        g_warning("Web process crash loop on %s (%d kills in window), falling back to home",
+                  last_crash_uri, crash_count_in_window);
+        request->uri = g_strdup(default_home_url());
+        crash_count_in_window = 0;
+        crash_window_start_us = 0;
+    } else {
+        request->uri = g_strdup(uri);
+    }
     g_timeout_add(500, reload_after_web_process_crash, request);
 }
 
@@ -2670,22 +2700,35 @@ int main(int argc, char **argv) {
     }
 
     /* 2. Create WebView (this internally creates WPEView + WPEToplevel) */
-    /* 1GB 设备的内存防线：WebProcess 超 300MB×0.9 主动 shrinkOrDie 自杀重启
-     * （由 on_web_process_terminated 崩溃重载接管恢复），替代默认写死 7GB
-     * 的永不触发阈值。NetworkProcess 共用同一份配置。 */
+    /* 单任务设备的内存防线：上限按物理内存动态计算（55%，1GB 机型约 560MB），
+     * 超限×0.92 主动 shrinkOrDie 自杀重启（由 on_web_process_terminated 崩溃
+     * 重载接管恢复）。写死 300MB 在抖音这类重站上会触发杀→重载循环。 */
+    guint memory_limit_mb = 675;
+    {
+        struct sysinfo si;
+        if (sysinfo(&si) == 0 && si.totalram > 0) {
+            guint64 total_mb = (guint64)si.totalram * si.mem_unit / (1024 * 1024);
+            /* 68%：bilibili/抖音这类重站实测稳态 ~620MB，55%（kill≈500MB）会
+             * 30s 一轮杀→重载循环。设备有 512MB swap 且浏览器 oom_score_adj
+             * 已置 -600，物理内存吃紧时由 swap 与其他进程让位。 */
+            memory_limit_mb = (guint)(total_mb * 68 / 100);
+            if (memory_limit_mb < 192)
+                memory_limit_mb = 192;
+        }
+    }
     WebKitMemoryPressureSettings *memory_pressure = webkit_memory_pressure_settings_new();
-    webkit_memory_pressure_settings_set_memory_limit(memory_pressure, 300);
+    webkit_memory_pressure_settings_set_memory_limit(memory_pressure, memory_limit_mb);
     /* setter 断言要求 conservative < strict < kill，必须先抬高 strict 再设 conservative */
-    webkit_memory_pressure_settings_set_strict_threshold(memory_pressure, 0.65);
+    webkit_memory_pressure_settings_set_strict_threshold(memory_pressure, 0.7);
     webkit_memory_pressure_settings_set_conservative_threshold(memory_pressure, 0.5);
-    webkit_memory_pressure_settings_set_kill_threshold(memory_pressure, 0.9);
+    webkit_memory_pressure_settings_set_kill_threshold(memory_pressure, 0.92);
     WebKitWebContext *context = g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", memory_pressure,
         NULL);
     webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
     webkit_web_context_add_path_to_sandbox(context, "/userdisk", TRUE);
     webkit_web_context_add_path_to_sandbox(context, "/tmp", FALSE);
-    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=document_browser mem_limit=300MB kill=0.9\n");
+    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=document_browser mem_limit=%uMB kill=0.92\n", memory_limit_mb);
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_javascript(settings, TRUE);
     webkit_settings_set_enable_javascript_markup(settings, TRUE);
@@ -2697,6 +2740,12 @@ int main(int argc, char **argv) {
     webkit_settings_set_enable_mediasource(settings, TRUE);
     webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
     webkit_settings_set_media_playback_allows_inline(settings, TRUE);
+    /* 移动 UA：不设时 WPE 默认桌面 UA，抖音/百度会喂桌面版页面，
+     * 对 960x266 小屏是数倍的排版/内存/脚本开销（日志曾证实加载
+     * www.douyin.com 桌面版）。 */
+    webkit_settings_set_user_agent(settings,
+        "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
     /* 小内存设备：BFCache 在本机型 cache model 下本就是 0 页，显式关闭求确定性。
      * （DNS 预取 setter 自 2.48 起是 no-op，不再调用。） */
     webkit_settings_set_enable_page_cache(settings, FALSE);
@@ -2728,10 +2777,9 @@ int main(int argc, char **argv) {
     g_object_unref(settings);
     g_object_unref(policies);
 
-    /* 基底背景设为黑：与合成器让位带/信箱带填充一致。地址栏收起 resize 后
-     * 底部新增视口在页面像素画上之前露出的是基底色，默认白会闪白条。 */
-    WebKitColor background = { 0.0, 0.0, 0.0, 1.0 };
-    webkit_web_view_set_background_color(web_view, &background);
+    /* 基底背景保持默认白：大量页面不设自身背景色、依赖 UA 默认白底，
+     * 设黑会让这类页面整页变黑（m.baidu.com 实测回归）。inset 布局下
+     * 工具栏显隐不再 resize WebView，原"白条"根因已不存在。 */
 
     g_signal_connect(web_view, "load-failed",
                      G_CALLBACK(on_load_failed), NULL);

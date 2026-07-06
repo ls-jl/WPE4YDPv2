@@ -118,10 +118,10 @@ static bool chromeLayoutResizeEnabled()
     static bool enabled = []() {
         const char* value = getenv("WPE_CHROME_LAYOUT");
         if (!value || !*value)
-            return true;
+            return false;
         if (!g_ascii_strcasecmp(value, "resize"))
             return true;
-        if (!g_ascii_strcasecmp(value, "overlay"))
+        if (!g_ascii_strcasecmp(value, "inset") || !g_ascii_strcasecmp(value, "visual-inset") || !g_ascii_strcasecmp(value, "overlay"))
             return false;
         return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off") && g_ascii_strcasecmp(value, "no");
     }();

@@ -51,13 +51,11 @@ flowchart LR
 
 `index` 页是浏览器启动页，不直接显示网页像素，也不参与 WPE 每帧刷新。它只负责：
 
-- 停止残留 WPE 进程，避免旧进程占用 DRM plane。
 - 显示“启动浏览器”入口。
 - 提供显示模式选项：`原生模式`（跟随系统/MiniApp 框架方向）或 `横屏旋转`（在系统方向基础上旋转到横屏），只影响浏览器画面旋转，传给 WPE/DRM/触摸。
-- 调用 `browserPlayer.prepareRuntime()` 获取包内 runtime 路径。
 - 进入 `frame` 页，并把 `url/browserMode/returnPage` 作为页面参数传入；`frame` 页再结合系统显示配置解析出实际的 `rotation/panelSize/drmMode`。
 
-`index` 不应该自动进入浏览器。自动启动会让调试和回到 MiniApp 首页时的生命周期变得不可控，也会导致 Home 后重新进入时立刻抢 DRM。
+`index` 不 import 或调用 `browserPlayer`。native JSAPI 调用只放在 `frame` 页，避免页面切换或旋转别名导致旧 native object 被框架禁用。`index` 也不应该自动进入浏览器；自动启动会让调试和回到 MiniApp 首页时的生命周期变得不可控，也会导致 Home 后重新进入时立刻抢 DRM。
 
 ### 2.2 `frame` 页
 
@@ -91,6 +89,7 @@ flowchart LR
 - 渲染全屏 `<hole>`。
 - 通过 `$dom.getComponentRect(this.$refs.browserHole)` 读取承载区域尺寸。
 - 解析 `panelSize/drmMode/viewport/rotation`。
+- 调用 `browserPlayer.prepareRuntime()` 校验包内 runtime。
 - 调用 `browserPlayer.startBrowser()` 启动 WPE。
 - 维护 watchdog：WPE 异常退出后回到 `index`。
 - 在 `onHide/onUnload` 中停止 WPE，释放 DRM。
@@ -268,7 +267,9 @@ assets/wpe-runtime/assets/fonts/miniapp/
 GStreamer：
 
 - 私有插件目录：`$DIR/lib/gstreamer-1.0`
-- 如果系统存在 Rockchip MPP 插件：`/usr/lib/gstreamer-1.0/libgstrockchipmpp.so`，会把系统 VPU 插件目录加入 `GST_PLUGIN_PATH`。
+- 默认只加载包内插件，日志显示 `gst_source=bundled`。
+- 只有显式设置 `WPE_USE_SYSTEM_GST=1` 时，才会把系统插件目录加入 `GST_PLUGIN_PATH`。默认目录是 `/usr/lib/gstreamer-1.0`，也可以用 `WPE_SYSTEM_GST_PLUGIN_DIR` 覆盖。
+- 系统 GStreamer 只用于 VPU/ALSA 等硬件能力调试，不是默认运行依赖。
 - registry 写入 `$workdir/gst-registry.bin`。
 
 ### 4.3 显示与触摸默认值
@@ -280,9 +281,9 @@ WPE_PANEL_SIZE=${WPE_PANEL_SIZE:-960x266}
 WPE_VIEWPORT=${WPE_VIEWPORT:-$WPE_PANEL_SIZE}
 WPE_DRM_MODE=${WPE_DRM_MODE:-480x960}
 WPE_DRM_FIT=${WPE_DRM_FIT:-panel-native}
-WPE_CHROME_LAYOUT=${WPE_CHROME_LAYOUT:-resize}
+WPE_CHROME_LAYOUT=${WPE_CHROME_LAYOUT:-inset}
 WPE_RAW_TOUCH=${WPE_RAW_TOUCH:-1}
-WPE_TOUCH_DEVICE=${WPE_TOUCH_DEVICE:-/dev/input/by-path/hyn_ts}
+WPE_TOUCH_DEVICE=<JSAPI 从 cfg.json 解析出的 device.tp>
 WPE_TOUCH_NATIVE_SCROLL=${WPE_TOUCH_NATIVE_SCROLL:-1}
 WPE_TOUCH_JS_SCROLL=${WPE_TOUCH_JS_SCROLL:-0}
 ```
@@ -290,7 +291,7 @@ WPE_TOUCH_JS_SCROLL=${WPE_TOUCH_JS_SCROLL:-0}
 输出日志会包含：
 
 ```text
-WPE launch: url=... drm=... panel=... drm_mode=... viewport=... rotation=... panel_rotation=... display_source=... fit=...
+WPE launch: url=... drm=... panel=... drm_mode=... viewport=... rotation=... panel_rotation=... touch_rotation=... touch_device=... display_source=... fit=... chrome_layout=... gst_source=...
 ```
 
 这是排查尺寸和旋转的第一条关键日志。
@@ -340,6 +341,8 @@ WPE 主程序启动后会执行：
 - 设置 `WPE_DRM_VIEWPORT`
 - 对底层 `WPEView` 调用 `wpe_view_resized()`
 - 使用 `apply_viewport(..., "env")` 应用布局尺寸
+
+默认 `WPE_CHROME_LAYOUT=inset` 时，toolbar 显示/隐藏不会频繁触发 WebKit resize/reflow。`WPE_CHROME_LAYOUT=resize` 只作为调试开关保留，用来对比旧的 WebView 高度重排路径。
 
 ### 5.4 framebuffer
 
@@ -491,6 +494,8 @@ drawChromeOverlay(...)
 ```
 
 这一步发生在 DRM commit 前，所以工具栏和网页内容最终是同一个 WPE framebuffer。MiniApp 只负责 `<hole>`，不负责地址栏、tabs、settings 等浏览器 chrome。
+
+当前保留一个性能优先例外：`rotation=0` 且命中 `dma_heap` zero-copy 直扫路径时，buffer 直接进入 DRM commit，不经过 CPU 合成，因此不会绘制 native toolbar。这是预期行为；如果 0 度也需要 toolbar，需要改走 CPU 合成路径或后续实现独立 DRM plane toolbar。
 
 ## 8. DRM commit
 
@@ -680,18 +685,24 @@ $workdir/keyboard/responses/
 1. WPE 发现输入触发点。
 2. WPE 写入请求 JSON：
    ```text
-   $workdir/keyboard/requests/<id>.json
+   $workdir/keyboard/requests/current.json
    ```
+   请求 `id` 写在 JSON 内。固定文件名可以让 JSAPI 先 `stat` 再读取，避免每轮 `opendir/readdir`。
 3. MiniApp `frame` 页每 200ms 轮询 `browserPlayer.pollKeyboardRequest()`。
 4. MiniApp 调用 HaasUI `global.startTextEdit()` 拉起系统键盘。
-5. 用户确认或取消。
-6. MiniApp 调用 `browserPlayer.respondKeyboardRequest()` 写入：
+5. Y07 这类 textarea 输入法会持续把完整当前文本写入：
+   ```text
+   $workdir/keyboard/responses/<id>.update
+   ```
+   `.update` 是增量状态文件，不做 `fsync`。
+6. 用户确认或取消。
+7. MiniApp 调用 `browserPlayer.respondKeyboardRequest()` 写入最终响应：
    ```text
    $workdir/keyboard/responses/<id>.ok
    $workdir/keyboard/responses/<id>.cancel
    ```
-7. WPE 轮询响应文件。
-8. 地址栏输入走 native chrome load URL；网页输入框走一次性 JS 写入当前 active input，并派发 `input/change`。
+8. WPE 轮询响应文件。
+9. 地址栏输入在最终 `.ok` 后才跳转；网页输入框对 `.update` 实时写入 active input，最终 `.ok` 再派发 `change`。
 
 ## 11. 常用调试命令
 

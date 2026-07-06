@@ -66,8 +66,8 @@ static bool fileExists(const std::string& path)
 static bool ensureDir(const std::string& path)
 {
     if (path.empty()) return false;
-    if (mkdir(path.c_str(), 0777) == 0 || errno == EEXIST) {
-        chmod(path.c_str(), 0777);
+    if (mkdir(path.c_str(), 0700) == 0 || errno == EEXIST) {
+        chmod(path.c_str(), 0700);
         return true;
     }
     return false;
@@ -134,7 +134,7 @@ static std::string readFile(const std::string& path)
     return ss.str();
 }
 
-static bool writeFile(const std::string& path, const std::string& value, mode_t mode = 0666)
+static bool writeFile(const std::string& path, const std::string& value, mode_t mode = 0600, bool syncToDisk = true)
 {
     ensureDirRecursive(parentDir(path));
     int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, mode);
@@ -151,7 +151,7 @@ static bool writeFile(const std::string& path, const std::string& value, mode_t 
         ptr += written;
         left -= static_cast<size_t>(written);
     }
-    if (fsync(fd) != 0) ok = false;
+    if (syncToDisk && fsync(fd) != 0) ok = false;
     close(fd);
     chmod(path.c_str(), mode);
     return ok;
@@ -249,13 +249,7 @@ static pid_t readPidFile(const std::string& path)
 
 static bool writePidFile(const std::string& path, pid_t pid)
 {
-    return writeFile(path, std::to_string(static_cast<long>(pid)) + "\n", 0666);
-}
-
-static bool hasSuffix(const std::string& value, const std::string& suffix)
-{
-    return value.size() >= suffix.size() &&
-        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return writeFile(path, std::to_string(static_cast<long>(pid)) + "\n", 0600);
 }
 
 static bool isSafeKeyboardId(const std::string& value)
@@ -370,15 +364,6 @@ static std::vector<pid_t> collectScopedBrowserPids(const std::string& runtimePat
     }
     closedir(proc);
     return pids;
-}
-
-static bool hasScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
-{
-    std::vector<pid_t> pids = collectScopedBrowserPids(runtimePath, workdir);
-    for (pid_t pid : pids) {
-        if (processExists(pid)) return true;
-    }
-    return false;
 }
 
 static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
@@ -786,7 +771,7 @@ public:
                 const std::string fpsMaxValue = std::to_string(fpsMax);
                 setenv("WPE_DRM_MAX_FPS", fpsMaxValue.c_str(), 1);
             }
-            setenv("WPE_CHROME_LAYOUT", "resize", 0);
+            setenv("WPE_CHROME_LAYOUT", "inset", 0);
             setenv("GST_REGISTRY", joinPath(workdir, "gst-registry.bin").c_str(), 1);
             setenv("WPE_DEFAULT_URL", url.c_str(), 1);
             setenv("HOME", workdir.c_str(), 1);
@@ -884,30 +869,14 @@ public:
             return;
         }
 
-        const std::string requestsDir = joinPath(keyboardDirForWorkdir(workdir), "requests");
-        DIR* dir = opendir(requestsDir.c_str());
-        if (!dir) {
+        const std::string requestPath = joinPath(joinPath(keyboardDirForWorkdir(workdir), "requests"), "current.json");
+        struct stat st;
+        if (stat(requestPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
             info.GetReturnValue().Set("");
             return;
         }
 
-        std::string selected;
-        struct dirent* entry = nullptr;
-        while ((entry = readdir(dir)) != nullptr) {
-            const std::string name(entry->d_name);
-            if (name == "." || name == "..") continue;
-            if (!hasSuffix(name, ".json")) continue;
-            selected = name;
-            break;
-        }
-        closedir(dir);
-
-        if (selected.empty()) {
-            info.GetReturnValue().Set("");
-            return;
-        }
-
-        info.GetReturnValue().Set(readFile(joinPath(requestsDir, selected)));
+        info.GetReturnValue().Set(readFile(requestPath));
     }
 
     void respondKeyboardRequest(JQFunctionInfo& info)
@@ -935,11 +904,11 @@ public:
         const std::string keyboardDir = keyboardDirForWorkdir(workdir);
         const std::string responsesDir = joinPath(keyboardDir, "responses");
         const std::string responsePath = joinPath(responsesDir, id + (confirmed ? ".ok" : ".cancel"));
-        if (!writeFile(responsePath, confirmed ? text : "", 0666)) {
+        if (!writeFile(responsePath, confirmed ? text : "", 0600, true)) {
             throwError(info, std::string("keyboard response write failed: ") + responsePath + ": " + std::strerror(errno));
             return;
         }
-        unlink(joinPath(joinPath(keyboardDir, "requests"), id + ".json").c_str());
+        unlink(joinPath(joinPath(keyboardDir, "requests"), "current.json").c_str());
         publishState("keyboard_response", id + (confirmed ? ":ok" : ":cancel"));
         info.GetReturnValue().Set(true);
     }
@@ -967,7 +936,7 @@ public:
 
         const std::string keyboardDir = keyboardDirForWorkdir(workdir);
         const std::string updatePath = joinPath(joinPath(keyboardDir, "responses"), id + ".update");
-        if (!writeFile(updatePath, text, 0666)) {
+        if (!writeFile(updatePath, text, 0600, false)) {
             throwError(info, std::string("keyboard update write failed: ") + updatePath + ": " + std::strerror(errno));
             return;
         }

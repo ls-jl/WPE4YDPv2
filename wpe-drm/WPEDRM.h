@@ -108,6 +108,7 @@ class Plane {
     WTF_MAKE_TZONE_ALLOCATED(Plane);
 public:
     enum class Type : uint8_t {
+        Overlay = DRM_PLANE_TYPE_OVERLAY,
         Primary = DRM_PLANE_TYPE_PRIMARY,
         Cursor = DRM_PLANE_TYPE_CURSOR
     };
