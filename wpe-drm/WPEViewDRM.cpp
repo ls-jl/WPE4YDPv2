@@ -822,6 +822,7 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
     const uint32_t text = 0xff1a222b;
     const uint32_t disabled = 0xff7f8a94;
     const uint32_t accent = 0xff1d8dbb;
+    const uint32_t progressBlue = 0xff4285f4;
     const uint32_t panel = 0xf8f5f7fa;
 
     int chromeHeight = std::clamp<int>(chrome.height, 24, std::min<int>(80, panelHeight));
@@ -836,9 +837,8 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
         int fillWidth = static_cast<int>(std::lround(panelWidth * progress));
         if (progress > 0.0 && fillWidth < 1)
             fillWidth = 1;
-        painter.fillRect(0, progressY, panelWidth, 3, 0x8853606b);
         if (fillWidth > 0)
-            painter.fillRect(0, progressY, std::min<int>(fillWidth, panelWidth), 3, accent);
+            painter.fillRect(0, progressY, std::min<int>(fillWidth, panelWidth), 3, progressBlue);
     }
 
     if (shownFraction <= 0.001 && !hasPanel)

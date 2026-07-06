@@ -18,30 +18,9 @@
           </div>
         </div>
 
-        <textarea
-          v-if="keyboardProbeVisible"
-          ref="keyboardProbeField"
-          class="keyboard-probe-field"
-          :value="keyboardProbeText"
-          :focus="keyboardProbeFocused"
-          placeholder="键盘测试"
-          placeholderColor="#878A99"
-          cursorColor="#FF683D"
-          :cursorSize="3"
-          :showCursor="true"
-          :softInputEnable="true"
-          maxlength="128"
-          @input="onKeyboardProbeTextChanged"
-          @confirm="onKeyboardProbeTextEditFinished"
-          @textEditFinished="onKeyboardProbeTextEditFinished"
-          @textChanged="onKeyboardProbeTextChanged"
-          @focus="onKeyboardProbeFocus"
-          @blur="onKeyboardProbeBlur"
-        ></textarea>
-
         <div class="button-row">
           <text class="primary-button" @click="launchBrowser()">{{ busy ? '启动中' : '启动浏览器' }}</text>
-          <text class="secondary-button" @click="openKeyboardProbe()">键盘测试</text>
+          <text class="secondary-button" @click="stopBrowser()">停止浏览器</text>
         </div>
       </div>
     </div>
@@ -79,9 +58,6 @@ export default {
       messageText: '准备启动 Direct WPE 浏览器',
       detailText: '',
       selectedMode: DEFAULT_BROWSER_MODE,
-      keyboardProbeVisible: false,
-      keyboardProbeFocused: false,
-      keyboardProbeText: '',
     }
   },
   mounted() {
@@ -105,7 +81,6 @@ export default {
         this.busy = false
         this.statusText = 'Ready'
         this.messageText = '准备启动 Direct WPE 浏览器'
-        this.keyboardProbeFocused = false
       }
       if (pageOptions.browserStatus) {
         this.detailText = `${pageOptions.browserStatus}`
@@ -116,46 +91,6 @@ export default {
     setMode(mode) {
       this.selectedMode = normalizeBrowserMode(mode)
       this.detailText = ''
-    },
-    openKeyboardProbe() {
-      this.keyboardProbeVisible = true
-      this.keyboardProbeFocused = true
-      this.detailText = 'textarea focus 键盘请求'
-      console.warn('index keyboard textarea focus request')
-      return
-    },
-    onKeyboardProbeTextEditFinished(result) {
-      const text = this.parseKeyboardProbeResult(result)
-      this.keyboardProbeText = text
-      this.keyboardProbeFocused = false
-      this.detailText = `textarea 键盘返回: ${text || '空'}`
-      console.warn(`index keyboard textarea finished ${text || ''}`)
-    },
-    onKeyboardProbeTextChanged(result) {
-      this.keyboardProbeText = this.parseKeyboardProbeResult(result)
-      console.warn(`index keyboard textarea changed ${this.keyboardProbeText || ''}`)
-    },
-    onKeyboardProbeFocus() {
-      console.warn('index keyboard textarea focused')
-    },
-    onKeyboardProbeBlur() {
-      this.keyboardProbeFocused = false
-      console.warn('index keyboard textarea blurred')
-    },
-    parseKeyboardProbeResult(result) {
-      if (!result) return ''
-      if (typeof result === 'string') {
-        try {
-          const parsed = JSON.parse(result)
-          return parsed.text || (parsed.records && parsed.records[0] && parsed.records[0].text) || parsed.contents || result
-        } catch (err) {
-          return result
-        }
-      }
-      if (typeof result === 'object') {
-        return result.text || (result.records && result.records[0] && result.records[0].text) || result.contents || ''
-      }
-      return `${result}`
     },
     readInitialUrl() {
       const page = this.$page || {}
@@ -181,7 +116,6 @@ export default {
     },
     launchBrowser() {
       if (this.busy) return
-      this.keyboardProbeFocused = false
       this.busy = true
       this.statusText = 'Starting'
       this.messageText = '正在进入浏览器'
@@ -199,6 +133,28 @@ export default {
         this.messageText = '浏览器启动失败'
         this.detailText = message
         console.warn(`launch browser nav failed ${message}`)
+        this.busy = false
+      }
+    },
+    stopBrowser() {
+      if (this.busy) return
+      this.busy = true
+      this.statusText = 'Stopping'
+      this.messageText = '正在停止浏览器'
+      this.detailText = ''
+
+      try {
+        $falcon.navTo('frame', {
+          stopOnly: 1,
+          browserMode: this.selectedMode,
+          returnPage: 'index',
+        })
+      } catch (err) {
+        const message = err && err.message ? err.message : `${err}`
+        this.statusText = 'Error'
+        this.messageText = '停止浏览器失败'
+        this.detailText = message
+        console.warn(`stop browser nav failed ${message}`)
         this.busy = false
       }
     },
@@ -324,18 +280,6 @@ export default {
   font-size: 15px;
   color: #d9e6f2;
   background-color: #26323d;
-}
-
-.keyboard-probe-field {
-  margin-top: 4px;
-  width: 260px;
-  height: 42px;
-  padding: 4px 8px;
-  border-radius: 4px;
-  opacity: 1;
-  color: #ffffff;
-  background-color: #18212a;
-  font-size: 18px;
 }
 
 </style>

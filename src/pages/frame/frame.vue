@@ -282,6 +282,10 @@ export default {
     }
   },
   mounted() {
+    if (this.isStopOnly()) {
+      this.stopOnlyAndReturn()
+      return
+    }
     this.setupKeyboard()
     this.startBrowser()
     this.startPolling()
@@ -292,6 +296,10 @@ export default {
   methods: {
     pageOptions() {
       return this.$page && this.$page.options ? this.$page.options : {}
+    },
+    isStopOnly() {
+      const options = this.pageOptions()
+      return options.stopOnly === 1 || options.stopOnly === '1' || options.stopOnly === true || options.stopOnly === 'true'
     },
     browserWorkdir() {
       const options = this.pageOptions()
@@ -779,6 +787,28 @@ export default {
         console.warn(`stop browser failed ${err}`)
       }
     },
+    stopOnlyAndReturn() {
+      const options = this.pageOptions()
+      this.leavingFrame = true
+      console.warn('wpe stop-only frame')
+      let status = '浏览器已停止'
+      try {
+        this.stopBrowser()
+      } catch (err) {
+        status = err && err.message ? err.message : `${err}`
+        console.warn(`stop-only failed ${status}`)
+      }
+      setTimeout(() => {
+        try {
+          $falcon.navTo(options.returnPage || 'index', {
+            browserStatus: status,
+            browserMode: options.browserMode || DEFAULT_BROWSER_MODE,
+          })
+        } catch (err) {
+          console.warn(`stop-only nav index failed ${err}`)
+        }
+      }, 100)
+    },
     leaveFrame(reason) {
       if (this.leavingFrame) return
       this.leavingFrame = true
@@ -797,6 +827,7 @@ export default {
       }, 100)
     },
     onShow() {
+      if (this.isStopOnly()) return
       if (!this.leavingFrame) {
         this.startBrowser()
       }
