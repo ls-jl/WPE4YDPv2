@@ -105,6 +105,7 @@ typedef struct {
     int scroll_direction;
     gboolean suppress_history;
     guint layout_timer;
+    char site_profile[16];
 } BrowserChrome;
 
 typedef struct {
@@ -368,6 +369,43 @@ static const char *default_home_url(void)
     return url && url[0] ? url : "https://m.baidu.com/";
 }
 
+static const char *site_profile_mobile_user_agent(void)
+{
+    return "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+}
+
+static const char *site_profile_desktop_user_agent(void)
+{
+    return "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+}
+
+static const char *normalize_site_profile(const char *profile)
+{
+    return profile && !g_ascii_strcasecmp(profile, "desktop") ? "desktop" : "mobile";
+}
+
+static const char *site_profile_user_agent(const char *profile)
+{
+    return !g_strcmp0(normalize_site_profile(profile), "desktop")
+        ? site_profile_desktop_user_agent()
+        : site_profile_mobile_user_agent();
+}
+
+static void chrome_apply_site_profile(AppState *state)
+{
+    if (!state || !state->web_view)
+        return;
+    const char *profile = normalize_site_profile(state->chrome.site_profile);
+    g_strlcpy(state->chrome.site_profile, profile, sizeof(state->chrome.site_profile));
+    WebKitSettings *settings = webkit_web_view_get_settings(state->web_view);
+    const char *user_agent = site_profile_user_agent(profile);
+    if (settings)
+        webkit_settings_set_user_agent(settings, user_agent);
+    g_print("Site profile: site_profile=%s user_agent=%s\n", profile, user_agent);
+}
+
 static void chrome_apply_layout(AppState *state, const char *reason);
 
 static void chrome_request_frame(AppState *state)
@@ -425,10 +463,13 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         const char *home = chrome->home_url && chrome->home_url[0] ? chrome->home_url : default_home_url();
         snprintf(line, sizeof(line), "SET HOME %.80s", home);
         g_key_file_set_string(key_file, "panel", "line0", line);
-        g_key_file_set_string(key_file, "panel", "line1", chrome->touch_debug ? "TOUCH DEBUG ON" : "TOUCH DEBUG OFF");
-        g_key_file_set_string(key_file, "panel", "line2", "CLEAR CACHE");
-        g_key_file_set_string(key_file, "panel", "line3", "ABOUT WPE DRM2");
-        line_count = 4;
+        snprintf(line, sizeof(line), "SITE MODE %s",
+                 !g_strcmp0(normalize_site_profile(chrome->site_profile), "desktop") ? "DESKTOP" : "MOBILE");
+        g_key_file_set_string(key_file, "panel", "line1", line);
+        g_key_file_set_string(key_file, "panel", "line2", chrome->touch_debug ? "TOUCH DEBUG ON" : "TOUCH DEBUG OFF");
+        g_key_file_set_string(key_file, "panel", "line3", "CLEAR CACHE");
+        g_key_file_set_string(key_file, "panel", "line4", "ABOUT WPE DRM2");
+        line_count = 5;
     }
 
     g_key_file_set_integer(key_file, "panel", "line_count", line_count);
@@ -472,6 +513,7 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_integer(key_file, "chrome", "height", chrome->height);
     g_key_file_set_integer(key_file, "chrome", "tab_count", chrome->tab_count);
     g_key_file_set_integer(key_file, "chrome", "active_tab", chrome->active);
+    g_key_file_set_string(key_file, "chrome", "site_profile", normalize_site_profile(chrome->site_profile));
     char *transition_us = g_strdup_printf("%" G_GINT64_FORMAT, chrome->transition_us);
     g_key_file_set_string(key_file, "chrome", "transition_us", transition_us);
     g_free(transition_us);
@@ -503,6 +545,7 @@ static void chrome_save_state(AppState *state)
     GKeyFile *key_file = g_key_file_new();
     g_key_file_set_string(key_file, "settings", "home_url", chrome->home_url ? chrome->home_url : default_home_url());
     g_key_file_set_boolean(key_file, "settings", "touch_debug", chrome->touch_debug);
+    g_key_file_set_string(key_file, "settings", "site_profile", normalize_site_profile(chrome->site_profile));
     g_key_file_set_integer(key_file, "tabs", "active", chrome->active);
     g_key_file_set_integer(key_file, "tabs", "count", chrome->tab_count);
     g_key_file_set_integer(key_file, "tabs", "next_id", chrome->next_tab_id);
@@ -756,6 +799,82 @@ static char *js_quote_string(const char *value)
     return quoted;
 }
 
+static char *uri_scheme_dup(const char *uri)
+{
+    if (!uri || !g_ascii_isalpha(uri[0]))
+        return NULL;
+
+    const char *p = uri + 1;
+    while (*p) {
+        if (*p == ':')
+            return g_ascii_strdown(uri, p - uri);
+        if (*p == '/' || *p == '?' || *p == '#' || g_ascii_isspace(*p))
+            return NULL;
+        if (!(g_ascii_isalnum(*p) || *p == '+' || *p == '-' || *p == '.'))
+            return NULL;
+        p++;
+    }
+    return NULL;
+}
+
+static gboolean browser_scheme_is_allowed(const char *scheme)
+{
+    if (!scheme || !scheme[0])
+        return TRUE;
+    return !g_ascii_strcasecmp(scheme, "http")
+        || !g_ascii_strcasecmp(scheme, "https")
+        || !g_ascii_strcasecmp(scheme, "about")
+        || !g_ascii_strcasecmp(scheme, "file");
+}
+
+static gboolean is_bvid_char(char c)
+{
+    return g_ascii_isalnum(c);
+}
+
+static char *bilibili_web_url_from_uri(const char *uri)
+{
+    if (!uri || !uri[0])
+        return NULL;
+
+    const char *bv = NULL;
+    for (const char *p = uri; *p; ++p) {
+        if (p[0] == 'B' && p[1] == 'V' && is_bvid_char(p[2])) {
+            bv = p;
+            break;
+        }
+    }
+    if (bv) {
+        const char *end = bv;
+        while (*end && is_bvid_char(*end) && end - bv < 32)
+            end++;
+        if (end - bv >= 4) {
+            char *bvid = g_strndup(bv, end - bv);
+            char *url = g_strdup_printf("https://www.bilibili.com/video/%s/", bvid);
+            g_free(bvid);
+            return url;
+        }
+    }
+
+    const char *prefix = "bilibili://video/";
+    if (!g_ascii_strncasecmp(uri, prefix, strlen(prefix))) {
+        const char *id = uri + strlen(prefix);
+        while (*id && !g_ascii_isdigit(*id))
+            id++;
+        const char *end = id;
+        while (*end && g_ascii_isdigit(*end))
+            end++;
+        if (end > id) {
+            char *avid = g_strndup(id, end - id);
+            char *url = g_strdup_printf("https://www.bilibili.com/video/av%s/", avid);
+            g_free(avid);
+            return url;
+        }
+    }
+
+    return NULL;
+}
+
 static char *normalize_user_url(const char *raw)
 {
     char *value = g_strdup(raw ? raw : "");
@@ -772,8 +891,32 @@ static char *normalize_user_url(const char *raw)
         g_free(value);
         return g_strdup("https://www.bing.com/");
     }
-    if (strstr(value, "://") || g_str_has_prefix(value, "about:") || g_str_has_prefix(value, "file:"))
-        return value;
+
+    char *scheme = uri_scheme_dup(value);
+    if (scheme) {
+        if (browser_scheme_is_allowed(scheme)) {
+            g_free(scheme);
+            return value;
+        }
+        if (!g_ascii_strcasecmp(scheme, "bilibili")) {
+            char *web_url = bilibili_web_url_from_uri(value);
+            if (web_url) {
+                g_print("Converted Bilibili user URL: raw=%s url=%s\n", value, web_url);
+                g_free(scheme);
+                g_free(value);
+                return web_url;
+            }
+        }
+        g_warning("Blocked user URL scheme: scheme=%s raw=%s", scheme, value);
+        g_free(scheme);
+        g_free(value);
+        return NULL;
+    }
+    if (strstr(value, "://")) {
+        g_warning("Blocked malformed URL scheme: raw=%s", value);
+        g_free(value);
+        return NULL;
+    }
 
     if (strchr(value, ' ') || strchr(value, '\t') || !strchr(value, '.')) {
         char *escaped = g_uri_escape_string(value, NULL, TRUE);
@@ -888,15 +1031,21 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
     if (confirmed) {
         if (!g_strcmp0(state->keyboard_active_kind, "address")) {
             char *url = normalize_user_url(final_text);
-            chrome_load_url(state, url, TRUE);
+            if (url)
+                chrome_load_url(state, url, TRUE);
+            else
+                g_warning("Ignoring blocked address input: bytes=%zu", strlen(final_text));
             g_free(url);
         } else if (!g_strcmp0(state->keyboard_active_kind, "home_url")) {
             char *url = normalize_user_url(final_text);
-            g_free(state->chrome.home_url);
-            state->chrome.home_url = url;
-            state->chrome.panel = CHROME_PANEL_NONE;
-            chrome_save_state(state);
-            chrome_request_frame(state);
+            if (url) {
+                g_free(state->chrome.home_url);
+                state->chrome.home_url = url;
+                state->chrome.panel = CHROME_PANEL_NONE;
+                chrome_save_state(state);
+                chrome_request_frame(state);
+            } else
+                g_warning("Ignoring blocked home URL input: bytes=%zu", strlen(final_text));
         } else if (!g_strcmp0(state->keyboard_active_kind, "web_input"))
             keyboard_insert_web_text(state, final_text, TRUE);
     }
@@ -1203,6 +1352,23 @@ static void chrome_clear_cache(void)
         remove_dir_contents(cache);
 }
 
+static void chrome_toggle_site_profile(AppState *state)
+{
+    if (!state)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    const char *current = normalize_site_profile(chrome->site_profile);
+    const char *next = !g_strcmp0(current, "desktop") ? "mobile" : "desktop";
+    g_strlcpy(chrome->site_profile, next, sizeof(chrome->site_profile));
+    chrome_apply_site_profile(state);
+    BrowserTab *tab = chrome_active_tab(chrome);
+    const char *reload_url = tab && tab->url[0] ? tab->url : (chrome->home_url ? chrome->home_url : default_home_url());
+    g_print("Site profile changed: %s reload=%s\n", next, reload_url);
+    chrome->panel = CHROME_PANEL_NONE;
+    chrome_save_state(state);
+    chrome_load_url(state, reload_url, FALSE);
+}
+
 static void chrome_select_panel_row(AppState *state, int row)
 {
     BrowserChrome *chrome = &state->chrome;
@@ -1229,13 +1395,15 @@ static void chrome_select_panel_row(AppState *state, int row)
             keyboard_request(state, "home_url", chrome->home_url ? chrome->home_url : default_home_url(),
                              "设置主页 URL", "EnUSPreferred", 512, FALSE);
         } else if (row == 1) {
+            chrome_toggle_site_profile(state);
+        } else if (row == 2) {
             chrome->touch_debug = !chrome->touch_debug;
             chrome_save_state(state);
-        } else if (row == 2) {
+        } else if (row == 3) {
             chrome_clear_cache();
             chrome->panel = CHROME_PANEL_NONE;
             chrome_save_state(state);
-        } else if (row == 3) {
+        } else if (row == 4) {
             g_print("About: Direct WPE DRM browser chrome\n");
         }
     }
@@ -1425,6 +1593,7 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     chrome->state_path = g_strdup(g_getenv("WPE_CHROME_STATE") && g_getenv("WPE_CHROME_STATE")[0] ? g_getenv("WPE_CHROME_STATE") : "/tmp/wpe-drm2-browser-state.ini");
     chrome->render_state_path = g_strdup(g_getenv("WPE_CHROME_RENDER_STATE") && g_getenv("WPE_CHROME_RENDER_STATE")[0] ? g_getenv("WPE_CHROME_RENDER_STATE") : "/tmp/wpe-drm2-chrome-state.ini");
     chrome->home_url = g_strdup(default_home_url());
+    g_strlcpy(chrome->site_profile, "mobile", sizeof(chrome->site_profile));
     chrome->tab_count = 1;
     chrome->active = 0;
     chrome->next_tab_id = 2;
@@ -1443,6 +1612,9 @@ static void chrome_load_state(AppState *state, const char *initial_url)
             home = NULL;
         }
         g_free(home);
+        gchar *site_profile = g_key_file_get_string(key_file, "settings", "site_profile", NULL);
+        g_strlcpy(chrome->site_profile, normalize_site_profile(site_profile), sizeof(chrome->site_profile));
+        g_free(site_profile);
         chrome->touch_debug = g_key_file_get_boolean(key_file, "settings", "touch_debug", NULL);
         int count = g_key_file_get_integer(key_file, "tabs", "count", NULL);
         if (count > 0 && count <= MAX_BROWSER_TABS) {
@@ -2402,6 +2574,71 @@ static gboolean on_load_failed(WebKitWebView *web_view, WebKitLoadEvent load_eve
     return FALSE;
 }
 
+static gboolean on_decide_policy(WebKitWebView *web_view,
+                                 WebKitPolicyDecision *decision,
+                                 WebKitPolicyDecisionType type,
+                                 gpointer user_data)
+{
+    (void)web_view;
+    (void)user_data;
+
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
+        && type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION)
+        return FALSE;
+
+    WebKitNavigationPolicyDecision *navigation_decision = WEBKIT_NAVIGATION_POLICY_DECISION(decision);
+    WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(navigation_decision);
+    WebKitURIRequest *request = action ? webkit_navigation_action_get_request(action) : NULL;
+    const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
+    char *scheme = uri_scheme_dup(uri);
+    if (!scheme)
+        return FALSE;
+
+    if (browser_scheme_is_allowed(scheme)) {
+        if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION && uri && uri[0]) {
+            g_print("Open new-window navigation in current view: uri=%s nav_type=%d user_gesture=%d frame=%s\n",
+                    uri,
+                    action ? webkit_navigation_action_get_navigation_type(action) : -1,
+                    action ? webkit_navigation_action_is_user_gesture(action) : FALSE,
+                    action && webkit_navigation_action_get_frame_name(action) ? webkit_navigation_action_get_frame_name(action) : "(main)");
+            webkit_policy_decision_ignore(decision);
+            load_uri_preserving_local_html(web_view, uri);
+            g_free(scheme);
+            return TRUE;
+        }
+        g_free(scheme);
+        return FALSE;
+    }
+
+    if (!g_ascii_strcasecmp(scheme, "bilibili")) {
+        char *web_url = bilibili_web_url_from_uri(uri);
+        if (web_url) {
+            g_print("Converted Bilibili navigation: uri=%s url=%s type=%d nav_type=%d user_gesture=%d\n",
+                    uri ? uri : "(null)",
+                    web_url,
+                    type,
+                    action ? webkit_navigation_action_get_navigation_type(action) : -1,
+                    action ? webkit_navigation_action_is_user_gesture(action) : FALSE);
+            webkit_policy_decision_ignore(decision);
+            load_uri_preserving_local_html(web_view, web_url);
+            g_free(web_url);
+            g_free(scheme);
+            return TRUE;
+        }
+    }
+
+    g_warning("Blocked navigation: scheme=%s uri=%s type=%d nav_type=%d user_gesture=%d frame=%s",
+              scheme,
+              uri ? uri : "(null)",
+              type,
+              action ? webkit_navigation_action_get_navigation_type(action) : -1,
+              action ? webkit_navigation_action_is_user_gesture(action) : FALSE,
+              action && webkit_navigation_action_get_frame_name(action) ? webkit_navigation_action_get_frame_name(action) : "(main)");
+    webkit_policy_decision_ignore(decision);
+    g_free(scheme);
+    return TRUE;
+}
+
 typedef struct {
     WebKitWebView *web_view;
     char *uri;
@@ -2743,14 +2980,12 @@ int main(int argc, char **argv) {
     /* 移动 UA：不设时 WPE 默认桌面 UA，抖音/百度会喂桌面版页面，
      * 对 960x266 小屏是数倍的排版/内存/脚本开销（日志曾证实加载
      * www.douyin.com 桌面版）。 */
-    webkit_settings_set_user_agent(settings,
-        "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+    webkit_settings_set_user_agent(settings, site_profile_user_agent("mobile"));
     /* 小内存设备：BFCache 在本机型 cache model 下本就是 0 页，显式关闭求确定性。
      * （DNS 预取 setter 自 2.48 起是 no-op，不再调用。） */
     webkit_settings_set_enable_page_cache(settings, FALSE);
     g_object_set(settings, "enable-write-console-messages-to-stdout", TRUE, NULL);
-    g_print("Settings: javascript=%d javascript_markup=%d file_access=%d webgl=%d canvas_accel=%d media=%d webaudio=%d mediasource=%d\n",
+    g_print("Settings: javascript=%d javascript_markup=%d file_access=%d webgl=%d canvas_accel=%d media=%d webaudio=%d mediasource=%d site_profile=mobile user_agent=%s\n",
             webkit_settings_get_enable_javascript(settings),
             webkit_settings_get_enable_javascript_markup(settings),
             webkit_settings_get_allow_file_access_from_file_urls(settings),
@@ -2758,7 +2993,8 @@ int main(int argc, char **argv) {
             webkit_settings_get_enable_2d_canvas_acceleration(settings),
             webkit_settings_get_enable_media(settings),
             webkit_settings_get_enable_webaudio(settings),
-            webkit_settings_get_enable_mediasource(settings));
+            webkit_settings_get_enable_mediasource(settings),
+            webkit_settings_get_user_agent(settings));
     WebKitUserContentManager *user_content_manager = webkit_user_content_manager_new();
     WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
         "autoplay", WEBKIT_AUTOPLAY_ALLOW,
@@ -2787,6 +3023,8 @@ int main(int argc, char **argv) {
                      G_CALLBACK(on_load_failed_with_tls_errors), network_session);
     g_signal_connect(web_view, "web-process-terminated",
                      G_CALLBACK(on_web_process_terminated), NULL);
+    g_signal_connect(web_view, "decide-policy",
+                     G_CALLBACK(on_decide_policy), NULL);
 
     /* 3. Access the underlying WPEView for frame callbacks */
     AppState *state = NULL;
@@ -2815,6 +3053,7 @@ int main(int argc, char **argv) {
         state->viewport_width = width;
         state->viewport_height = height;
         chrome_load_state(state, url);
+        chrome_apply_site_profile(state);
         setup_keyboard_bridge(state);
         setup_keyboard_user_script(user_content_manager, state);
         g_signal_connect(web_view, "load-changed",
