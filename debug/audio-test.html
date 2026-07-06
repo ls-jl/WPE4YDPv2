@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>audio-init</title></head>
+<body style="background:#111;color:#eee;font-size:28px">
+<div id="s">audio test starting...</div>
+<script>
+(function () {
+  var el = document.getElementById('s');
+  function report(msg) { el.textContent = msg; document.title = msg; }
+  try {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) { report('no AudioContext'); return; }
+    var ctx = new Ctx();
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    gain.gain.value = 0.4;
+    osc.frequency.value = 440;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    var tick = 0;
+    setInterval(function () {
+      tick += 1;
+      report('audio ctx=' + ctx.state + ' t=' + tick + 's rate=' + ctx.sampleRate);
+      if (ctx.state === 'suspended') ctx.resume();
+    }, 1000);
+    report('audio ctx=' + ctx.state + ' rate=' + ctx.sampleRate);
+  } catch (err) {
+    report('audio error: ' + err);
+  }
+})();
+</script>
+</body>
+</html>

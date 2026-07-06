@@ -344,14 +344,14 @@ static void signalProcessTree(pid_t pid, int signo)
     kill(pid, signo);
 }
 
-static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
+static std::vector<pid_t> collectScopedBrowserPids(const std::string& runtimePath, const std::string& workdir)
 {
-    if (runtimePath.empty() && workdir.empty()) return;
+    std::vector<pid_t> pids;
+    if (runtimePath.empty() && workdir.empty()) return pids;
 
     DIR* proc = opendir("/proc");
-    if (!proc) return;
+    if (!proc) return pids;
 
-    std::vector<pid_t> pids;
     struct dirent* entry = nullptr;
     while ((entry = readdir(proc)) != nullptr) {
         pid_t pid = parseProcPid(entry->d_name);
@@ -362,14 +362,28 @@ static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const 
         if (cmdline.empty() || !isBrowserProcessName(cmdline)) continue;
 
         std::string environ = readFile(joinPath(procDir, "environ"));
-        const bool scoped = containsString(cmdline, runtimePath) ||
-            containsString(environ, runtimePath) ||
-            containsString(cmdline, workdir) ||
-            containsString(environ, workdir);
+        const bool scoped = (!runtimePath.empty() && (containsString(cmdline, runtimePath) ||
+            containsString(environ, runtimePath))) ||
+            (!workdir.empty() && (containsString(cmdline, workdir) ||
+            containsString(environ, workdir)));
         if (scoped) pids.push_back(pid);
     }
     closedir(proc);
+    return pids;
+}
 
+static bool hasScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
+{
+    std::vector<pid_t> pids = collectScopedBrowserPids(runtimePath, workdir);
+    for (pid_t pid : pids) {
+        if (processExists(pid)) return true;
+    }
+    return false;
+}
+
+static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
+{
+    std::vector<pid_t> pids = collectScopedBrowserPids(runtimePath, workdir);
     if (pids.empty()) return;
     for (pid_t pid : pids) signalProcessTree(pid, SIGTERM);
     for (int i = 0; i < 20; ++i) {

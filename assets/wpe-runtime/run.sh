@@ -15,13 +15,23 @@ export GBM_BACKEND="${GBM_BACKEND:-drm}"
 export GALLIUM_DRIVER="${GALLIUM_DRIVER:-softpipe}"
 export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-kms_swrast}"
 GST_PRIVATE_PLUGIN_DIR="$DIR/lib/gstreamer-1.0"
-GST_VPU_PLUGIN_DIR="${WPE_VPU_PLUGIN_DIR:-/usr/lib/gstreamer-1.0}"
-if [ -f "$GST_VPU_PLUGIN_DIR/libgstrockchipmpp.so" ]; then
-    export GST_PLUGIN_PATH="$GST_VPU_PLUGIN_DIR:$GST_PRIVATE_PLUGIN_DIR"
-    export GST_PLUGIN_SYSTEM_PATH="$GST_VPU_PLUGIN_DIR:$GST_PRIVATE_PLUGIN_DIR"
+GST_SYSTEM_PLUGIN_DIR="${WPE_SYSTEM_GST_PLUGIN_DIR:-${WPE_VPU_PLUGIN_DIR:-/usr/lib/gstreamer-1.0}}"
+# 系统插件目录提供 VPU 硬解（rockchipmpp）和整套音频栈（alsasink/autodetect/
+# faad/mpg123/opus/vorbis 等，打包 runtime 未带音频插件）。目录存在即引入，
+# 不再以 rockchipmpp 存在为前置条件。
+if [ -d "$GST_SYSTEM_PLUGIN_DIR" ]; then
+    export GST_PLUGIN_PATH="$GST_SYSTEM_PLUGIN_DIR:$GST_PRIVATE_PLUGIN_DIR"
+    export GST_PLUGIN_SYSTEM_PATH="$GST_SYSTEM_PLUGIN_DIR:$GST_PRIVATE_PLUGIN_DIR"
 else
     export GST_PLUGIN_PATH="$GST_PRIVATE_PLUGIN_DIR"
     export GST_PLUGIN_SYSTEM_PATH="$GST_PRIVATE_PLUGIN_DIR"
+fi
+
+# 浏览器音频走系统 ALSA（RK817 codec，/etc/asound.conf 路由到 speaker）。
+# 启动前尽力解除静音，失败不阻塞。
+if command -v amixer >/dev/null 2>&1; then
+    env -u LD_LIBRARY_PATH amixer sset Master unmute >/dev/null 2>&1 || true
+    env -u LD_LIBRARY_PATH amixer sset Playback unmute >/dev/null 2>&1 || true
 fi
 export GIO_MODULE_DIR="$DIR/lib/gio/modules"
 export GIO_EXTRA_MODULES="$DIR/lib/gio/modules"
@@ -41,8 +51,17 @@ export WEBKIT_GST_DISABLE_GL_SINK="${WEBKIT_GST_DISABLE_GL_SINK:-1}"
 export WEBKIT_WEBGL_DISABLE_GBM="${WEBKIT_WEBGL_DISABLE_GBM:-1}"
 export WEBKIT_DISABLE_DMABUF_ATLAS="${WEBKIT_DISABLE_DMABUF_ATLAS:-1}"
 export WEBKIT_FORCE_VBLANK_TIMER="${WEBKIT_FORCE_VBLANK_TIMER:-1}"
-export WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR="${WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR:-1}"
-export WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS="${WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS:-30}"
+# 低配设备（1GB/4xA53/无GPU）调优：
+# - 恢复系统级内存压力监控（原先 =1 关闭；关闭会同时使 tile 预取恒 2x）
+# - Skia 走原生 CPU 光栅化，不再经 softpipe 软件 GL 模拟的 GPU 路径（收益最大）
+# - 刷新节流 30→20 fps（须为刷新率 60 的因子），线性省 CPU
+# - JSC：FTL JIT 关（最耗内存层）、JS 堆封顶 64MB、脚本看门狗 8s 防死循环
+export WEBKIT_SKIA_ENABLE_CPU_RENDERING="${WEBKIT_SKIA_ENABLE_CPU_RENDERING:-1}"
+export WEBKIT_SKIA_CPU_PAINTING_THREADS="${WEBKIT_SKIA_CPU_PAINTING_THREADS:-3}"
+export WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS="${WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS:-20}"
+export JSC_useFTLJIT="${JSC_useFTLJIT:-false}"
+export JSC_gcMaxHeapSize="${JSC_gcMaxHeapSize:-67108864}"
+export JSC_watchdog="${JSC_watchdog:-8000}"
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
 export WPE_CHROME_ENABLED="${WPE_CHROME_ENABLED:-1}"
 export WPE_CHROME_HEIGHT="${WPE_CHROME_HEIGHT:-44}"

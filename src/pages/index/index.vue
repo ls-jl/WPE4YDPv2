@@ -20,7 +20,6 @@
 
         <div class="button-row">
           <text class="primary-button" @click="launchBrowser()">{{ busy ? '启动中' : '启动浏览器' }}</text>
-          <text class="secondary-button" @click="stopBrowser()">停止浏览器</text>
         </div>
       </div>
     </div>
@@ -133,28 +132,6 @@ export default {
         this.messageText = '浏览器启动失败'
         this.detailText = message
         console.warn(`launch browser nav failed ${message}`)
-        this.busy = false
-      }
-    },
-    stopBrowser() {
-      if (this.busy) return
-      this.busy = true
-      this.statusText = 'Stopping'
-      this.messageText = '正在停止浏览器'
-      this.detailText = ''
-
-      try {
-        $falcon.navTo('frame', {
-          stopOnly: 1,
-          browserMode: this.selectedMode,
-          returnPage: 'index',
-        })
-      } catch (err) {
-        const message = err && err.message ? err.message : `${err}`
-        this.statusText = 'Error'
-        this.messageText = '停止浏览器失败'
-        this.detailText = message
-        console.warn(`stop browser nav failed ${message}`)
         this.busy = false
       }
     },

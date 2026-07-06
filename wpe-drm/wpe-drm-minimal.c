@@ -102,6 +102,7 @@ typedef struct {
     guint32 scroll_last_time_ms;
     int scroll_direction;
     gboolean suppress_history;
+    guint layout_timer;
 } BrowserChrome;
 
 typedef struct {
@@ -1484,6 +1485,10 @@ static void chrome_destroy(AppState *state)
         return;
     BrowserChrome *chrome = &state->chrome;
     chrome_save_state(state);
+    if (chrome->layout_timer) {
+        g_source_remove(chrome->layout_timer);
+        chrome->layout_timer = 0;
+    }
     for (int i = 0; i < chrome->tab_count; ++i)
         chrome_clear_tab(&chrome->tabs[i]);
     g_free(chrome->state_path);
@@ -1527,6 +1532,14 @@ static void ensure_panel_size(AppState *state)
     }
 }
 
+static gboolean chrome_deferred_layout_cb(gpointer user_data)
+{
+    AppState *state = user_data;
+    state->chrome.layout_timer = 0;
+    chrome_apply_layout(state, "deferred");
+    return G_SOURCE_REMOVE;
+}
+
 static void chrome_apply_layout(AppState *state, const char *reason)
 {
     if (!state || !state->view || !state->chrome.enabled || !chrome_layout_resize_enabled())
@@ -1539,6 +1552,22 @@ static void chrome_apply_layout(AppState *state, const char *reason)
     int content_height = panel_height - top_inset;
     if (content_height < 64)
         content_height = 64;
+
+    /* 工具栏收起（内容区变大）时把 resize 推迟到滑出动画结束：立刻 resize 会让
+     * WebKit 在动画期间就为底部新增区域重排重绘，未及绘制的部分露出基底背景。
+     * 展开方向内容区变小，不会露底，仍立即应用。 */
+    gboolean growing = state->viewport_height > 0 && content_height > state->viewport_height;
+    if (growing && !g_str_equal(reason ? reason : "", "deferred")) {
+        if (state->chrome.layout_timer)
+            g_source_remove(state->chrome.layout_timer);
+        state->chrome.layout_timer = g_timeout_add(chrome_animation_duration_ms(),
+                                                   chrome_deferred_layout_cb, state);
+        return;
+    }
+    if (state->chrome.layout_timer) {
+        g_source_remove(state->chrome.layout_timer);
+        state->chrome.layout_timer = 0;
+    }
 
     char detail[96];
     snprintf(detail, sizeof(detail), "chrome_%s inset=%d panel=%dx%d", reason ? reason : "layout", top_inset, panel_width, panel_height);
@@ -2641,10 +2670,22 @@ int main(int argc, char **argv) {
     }
 
     /* 2. Create WebView (this internally creates WPEView + WPEToplevel) */
-    WebKitWebContext *context = webkit_web_context_new();
+    /* 1GB 设备的内存防线：WebProcess 超 300MB×0.9 主动 shrinkOrDie 自杀重启
+     * （由 on_web_process_terminated 崩溃重载接管恢复），替代默认写死 7GB
+     * 的永不触发阈值。NetworkProcess 共用同一份配置。 */
+    WebKitMemoryPressureSettings *memory_pressure = webkit_memory_pressure_settings_new();
+    webkit_memory_pressure_settings_set_memory_limit(memory_pressure, 300);
+    /* setter 断言要求 conservative < strict < kill，必须先抬高 strict 再设 conservative */
+    webkit_memory_pressure_settings_set_strict_threshold(memory_pressure, 0.65);
+    webkit_memory_pressure_settings_set_conservative_threshold(memory_pressure, 0.5);
+    webkit_memory_pressure_settings_set_kill_threshold(memory_pressure, 0.9);
+    WebKitWebContext *context = g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
+        "memory-pressure-settings", memory_pressure,
+        NULL);
+    webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
     webkit_web_context_add_path_to_sandbox(context, "/userdisk", TRUE);
     webkit_web_context_add_path_to_sandbox(context, "/tmp", FALSE);
-    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp\n");
+    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=document_browser mem_limit=300MB kill=0.9\n");
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_javascript(settings, TRUE);
     webkit_settings_set_enable_javascript_markup(settings, TRUE);
@@ -2656,6 +2697,9 @@ int main(int argc, char **argv) {
     webkit_settings_set_enable_mediasource(settings, TRUE);
     webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
     webkit_settings_set_media_playback_allows_inline(settings, TRUE);
+    /* 小内存设备：BFCache 在本机型 cache model 下本就是 0 页，显式关闭求确定性。
+     * （DNS 预取 setter 自 2.48 起是 no-op，不再调用。） */
+    webkit_settings_set_enable_page_cache(settings, FALSE);
     g_object_set(settings, "enable-write-console-messages-to-stdout", TRUE, NULL);
     g_print("Settings: javascript=%d javascript_markup=%d file_access=%d webgl=%d canvas_accel=%d media=%d webaudio=%d mediasource=%d\n",
             webkit_settings_get_enable_javascript(settings),
@@ -2670,6 +2714,8 @@ int main(int argc, char **argv) {
     WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
         "autoplay", WEBKIT_AUTOPLAY_ALLOW,
         NULL);
+    webkit_network_session_set_memory_pressure_settings(memory_pressure);
+    webkit_memory_pressure_settings_free(memory_pressure);
     WebKitNetworkSession *network_session = webkit_network_session_get_default();
     WebKitWebView *web_view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "web-context", context,
@@ -2681,6 +2727,11 @@ int main(int argc, char **argv) {
         NULL);
     g_object_unref(settings);
     g_object_unref(policies);
+
+    /* 基底背景设为黑：与合成器让位带/信箱带填充一致。地址栏收起 resize 后
+     * 底部新增视口在页面像素画上之前露出的是基底色，默认白会闪白条。 */
+    WebKitColor background = { 0.0, 0.0, 0.0, 1.0 };
+    webkit_web_view_set_background_color(web_view, &background);
 
     g_signal_connect(web_view, "load-failed",
                      G_CALLBACK(on_load_failed), NULL);
