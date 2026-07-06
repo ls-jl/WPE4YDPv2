@@ -417,6 +417,7 @@ struct ChromeRenderState {
     bool enabled { true };
     bool visible { true };
     bool loading { false };
+    double loadProgress { 0.0 };
     bool canBack { false };
     bool canForward { false };
     bool touchDebug { false };
@@ -497,6 +498,8 @@ static ChromeRenderState readChromeRenderState()
         state.visible = g_key_file_get_boolean(keyFile, "chrome", "visible", nullptr);
     if (g_key_file_has_key(keyFile, "chrome", "loading", nullptr))
         state.loading = g_key_file_get_boolean(keyFile, "chrome", "loading", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "load_progress", nullptr))
+        state.loadProgress = std::clamp(g_key_file_get_double(keyFile, "chrome", "load_progress", nullptr), 0.0, 1.0);
     if (g_key_file_has_key(keyFile, "chrome", "can_back", nullptr))
         state.canBack = g_key_file_get_boolean(keyFile, "chrome", "can_back", nullptr);
     if (g_key_file_has_key(keyFile, "chrome", "can_forward", nullptr))
@@ -825,6 +828,18 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
     bool hasPanel = strcmp(chrome.panel, "none") && chrome.panel[0];
     double shownFraction = hasPanel ? 1.0 : chromeShownFraction(chrome);
     int toolbarY = static_cast<int>(std::lround((shownFraction - 1.0) * chromeHeight));
+
+    if (chrome.loading && panelWidth > 0 && panelHeight >= 3) {
+        double progress = std::isfinite(chrome.loadProgress) ? std::clamp(chrome.loadProgress, 0.0, 1.0) : 0.0;
+        int progressY = shownFraction <= 0.001 && !hasPanel ? 0 : toolbarY + chromeHeight;
+        progressY = std::clamp(progressY, 0, static_cast<int>(panelHeight) - 3);
+        int fillWidth = static_cast<int>(std::lround(panelWidth * progress));
+        if (progress > 0.0 && fillWidth < 1)
+            fillWidth = 1;
+        painter.fillRect(0, progressY, panelWidth, 3, 0x8853606b);
+        if (fillWidth > 0)
+            painter.fillRect(0, progressY, std::min<int>(fillWidth, panelWidth), 3, accent);
+    }
 
     if (shownFraction <= 0.001 && !hasPanel)
         return;

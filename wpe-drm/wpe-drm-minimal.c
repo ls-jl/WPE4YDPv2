@@ -82,6 +82,7 @@ typedef struct {
     gboolean enabled;
     gboolean visible;
     gboolean loading;
+    double load_progress;
     gboolean touch_debug;
     int height;
     double hide_down_px;
@@ -458,6 +459,7 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_boolean(key_file, "chrome", "enabled", chrome->enabled);
     g_key_file_set_boolean(key_file, "chrome", "visible", chrome->visible);
     g_key_file_set_boolean(key_file, "chrome", "loading", chrome->loading);
+    g_key_file_set_double(key_file, "chrome", "load_progress", chrome->load_progress);
     g_key_file_set_boolean(key_file, "chrome", "can_back", tab && tab->back_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "can_forward", tab && tab->forward_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "touch_debug", chrome->touch_debug);
@@ -640,6 +642,7 @@ static void chrome_load_url(AppState *state, const char *url, gboolean push_hist
     chrome_set_tab_url(tab, url);
     chrome->suppress_history = TRUE;
     chrome->loading = TRUE;
+    chrome->load_progress = 0.0;
     chrome->panel = CHROME_PANEL_NONE;
     chrome_set_visible(state, TRUE);
     chrome_save_state(state);
@@ -2277,6 +2280,7 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
         chrome_set_tab_url(tab, uri);
     }
     chrome->loading = load_event != WEBKIT_LOAD_FINISHED;
+    chrome->load_progress = chrome->loading ? webkit_web_view_get_estimated_load_progress(web_view) : 1.0;
     if (load_event == WEBKIT_LOAD_FINISHED) {
         chrome->suppress_history = FALSE;
         const char *title = webkit_web_view_get_title(web_view);
@@ -2290,6 +2294,18 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
         chrome_save_state(state);
     else
         chrome_update_render_state(state);
+}
+
+static void on_estimated_load_progress_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    AppState *state = (AppState *)user_data;
+    if (!state)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    if (!chrome->loading)
+        return;
+    chrome->load_progress = webkit_web_view_get_estimated_load_progress(web_view);
+    chrome_update_render_state(state);
 }
 
 static void on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointer user_data) {
@@ -2704,6 +2720,8 @@ int main(int argc, char **argv) {
         setup_keyboard_user_script(user_content_manager, state);
         g_signal_connect(web_view, "load-changed",
                          G_CALLBACK(on_load_changed), state);
+        g_signal_connect(web_view, "notify::estimated-load-progress",
+                         G_CALLBACK(on_estimated_load_progress_changed), state);
         g_signal_connect(web_view, "notify::title",
                          G_CALLBACK(on_title_changed), state);
 
