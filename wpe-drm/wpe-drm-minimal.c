@@ -107,8 +107,6 @@ typedef struct {
     WPEView *view;
     WPEToplevel *toplevel;
     WebKitWebView *web_view;
-    char *viewport_file;
-    char *viewport_spec;
     int viewport_width;
     int viewport_height;
     int panel_width;
@@ -169,6 +167,7 @@ typedef struct {
     char *keyboard_active_id;
     char *keyboard_active_kind;
     char *keyboard_pending_text;
+    gboolean keyboard_pending_text_valid;
     gint64 keyboard_active_us;
     gint64 last_pointer_tap_us;
     BrowserChrome chrome;
@@ -807,7 +806,25 @@ static void keyboard_clear_active(AppState *state)
     g_clear_pointer(&state->keyboard_active_id, g_free);
     g_clear_pointer(&state->keyboard_active_kind, g_free);
     g_clear_pointer(&state->keyboard_pending_text, g_free);
+    state->keyboard_pending_text_valid = FALSE;
     state->keyboard_active_us = 0;
+}
+
+static void on_keyboard_apply_finished(GObject *object, GAsyncResult *result, gpointer user_data)
+{
+    (void)user_data;
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    if (!value) {
+        g_warning("Keyboard apply failed: %s", error ? error->message : "unknown");
+        if (error)
+            g_error_free(error);
+        return;
+    }
+    char *str = jsc_value_to_string(value);
+    g_print("Keyboard apply result: %s\n", str ? str : "(null)");
+    g_free(str);
+    g_object_unref(value);
 }
 
 static void keyboard_insert_web_text(AppState *state, const char *text, gboolean commit)
@@ -818,16 +835,11 @@ static void keyboard_insert_web_text(AppState *state, const char *text, gboolean
     char *script = g_strdup_printf(
         "(function(text,commit){"
         "if(window.__haasKeyboardSetText)return window.__haasKeyboardSetText(text,commit);"
-        "var el=document.activeElement;"
-        "function editable(n){return n&&(n.tagName==='INPUT'||n.tagName==='TEXTAREA'||n.isContentEditable);}"
-        "if(!editable(el))return false;"
-        "if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(text.length,text.length);}catch(e){}}}"
-        "function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}"
-        "fire('input');if(commit)fire('change');return true;"
+        "return 'apply_ok=0 target_alive=0 reason=no_bridge';"
         "})(%s,%s)",
         quoted, commit ? "true" : "false");
     g_print("Keyboard insert web text: bytes=%zu commit=%d\n", strlen(text ? text : ""), commit);
-    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL, NULL);
+    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, on_keyboard_apply_finished, NULL);
     g_free(script);
     g_free(quoted);
 }
@@ -839,6 +851,7 @@ static void keyboard_handle_update(AppState *state, const char *text)
 
     g_free(state->keyboard_pending_text);
     state->keyboard_pending_text = g_strdup(text ? text : "");
+    state->keyboard_pending_text_valid = TRUE;
     g_print("Keyboard update: id=%s kind=%s bytes=%zu\n",
             state->keyboard_active_id,
             state->keyboard_active_kind,
@@ -854,7 +867,7 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
         return;
 
     const char *final_text = text ? text : "";
-    if (confirmed && state->keyboard_pending_text && state->keyboard_pending_text[0])
+    if (confirmed && state->keyboard_pending_text_valid && state->keyboard_pending_text)
         final_text = state->keyboard_pending_text;
 
     g_print("Keyboard %s: id=%s kind=%s bytes=%zu\n",
@@ -882,6 +895,8 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
     keyboard_clear_active(state);
 }
 
+/* 注意:该轮询只在键盘会话激活期间存在(keyboard_request 创建、
+ * 确认/取消/超时即移除),空闲时无任何开销,因此维持轮询而非 inotify。 */
 static gboolean keyboard_response_tick(gpointer user_data)
 {
     AppState *state = (AppState *)user_data;
@@ -994,8 +1009,14 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
         state->keyboard_active_id = g_strdup(id);
         state->keyboard_active_kind = g_strdup(kind ? kind : "");
         state->keyboard_pending_text = g_strdup(text ? text : "");
+        state->keyboard_pending_text_valid = FALSE;
         state->keyboard_active_us = g_get_monotonic_time();
-        state->keyboard_response_source_id = g_timeout_add(150, keyboard_response_tick, state);
+        guint poll_ms = (guint)env_double("WPE_KEYBOARD_POLL_MS", 30);
+        if (poll_ms < 16)
+            poll_ms = 16;
+        if (poll_ms > 250)
+            poll_ms = 250;
+        state->keyboard_response_source_id = g_timeout_add(poll_ms, keyboard_response_tick, state);
         g_print("Keyboard request: id=%s kind=%s placeholder=%s maxlength=%d multiline=%d\n",
                 id, kind ? kind : "", placeholder ? placeholder : "", maxlength, multiline);
     } else
@@ -1011,47 +1032,50 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
     return ok;
 }
 
-static char *query_get_param(const char *message, const char *key)
+/* 一次性把 "k=v&k=v" 消息解析成哈希表,取代之前每取一个参数就 g_strsplit
+ * 整条消息的做法(单条消息要连取 6 个参数)。值已做 URI 反转义。 */
+static GHashTable *query_parse_params(const char *message)
 {
-    if (!message || !key)
-        return NULL;
+    GHashTable *params = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    if (!message)
+        return params;
     char **pairs = g_strsplit(message, "&", -1);
-    char *result = NULL;
     for (int i = 0; pairs && pairs[i]; ++i) {
         char *equals = strchr(pairs[i], '=');
         if (!equals)
             continue;
         *equals = 0;
-        if (!strcmp(pairs[i], key)) {
-            result = g_uri_unescape_string(equals + 1, NULL);
-            break;
-        }
+        char *value = g_uri_unescape_string(equals + 1, NULL);
+        if (value)
+            g_hash_table_replace(params, g_strdup(pairs[i]), value);
     }
     g_strfreev(pairs);
-    return result;
+    return params;
 }
 
-static int query_get_int(const char *message, const char *key, int fallback)
+static const char *params_get_string(GHashTable *params, const char *key, const char *fallback)
 {
-    char *value = query_get_param(message, key);
+    const char *value = g_hash_table_lookup(params, key);
+    return value && value[0] ? value : fallback;
+}
+
+static int params_get_int(GHashTable *params, const char *key, int fallback)
+{
+    const char *value = g_hash_table_lookup(params, key);
     if (!value)
         return fallback;
     char *end = NULL;
     long parsed = strtol(value, &end, 10);
-    int result = end != value ? (int)parsed : fallback;
-    g_free(value);
-    return result;
+    return end != value ? (int)parsed : fallback;
 }
 
-static gboolean query_get_bool(const char *message, const char *key, gboolean fallback)
+static gboolean params_get_bool(GHashTable *params, const char *key, gboolean fallback)
 {
-    char *value = query_get_param(message, key);
+    const char *value = g_hash_table_lookup(params, key);
     if (!value)
         return fallback;
-    gboolean result = !g_ascii_strcasecmp(value, "1") || !g_ascii_strcasecmp(value, "true") ||
+    return !g_ascii_strcasecmp(value, "1") || !g_ascii_strcasecmp(value, "true") ||
         !g_ascii_strcasecmp(value, "yes");
-    g_free(value);
-    return result;
 }
 
 static void on_keyboard_script_message(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
@@ -1062,30 +1086,25 @@ static void on_keyboard_script_message(WebKitUserContentManager *manager, JSCVal
         return;
 
     char *message = jsc_value_to_string(value);
-    char *kind = query_get_param(message, "kind");
-    if (g_strcmp0(kind, "web_input")) {
-        g_free(kind);
+    GHashTable *params = query_parse_params(message);
+    if (g_strcmp0(params_get_string(params, "kind", NULL), "web_input")) {
+        g_hash_table_unref(params);
         g_free(message);
         return;
     }
 
-    char *text = query_get_param(message, "text");
-    char *placeholder = query_get_param(message, "placeholder");
-    char *input_type = query_get_param(message, "inputType");
-    int maxlength = query_get_int(message, "maxlength", 100);
-    gboolean multiline = query_get_bool(message, "multiLinesEditVisible", FALSE);
     gint64 pointer_gate_us = (gint64)env_double("WPE_KEYBOARD_POINTER_GATE_MS", 2000) * 1000;
     gint64 since_pointer_us = state->last_pointer_tap_us > 0 ? g_get_monotonic_time() - state->last_pointer_tap_us : G_MAXINT64;
     if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
-        keyboard_request(state, "web_input", text ? text : "", placeholder && placeholder[0] ? placeholder : "请输入内容",
-                         input_type && input_type[0] ? input_type : "ZhCNPreferred",
-                         maxlength, multiline);
+        keyboard_request(state, "web_input",
+                         params_get_string(params, "text", ""),
+                         params_get_string(params, "placeholder", "请输入内容"),
+                         params_get_string(params, "inputType", "ZhCNPreferred"),
+                         params_get_int(params, "maxlength", 100),
+                         params_get_bool(params, "multiLinesEditVisible", FALSE));
     } else
         g_print("Keyboard web_input ignored: no recent pointer tap since_us=%" G_GINT64_FORMAT "\n", since_pointer_us);
-    g_free(kind);
-    g_free(text);
-    g_free(placeholder);
-    g_free(input_type);
+    g_hash_table_unref(params);
     g_free(message);
 }
 
@@ -1123,14 +1142,23 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "if(window.__haasKeyboardInstalled)return;"
         "window.__haasKeyboardInstalled=true;"
         "window.__haasKeyboardTarget=null;"
+        "window.__haasKeyboardTargetId='';"
+        "window.__haasKeyboardSeq=1;"
         "window.__haasKeyboardLastAt=0;"
         "function editable(el){return !!(el&&((el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(el.type||''))||el.tagName==='TEXTAREA'||el.isContentEditable)&&!el.disabled&&!el.readOnly);}"
+        "function closestEditable(el){while(el&&el!==document){if(editable(el))return el;el=el.parentElement;}return null;}"
         "function enc(v){return encodeURIComponent(v==null?'':String(v));}"
         "function valueOf(el){return el.isContentEditable?(el.innerText||el.textContent||''):(el.value||'');}"
         "function typeOf(el){var t=String(el.getAttribute('type')||'').toLowerCase();if(t==='number'||t==='tel')return 'Number';if(t==='email'||t==='url'||t==='password')return 'EnUSPreferred';return 'ZhCNPreferred';}"
-        "function request(el){if(!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;var now=Date.now();if(window.__haasKeyboardTarget===el&&now-window.__haasKeyboardLastAt<600)return;window.__haasKeyboardTarget=el;window.__haasKeyboardLastAt=now;var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
-        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var el=e.target;if(editable(el))setTimeout(function(){request(el);},0);},true);"
-        "window.__haasKeyboardSetText=function(text,commit){var el=window.__haasKeyboardTarget||document.activeElement;if(!editable(el))return false;try{el.focus();}catch(e){}if(el.isContentEditable){el.textContent=text;}else{el.value=text;if(el.setSelectionRange){try{el.setSelectionRange(String(text).length,String(text).length);}catch(e){}}}function fire(n){var ev=document.createEvent('HTMLEvents');ev.initEvent(n,true,false);el.dispatchEvent(ev);}fire('input');if(commit)fire('change');return true;};"
+        "function mark(el){var id=el.getAttribute('data-haas-keyboard-id');if(!id){id='hk'+Date.now().toString(36)+(window.__haasKeyboardSeq++).toString(36);try{el.setAttribute('data-haas-keyboard-id',id);}catch(e){}}window.__haasKeyboardTargetId=id||'';return id||'';}"
+        "function findTarget(){var el=window.__haasKeyboardTarget;if(editable(el)&&document.documentElement&&document.documentElement.contains(el))return el;var id=window.__haasKeyboardTargetId;if(id&&document.querySelector){try{el=document.querySelector('[data-haas-keyboard-id=\"'+id+'\"]');if(editable(el))return el;}catch(e){}}el=document.activeElement;if(editable(el))return el;return null;}"
+        "function request(el){el=closestEditable(el);if(!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;var now=Date.now();if(window.__haasKeyboardTarget===el&&now-window.__haasKeyboardLastAt<600)return;window.__haasKeyboardTarget=el;mark(el);window.__haasKeyboardLastAt=now;var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
+        "document.addEventListener('focusin',function(e){var el=closestEditable(e.target);if(el)setTimeout(function(){request(el);},0);},true);"
+        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var el=closestEditable(e.target);if(el)setTimeout(function(){request(el);},0);},true);"
+        "function diffType(oldv,newv){oldv=String(oldv==null?'':oldv);newv=String(newv==null?'':newv);if(newv.length<oldv.length){return oldv.indexOf(newv)===0?'deleteContentBackward':'deleteContentForward';}if(newv.length>oldv.length){return newv.indexOf(oldv)===0?'insertText':'insertReplacementText';}return 'insertReplacementText';}"
+        "function makeInputEvent(name,typ,data,cancelable){try{return new InputEvent(name,{bubbles:true,cancelable:!!cancelable,inputType:typ,data:data});}catch(e){var ev=document.createEvent('Event');ev.initEvent(name,true,!!cancelable);try{ev.inputType=typ;ev.data=data;}catch(_e){}return ev;}}"
+        "function nativeSet(el,value,oldv){if(el.isContentEditable){el.textContent=value;return;}var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,value);else el.value=value;var tracker=el._valueTracker;if(tracker){try{tracker.setValue(oldv);}catch(e){}}if(el.setSelectionRange){try{el.setSelectionRange(String(value).length,String(value).length);}catch(e){}}}"
+        "window.__haasKeyboardSetText=function(text,commit){var el=findTarget();if(!editable(el))return 'apply_ok=0 target_alive=0 reason=no_target';var value=String(text==null?'':text);var oldv=valueOf(el);var typ=diffType(oldv,value);var data=typ.indexOf('delete')===0?null:value;try{el.focus();}catch(e){}try{el.dispatchEvent(makeInputEvent('beforeinput',typ,data,true));nativeSet(el,value,oldv);el.dispatchEvent(makeInputEvent('input',typ,data,false));if(commit){var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}return 'apply_ok=1 target_alive=1 inputType='+typ+' value='+enc(valueOf(el))+' commit='+(commit?1:0);}catch(e){return 'apply_ok=0 target_alive=1 reason='+enc(e&&e.message?e.message:String(e));}};"
         "})();";
     WebKitUserScript *script = webkit_user_script_new(source,
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
@@ -1514,45 +1542,6 @@ static void chrome_apply_layout(AppState *state, const char *reason)
     apply_viewport(state, panel_width, content_height, detail);
 }
 
-static gboolean viewport_file_tick(gpointer user_data)
-{
-    AppState *state = (AppState *)user_data;
-    if (!state || !state->viewport_file || !state->viewport_file[0])
-        return G_SOURCE_CONTINUE;
-
-    char *contents = NULL;
-    gsize length = 0;
-    GError *error = NULL;
-    if (!g_file_get_contents(state->viewport_file, &contents, &length, &error)) {
-        if (error)
-            g_error_free(error);
-        return G_SOURCE_CONTINUE;
-    }
-
-    char *spec = g_strstrip(contents);
-    if (!spec[0]) {
-        g_free(contents);
-        return G_SOURCE_CONTINUE;
-    }
-
-    if (state->viewport_spec && !strcmp(state->viewport_spec, spec)) {
-        g_free(contents);
-        return G_SOURCE_CONTINUE;
-    }
-
-    int width = 0;
-    int height = 0;
-    if (parse_viewport_string(spec, &width, &height)) {
-        apply_viewport(state, width, height, state->viewport_file);
-        g_free(state->viewport_spec);
-        state->viewport_spec = g_strdup(spec);
-    } else
-        g_warning("Ignoring invalid viewport file content '%s' from %s", spec, state->viewport_file);
-
-    g_free(contents);
-    return G_SOURCE_CONTINUE;
-}
-
 static void init_touch_slots(AppState *state)
 {
     state->current_slot = 0;
@@ -1890,12 +1879,12 @@ static void queue_scroll_event(AppState *state, double x, double y, double delta
     chrome_note_scroll(state, delta_y, time_ms);
     delta_x *= state->touch_scroll_scale;
     delta_y *= state->touch_scroll_scale;
+    /* delta 来自 update_touch_position 旋转映射后的 panel 坐标，已是屏幕方向，
+     * 不能再按 panel_rotation 取反（历史上此处的二次取反靠 C 默认
+     * INVERT_Y=TRUE 抵消，而 run.sh 固定 export 0，导致 90/270 度滚动反向）。
+     * WPE_TOUCH_SCROLL_INVERT_Y 仅作为面向用户的手动覆盖保留。 */
     if (state->touch_scroll_invert_y)
         delta_y = -delta_y;
-    if (state->panel_rotation == 90 || state->panel_rotation == 270) {
-        delta_x = -delta_x;
-        delta_y = -delta_y;
-    }
 
     double pending_limit = state->touch_scroll_pending_limit > 0 ? state->touch_scroll_pending_limit : state->touch_scroll_max_step * 2.0;
     double next_x = state->pending_native_scroll_x + delta_x;
@@ -2145,17 +2134,21 @@ static void setup_raw_touch(AppState *state)
         if (state->touch_active_y_max <= state->touch_active_y_min)
             state->touch_active_y_enabled = FALSE;
     }
-    state->send_touch_events = env_enabled("WPE_SEND_TOUCH_EVENTS", TRUE);
+    /* 默认值以 run.sh 为唯一事实来源;此处兜底值必须与 run.sh 的 export 保持一致,
+     * 仅在绕过 run.sh 直接启动本程序时生效。
+     * 注意:生产 run.sh 固定 WPE_SEND_TOUCH_EVENTS=0 且 WPE_TOUCH_SCROLL_FALLBACK=1,
+     * 因此 send_touch_event 原生触摸事件路径仅作为调试开关保留。 */
+    state->send_touch_events = env_enabled("WPE_SEND_TOUCH_EVENTS", FALSE);
     state->synthesize_pointer_tap = env_enabled("WPE_SYNTHESIZE_POINTER_TAP", TRUE);
-    state->touch_scroll_fallback = env_enabled("WPE_TOUCH_SCROLL_FALLBACK", FALSE);
+    state->touch_scroll_fallback = env_enabled("WPE_TOUCH_SCROLL_FALLBACK", TRUE);
     state->touch_native_scroll_fallback = env_enabled("WPE_TOUCH_NATIVE_SCROLL", TRUE);
     state->touch_js_scroll_fallback = env_enabled("WPE_TOUCH_JS_SCROLL", FALSE);
     state->touch_horizontal_scroll = env_enabled("WPE_TOUCH_HORIZONTAL_SCROLL", FALSE);
-    state->touch_scroll_invert_y = env_enabled("WPE_TOUCH_SCROLL_INVERT_Y", TRUE);
+    state->touch_scroll_invert_y = env_enabled("WPE_TOUCH_SCROLL_INVERT_Y", FALSE);
     state->touch_scroll_scale = env_double("WPE_TOUCH_SCROLL_SCALE", 1.0);
     state->touch_scroll_max_step = env_double("WPE_TOUCH_SCROLL_MAX_STEP", 32);
-    state->touch_scroll_pending_limit = env_double("WPE_TOUCH_SCROLL_PENDING_LIMIT", 48);
-    state->touch_tap_max_move = env_double("WPE_TOUCH_TAP_MAX_MOVE", 24);
+    state->touch_scroll_pending_limit = env_double("WPE_TOUCH_SCROLL_PENDING_LIMIT", 64);
+    state->touch_tap_max_move = env_double("WPE_TOUCH_TAP_MAX_MOVE", 32);
     state->touch_scroll_interval_ms = (int)env_double("WPE_TOUCH_SCROLL_INTERVAL_MS", 16);
     state->touch_scroll_stop_delay_ms = (int)env_double("WPE_TOUCH_SCROLL_STOP_DELAY_MS", 80);
     init_touch_slots(state);
@@ -2290,8 +2283,13 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
         if (tab && title)
             g_strlcpy(tab->title, title, sizeof(tab->title));
     }
-    chrome_save_state(state);
-    chrome_request_frame(state);
+    /* started/redirected 只刷新 render state(loading 指示),不做整份
+     * tab 状态序列化;合成器侧 33ms 轮询会自行发现变化并重绘,
+     * 无需再通过 wpe_view_resized 强制请求帧。 */
+    if (load_event == WEBKIT_LOAD_COMMITTED || load_event == WEBKIT_LOAD_FINISHED)
+        chrome_save_state(state);
+    else
+        chrome_update_render_state(state);
 }
 
 static void on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointer user_data) {
@@ -2305,7 +2303,6 @@ static void on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointe
     if (tab && title) {
         g_strlcpy(tab->title, title, sizeof(tab->title));
         chrome_save_state(state);
-        chrome_request_frame(state);
     }
 }
 
@@ -2331,33 +2328,6 @@ static gboolean print_view_state(gpointer user_data) {
             state->scroll_event_count,
             title ? title : "(null)",
             uri ? uri : "(null)");
-    return G_SOURCE_CONTINUE;
-}
-
-static void on_eval_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
-    (void)user_data;
-    GError *error = NULL;
-    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
-    if (!value) {
-        g_warning("Eval finished: failed: %s", error ? error->message : "unknown");
-        if (error)
-            g_error_free(error);
-        return;
-    }
-    char *str = jsc_value_to_string(value);
-    g_print("Eval finished: %s\n", str ? str : "(null)");
-    g_free(str);
-    g_object_unref(value);
-}
-
-static gboolean eval_tick(gpointer user_data) {
-    WebKitWebView *web_view = WEBKIT_WEB_VIEW(user_data);
-    static guint64 eval_count = 0;
-    eval_count++;
-    char *script = g_strdup_printf("(function(){var e=document.getElementById('txt'); var before='before title='+document.title+' text='+(e?e.textContent:'none')+' f='+typeof f+' body='+!!document.body; document.title='eval %llu'; if(e)e.textContent='eval %llu'; return before+' after=eval %llu';})()", (unsigned long long)eval_count, (unsigned long long)eval_count, (unsigned long long)eval_count);
-    g_print("Eval request: %" G_GUINT64_FORMAT "\n", eval_count);
-    webkit_web_view_evaluate_javascript(web_view, script, -1, NULL, NULL, NULL, on_eval_finished, NULL);
-    g_free(script);
     return G_SOURCE_CONTINUE;
 }
 
@@ -2522,8 +2492,7 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 static gboolean reload_after_web_process_crash(gpointer user_data)
 {
     ReloadRequest *request = (ReloadRequest *)user_data;
-    const char *default_uri = g_getenv("WPE_DEFAULT_URL");
-    const char *uri = request->uri && request->uri[0] ? request->uri : (default_uri && default_uri[0] ? default_uri : "https://www.douyin.com/");
+    const char *uri = request->uri && request->uri[0] ? request->uri : default_home_url();
     g_warning("Reloading after Web process termination: %s", uri);
     load_uri_preserving_local_html(request->web_view, uri);
     g_object_unref(request->web_view);
@@ -2554,7 +2523,7 @@ static void on_buffer_rendered(WPEView *view, WPEBuffer *buffer, gpointer user_d
     if (!frame_stats_start_us)
         frame_stats_start_us = g_get_monotonic_time();
 
-    if (frame_count == 1 || !(frame_count % 60)) {
+    if (frame_count == 1 || !(frame_count % 600)) {
         gint64 elapsed_us = g_get_monotonic_time() - frame_stats_start_us;
         if (elapsed_us <= 0)
             elapsed_us = 1;
@@ -2760,18 +2729,9 @@ int main(int argc, char **argv) {
                 wpe_view_get_has_focus(wpe_view));
         g_signal_connect(wpe_view, "buffer-rendered",
                          G_CALLBACK(on_buffer_rendered), NULL);
-        const char *viewport_file = g_getenv("WPE_VIEWPORT_FILE");
-        if (env_enabled("WPE_ENABLE_VIEWPORT_FILE", FALSE) && viewport_file && viewport_file[0]) {
-            state->viewport_file = g_strdup(viewport_file);
-            viewport_file_tick(state);
-            g_timeout_add(500, viewport_file_tick, state);
-            g_print("Viewport hot-update file: %s\n", state->viewport_file);
-        }
         setup_raw_touch(state);
         chrome_apply_layout(state, "startup");
-        g_timeout_add_seconds(1, print_view_state, state);
-        if (g_getenv("WPE_DRM_EVAL_TICK"))
-            g_timeout_add_seconds(1, eval_tick, web_view);
+        g_timeout_add_seconds(30, print_view_state, state);
         g_print("WPEView: buffers managed by WPEViewDRM (built-in scanout)\n");
     }
     g_object_unref(user_content_manager);
@@ -2799,8 +2759,6 @@ int main(int argc, char **argv) {
             close(state->touch_fd);
         chrome_destroy(state);
         g_free(state->keyboard_dir);
-        g_free(state->viewport_file);
-        g_free(state->viewport_spec);
         g_free(state);
     }
     g_object_unref(web_view);

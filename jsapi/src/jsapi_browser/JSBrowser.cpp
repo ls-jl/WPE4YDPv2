@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -309,6 +310,23 @@ static pid_t parseProcPid(const char* name)
 static bool containsString(const std::string& value, const std::string& needle)
 {
     return !needle.empty() && value.find(needle) != std::string::npos;
+}
+
+static std::string toLowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static std::string trimAscii(const std::string& value)
+{
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+    return value.substr(begin, end - begin);
 }
 
 static bool isBrowserProcessName(const std::string& cmdline)
@@ -778,7 +796,6 @@ public:
             pidFile_ = pidFile;
             workdir_ = workdir;
             runtimePath_ = runtimePath;
-            logPath_ = logPath;
         }
         writePidFile(pidFile, pid);
         publishState("running", "pid=" + std::to_string(static_cast<long>(pid)));
@@ -793,14 +810,36 @@ public:
         std::string pidFile;
         std::string runtimePath;
         std::string scopedWorkdir;
+        pid_t pid = -1;
         {
             std::lock_guard<std::mutex> lock(processMutex_);
             pidFile = !workdir.empty() ? joinPath(workdir, "browser.pid") : pidFile_;
             runtimePath = runtimePath_;
             scopedWorkdir = !workdir.empty() ? workdir : workdir_;
+            if (!pidFile.empty() && pidFile == pidFile_ && browserPid_ > 1) pid = browserPid_;
         }
-        stopBrowserByPath(pidFile);
-        cleanupScopedBrowserProcesses(runtimePath, scopedWorkdir);
+        if (pid <= 1) pid = readPidFile(pidFile);
+
+        // SIGTERM 同步发出;等待退出/升级 SIGKILL/残留进程清理放到后台线程,
+        // 避免最坏 ~5s 的 usleep 循环阻塞 miniapp JS 线程(startBrowser 里的
+        // 同步等待保持不变——新实例启动前必须确认旧实例释放 DRM)。
+        if (pid > 1) {
+            kill(-pid, SIGTERM);
+            kill(pid, SIGTERM);
+        }
+        {
+            std::lock_guard<std::mutex> lock(processMutex_);
+            if (pidFile.empty() || pidFile == pidFile_) browserPid_ = -1;
+        }
+        std::thread([pid, pidFile, runtimePath, scopedWorkdir]() {
+            if (pid > 1 && waitForProcessExit(pid, 2000) != 0) {
+                kill(-pid, SIGKILL);
+                kill(pid, SIGKILL);
+                waitForProcessExit(pid, 1000);
+            }
+            if (!pidFile.empty()) unlink(pidFile.c_str());
+            cleanupScopedBrowserProcesses(runtimePath, scopedWorkdir);
+        }).detach();
         publishState("stopped", "ok");
         info.GetReturnValue().Set(true);
     }
@@ -920,6 +959,36 @@ public:
         }
         publishState("keyboard_update", id);
         info.GetReturnValue().Set(true);
+    }
+
+    void getKeyboardProfile(JQFunctionInfo& info)
+    {
+        const std::string hostname = trimAscii(readFile("/etc/hostname"));
+        const std::string osRelease = readFile("/etc/os-release");
+        const std::string cfg = readFile("/etc/miniapp/resources/cfg.json");
+        const std::string haystack = toLowerAscii(hostname + "\n" + osRelease + "\n" + cfg);
+
+        std::string mode = "globalOnly";
+        std::string reason = "default";
+        if (haystack.find("y07") != std::string::npos) {
+            mode = "textareaOnly";
+            reason = "y07";
+        } else if (haystack.find("3.14.") != std::string::npos &&
+            haystack.find("input") != std::string::npos) {
+            // 之前还接受子串 "im",但 time/limit/minimal 等词都含 "im",
+            // 该分支实际恒为真;只保留 "input" 判定。
+            mode = "textareaOnly";
+            reason = "ime_3.14";
+        }
+
+        std::ostringstream ss;
+        ss << "{";
+        ss << "\"mode\":\"" << mode << "\",";
+        ss << "\"reason\":\"" << reason << "\",";
+        ss << "\"hostname\":\"" << jsonEscape(hostname) << "\",";
+        ss << "\"source\":\"system\"";
+        ss << "}";
+        info.GetReturnValue().Set(ss.str());
     }
 
     void getSystemDisplayConfig(JQFunctionInfo& info)
@@ -1047,7 +1116,6 @@ private:
     std::string pidFile_;
     std::string workdir_;
     std::string runtimePath_;
-    std::string logPath_;
 };
 
 static JSValue createBrowserPlayer(JQModuleEnv* env)
@@ -1069,6 +1137,7 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("pollKeyboardRequest", &JSBrowserPlayer::pollKeyboardRequest);
     tpl->SetProtoMethod("updateKeyboardRequest", &JSBrowserPlayer::updateKeyboardRequest);
     tpl->SetProtoMethod("respondKeyboardRequest", &JSBrowserPlayer::respondKeyboardRequest);
+    tpl->SetProtoMethod("getKeyboardProfile", &JSBrowserPlayer::getKeyboardProfile);
     tpl->SetProtoMethod("getSystemDisplayConfig", &JSBrowserPlayer::getSystemDisplayConfig);
     tpl->SetProtoMethod("getDrmScreenSize", &JSBrowserPlayer::getDrmScreenSize);
     return tpl->CallConstructor();

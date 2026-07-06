@@ -1,80 +1,11 @@
 {
   "pages": {
     "index": "pages/index/index.js",
-    "index0": "pages/index0/index.js",
-    "index90": "pages/index90/index.js",
-    "index180": "pages/index180/index.js",
-    "index270": "pages/index270/index.js",
-    "frame": "pages/frame/frame.vue",
-    "frame0": "pages/frame0/frame.js",
-    "frame90": "pages/frame90/frame.js",
-    "frame180": "pages/frame180/frame.js",
-    "frame270": "pages/frame270/frame.js"
+    "frame": "pages/frame/frame.vue"
   },
   "props": {
-    "page_rotation": {
-      "index": "inherit",
-      "frame": "inherit"
-    },
-    "page_rotation_sku": {
-      "default": {
-        "index0": 0,
-        "index90": 90,
-        "index180": 180,
-        "index270": 270,
-        "frame0": 0,
-        "frame90": 90,
-        "frame180": 180,
-        "frame270": 270
-      },
-      "y03": {
-        "index0": 0,
-        "index90": 90,
-        "index180": 180,
-        "index270": 270,
-        "frame0": 0,
-        "frame90": 90,
-        "frame180": 180,
-        "frame270": 270
-      },
-      "y05": {
-        "index0": 0,
-        "index90": 90,
-        "index180": 180,
-        "index270": 270,
-        "frame0": 0,
-        "frame90": 90,
-        "frame180": 180,
-        "frame270": 270
-      },
-      "y07": {
-        "index0": 0,
-        "index90": 90,
-        "index180": 180,
-        "index270": 270,
-        "frame0": 0,
-        "frame90": 90,
-        "frame180": 180,
-        "frame270": 270
-      }
-    },
     "browser_display_sku": {
       "default": {
-        "panelSize": "960x266",
-        "drmMode": "480x960",
-        "rotation": 270
-      },
-      "y03": {
-        "panelSize": "960x266",
-        "drmMode": "480x960",
-        "rotation": 270
-      },
-      "y05": {
-        "panelSize": "960x266",
-        "drmMode": "480x960",
-        "rotation": 270
-      },
-      "y07": {
         "panelSize": "960x266",
         "drmMode": "480x960",
         "rotation": 270

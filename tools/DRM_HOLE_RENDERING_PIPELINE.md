@@ -8,7 +8,7 @@
 
 核心链路：
 
-1. MiniApp `index` 页显示启动入口、停止按钮、浏览器画面旋转选项和启动页视觉方向选项。
+1. MiniApp `index` 页显示启动入口和显示模式（原生/横屏旋转）选择。
 2. 用户点击启动后进入 `frame` 页。
 3. `frame` 页只渲染全屏 `<hole>`，同时调用 native JSAPI 启动 WPE。
 4. JSAPI `browserPlayer.startBrowser()` fork/exec 包内 `assets/wpe-runtime/run.sh`。
@@ -21,7 +21,7 @@
 
 ```mermaid
 flowchart LR
-    A["MiniApp index<br/>启动/停止/双旋转选择"] --> B["MiniApp frame<br/>全屏 <hole>"]
+    A["MiniApp index<br/>启动/显示模式选择"] --> B["MiniApp frame<br/>全屏 <hole>"]
     B --> C["browserPlayer.prepareRuntime()<br/>校验 assets/wpe-runtime"]
     B --> D["browserPlayer.startBrowser()"]
     D --> E["fork/exec<br/>assets/wpe-runtime/run.sh"]
@@ -53,11 +53,9 @@ flowchart LR
 
 - 停止残留 WPE 进程，避免旧进程占用 DRM plane。
 - 显示“启动浏览器”入口。
-- 显示“停止浏览器”入口。
-- 提供 `0 / 90 / 180 / 270` 浏览器画面旋转选项，传给 WPE/DRM/触摸。
-- 提供 `0 / 90 / 180 / 270` MiniApp 框架方向选项，通过 `app.json` 中的页面别名和 `page_rotation_sku` 让框架按真实页面方向运行，不传给 WPE。
+- 提供显示模式选项：`原生模式`（跟随系统/MiniApp 框架方向）或 `横屏旋转`（在系统方向基础上旋转到横屏），只影响浏览器画面旋转，传给 WPE/DRM/触摸。
 - 调用 `browserPlayer.prepareRuntime()` 获取包内 runtime 路径。
-- 进入与 MiniApp 框架方向匹配的 `frame0/frame90/frame180/frame270` 页面，并把 `runtimePath/workdir/logPath/url/rotation` 作为页面参数传入；这里的 `rotation` 只表示浏览器画面旋转。
+- 进入 `frame` 页，并把 `url/browserMode/returnPage` 作为页面参数传入；`frame` 页再结合系统显示配置解析出实际的 `rotation/panelSize/drmMode`。
 
 `index` 不应该自动进入浏览器。自动启动会让调试和回到 MiniApp 首页时的生命周期变得不可控，也会导致 Home 后重新进入时立刻抢 DRM。
 

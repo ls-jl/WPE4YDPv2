@@ -35,6 +35,7 @@
 #include <drm_fourcc.h>
 #include <drm_mode.h>
 #include <glib-unix.h>
+#include <glib/gstdio.h>
 #include <linux/dma-buf.h>
 #include <array>
 #include <algorithm>
@@ -276,27 +277,105 @@ static void writeRotatedPanelRow(const uint32_t* sourceRow, uint8_t* destination
     }
 }
 
-static void fillRotatedPanelRow(uint8_t* destination, uint32_t destinationPitch, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t panelY, uint32_t x0, uint32_t width, uint32_t color)
+// 把源坐标脏矩形变换到旋转后的目标缓冲坐标（用于填充、增量拷贝与 FB_DAMAGE_CLIPS）。
+static drm_mode_rect rotatedDestRect(int x1, int y1, int x2, int y2, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t topInset)
 {
+    int inset = static_cast<int>(topInset);
     switch (rotation) {
     case OutputRotation::Rotate0:
-    case OutputRotation::Rotate180: {
-        uint32_t rowY = rotation == OutputRotation::Rotate0 ? panelY : panelHeight - 1 - panelY;
-        auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(rowY) * destinationPitch);
-        uint32_t start = rotation == OutputRotation::Rotate0 ? x0 : panelWidth - x0 - width;
-        std::fill(row + start, row + start + width, color);
-        return;
+        return { x1, y1 + inset, x2, y2 + inset };
+    case OutputRotation::Rotate90:
+        return { static_cast<int>(panelHeight) - inset - y2, x1, static_cast<int>(panelHeight) - inset - y1, x2 };
+    case OutputRotation::Rotate180:
+        return { static_cast<int>(panelWidth) - x2, static_cast<int>(panelHeight) - inset - y2, static_cast<int>(panelWidth) - x1, static_cast<int>(panelHeight) - inset - y1 };
+    case OutputRotation::Rotate270:
+        return { inset + y1, static_cast<int>(panelWidth) - x2, inset + y2, static_cast<int>(panelWidth) - x1 };
     }
+    return { x1, y1, x2, y2 };
+}
+
+// 填充 panel 坐标系矩形 [x1,x2)×[y1,y2)：先变换到目标坐标，再按目标行序
+// std::fill，取代旧的逐 panel 行填充（90/270 度时那是每 4 字节跨一个 pitch
+// 的散写，44 行让位带一帧就是 4 万多次 write-combining 缓冲打断）。
+static void fillRotatedPanelRect(uint8_t* destination, uint32_t destinationPitch, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t color)
+{
+    if (x2 <= x1 || y2 <= y1)
+        return;
+    auto rect = rotatedDestRect(x1, y1, x2, y2, panelWidth, panelHeight, rotation, 0);
+    for (int dy = rect.y1; dy < rect.y2; ++dy) {
+        auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(dy) * destinationPitch);
+        std::fill(row + rect.x1, row + rect.x2, color);
+    }
+}
+
+// 旋转写入的分块核心：把源图子矩形 [x0,x0+width)×[y0,y0+height)（源坐标，
+// panel 行 = 源行 + topInset）旋转写入目标缓冲。与旧的 writeRotatedPanelRow
+// 逐源行实现不同，这里按目标行序遍历（dumb buffer 是 write-combining 映射，
+// 顺序写才能合并），90/270 度用 32x32 分块使源缓存行在块内被复用，
+// 避免旧实现每写 4 字节跨一个 pitch 的读写放大。
+static void rotateRegionARGB8888(const uint8_t* source, uint32_t sourceStride, uint8_t* destination, uint32_t destinationPitch, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t topInset, uint32_t x0, uint32_t y0, uint32_t width, uint32_t height)
+{
+    if (!width || !height)
+        return;
+
+    auto sourcePixel = [&](uint32_t x, uint32_t y) {
+        return *reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(y) * sourceStride + static_cast<size_t>(x) * 4);
+    };
+    constexpr uint32_t tileSize = 32;
+
+    switch (rotation) {
+    case OutputRotation::Rotate0:
+        for (uint32_t y = 0; y < height; ++y)
+            memcpy(destination + static_cast<size_t>(y0 + y + topInset) * destinationPitch + static_cast<size_t>(x0) * 4,
+                source + static_cast<size_t>(y0 + y) * sourceStride + static_cast<size_t>(x0) * 4,
+                static_cast<size_t>(width) * 4);
+        return;
+    case OutputRotation::Rotate180:
+        for (uint32_t y = 0; y < height; ++y) {
+            uint32_t panelY = y0 + y + topInset;
+            auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(panelHeight - 1 - panelY) * destinationPitch);
+            const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(y0 + y) * sourceStride);
+            uint32_t destStart = panelWidth - x0 - width;
+            for (uint32_t x = 0; x < width; ++x)
+                row[destStart + x] = sourceRow[x0 + width - 1 - x];
+        }
+        return;
     case OutputRotation::Rotate90: {
-        auto* column = destination + static_cast<size_t>(panelHeight - 1 - panelY) * 4 + static_cast<size_t>(x0) * destinationPitch;
-        for (uint32_t x = 0; x < width; ++x)
-            *reinterpret_cast<uint32_t*>(column + static_cast<size_t>(x) * destinationPitch) = color;
+        // dest(dx,dy) = src(x=dy, y=panelHeight-1-dx-topInset)
+        uint32_t dyBegin = x0;
+        uint32_t dyEnd = x0 + width;
+        uint32_t dxBegin = panelHeight - topInset - y0 - height;
+        uint32_t dxEnd = panelHeight - topInset - y0;
+        for (uint32_t tileY = dyBegin; tileY < dyEnd; tileY += tileSize) {
+            uint32_t tileYEnd = std::min(tileY + tileSize, dyEnd);
+            for (uint32_t tileX = dxBegin; tileX < dxEnd; tileX += tileSize) {
+                uint32_t tileXEnd = std::min(tileX + tileSize, dxEnd);
+                for (uint32_t dy = tileY; dy < tileYEnd; ++dy) {
+                    auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(dy) * destinationPitch);
+                    for (uint32_t dx = tileX; dx < tileXEnd; ++dx)
+                        row[dx] = sourcePixel(dy, panelHeight - 1 - dx - topInset);
+                }
+            }
+        }
         return;
     }
     case OutputRotation::Rotate270: {
-        auto* column = destination + static_cast<size_t>(panelY) * 4 + static_cast<size_t>(panelWidth - 1 - x0) * destinationPitch;
-        for (uint32_t x = 0; x < width; ++x)
-            *reinterpret_cast<uint32_t*>(column - static_cast<size_t>(x) * destinationPitch) = color;
+        // dest(dx,dy) = src(x=panelWidth-1-dy, y=dx-topInset)
+        uint32_t dyBegin = panelWidth - x0 - width;
+        uint32_t dyEnd = panelWidth - x0;
+        uint32_t dxBegin = topInset + y0;
+        uint32_t dxEnd = topInset + y0 + height;
+        for (uint32_t tileY = dyBegin; tileY < dyEnd; tileY += tileSize) {
+            uint32_t tileYEnd = std::min(tileY + tileSize, dyEnd);
+            for (uint32_t tileX = dxBegin; tileX < dxEnd; tileX += tileSize) {
+                uint32_t tileXEnd = std::min(tileX + tileSize, dxEnd);
+                for (uint32_t dy = tileY; dy < tileYEnd; ++dy) {
+                    auto* row = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(dy) * destinationPitch);
+                    for (uint32_t dx = tileX; dx < tileXEnd; ++dx)
+                        row[dx] = sourcePixel(panelWidth - 1 - dy, dx - topInset);
+                }
+            }
+        }
         return;
     }
     }
@@ -318,17 +397,11 @@ static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uin
 
         // 只清网页内容覆盖不到的区域（顶部 chrome 让位带 + 右侧信箱带），
         // 不再每帧整幅清屏后重画。
-        for (uint32_t panelY = 0; panelY < topInset; ++panelY)
-            fillRotatedPanelRow(destination, destinationPitch, panelWidth, panelHeight, rotation, panelY, 0, panelWidth, 0xff000000);
-        if (copyWidth < panelWidth) {
-            for (uint32_t panelY = topInset; panelY < panelHeight; ++panelY)
-                fillRotatedPanelRow(destination, destinationPitch, panelWidth, panelHeight, rotation, panelY, copyWidth, panelWidth - copyWidth, 0xff000000);
-        }
+        fillRotatedPanelRect(destination, destinationPitch, panelWidth, panelHeight, rotation, 0, 0, panelWidth, topInset, 0xff000000);
+        if (copyWidth < panelWidth)
+            fillRotatedPanelRect(destination, destinationPitch, panelWidth, panelHeight, rotation, copyWidth, topInset, panelWidth, panelHeight, 0xff000000);
 
-        for (uint32_t sourceY = 0; sourceY < copyHeight; ++sourceY) {
-            const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
-            writeRotatedPanelRow(sourceRow, destination, destinationPitch, panelWidth, panelHeight, rotation, sourceY + topInset, 0, copyWidth);
-        }
+        rotateRegionARGB8888(source, sourceStride, destination, destinationPitch, panelWidth, panelHeight, rotation, topInset, 0, 0, copyWidth, copyHeight);
         if (copyHeight < availableHeight) {
             const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(copyHeight - 1) * sourceStride);
             for (uint32_t panelY = topInset + copyHeight; panelY < topInset + availableHeight; ++panelY)
@@ -337,44 +410,7 @@ static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uin
         return;
     }
 
-    switch (rotation) {
-    case OutputRotation::Rotate0: {
-        auto rowBytes = static_cast<size_t>(sourceWidth) * 4;
-        for (uint32_t y = 0; y < sourceHeight; ++y)
-            memcpy(destination + static_cast<size_t>(y) * destinationPitch, source + static_cast<size_t>(y) * sourceStride, rowBytes);
-        return;
-    }
-    case OutputRotation::Rotate90:
-        for (uint32_t destinationY = 0; destinationY < sourceWidth; ++destinationY) {
-            auto* destinationRow = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(destinationY) * destinationPitch);
-            for (uint32_t destinationX = 0; destinationX < sourceHeight; ++destinationX) {
-                auto sourceY = sourceHeight - 1 - destinationX;
-                auto sourceX = destinationY;
-                const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
-                destinationRow[destinationX] = sourceRow[sourceX];
-            }
-        }
-        return;
-    case OutputRotation::Rotate180:
-        for (uint32_t destinationY = 0; destinationY < sourceHeight; ++destinationY) {
-            auto sourceY = sourceHeight - 1 - destinationY;
-            const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(sourceY) * sourceStride);
-            auto* destinationRow = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(destinationY) * destinationPitch);
-            for (uint32_t destinationX = 0; destinationX < sourceWidth; ++destinationX)
-                destinationRow[destinationX] = sourceRow[sourceWidth - 1 - destinationX];
-        }
-        return;
-    case OutputRotation::Rotate270:
-        for (uint32_t destinationY = 0; destinationY < sourceWidth; ++destinationY) {
-            auto sourceX = sourceWidth - 1 - destinationY;
-            auto* destinationRow = reinterpret_cast<uint32_t*>(destination + static_cast<size_t>(destinationY) * destinationPitch);
-            for (uint32_t destinationX = 0; destinationX < sourceHeight; ++destinationX) {
-                const auto* sourceRow = reinterpret_cast<const uint32_t*>(source + static_cast<size_t>(destinationX) * sourceStride);
-                destinationRow[destinationX] = sourceRow[sourceX];
-            }
-        }
-        return;
-    }
+    rotateRegionARGB8888(source, sourceStride, destination, destinationPitch, panelWidth, panelHeight, rotation, 0, 0, 0, sourceWidth, sourceHeight);
 }
 
 struct ChromeRenderState {
@@ -514,12 +550,16 @@ static guint chromeRenderStateHash()
     return hash;
 }
 
-// chrome 渲染状态缓存：INI 只在文件内容（hash）变化时重新解析。
-// 之前每一渲染帧至少全量读+解析 2 次，另有 33ms 轮询再读 1 次，
-// 空闲时也有约 60 次磁盘读/秒，而这一切都发生在软件拷贝主循环里。
+// chrome 渲染状态缓存：INI 只在文件真正变化时重新读取解析。
+// 探测分两级：先 stat（写端 g_file_set_contents 走临时文件+rename，
+// inode 必变），未变直接返回，空闲时把原先每 33ms 的全量读+hash
+// 降为一次 stat；stat 变了再读内容比对 hash，内容相同也不重新解析。
 struct ChromeStateCache {
     ChromeRenderState state;
     guint hash { 0 };
+    gint64 stampMTime { -1 };
+    gint64 stampInode { -1 };
+    gint64 stampSize { -1 };
     bool valid { false };
 };
 
@@ -533,6 +573,16 @@ static ChromeStateCache& chromeStateCache()
 static bool refreshChromeRenderState()
 {
     auto& cache = chromeStateCache();
+    GStatBuf st;
+    if (!g_stat(chromeRenderStatePath(), &st)) {
+        if (cache.valid && static_cast<gint64>(st.st_mtime) == cache.stampMTime
+            && static_cast<gint64>(st.st_ino) == cache.stampInode
+            && static_cast<gint64>(st.st_size) == cache.stampSize)
+            return false;
+        cache.stampMTime = st.st_mtime;
+        cache.stampInode = st.st_ino;
+        cache.stampSize = st.st_size;
+    }
     guint hash = chromeRenderStateHash();
     if (cache.valid && hash == cache.hash)
         return false;
@@ -684,11 +734,24 @@ public:
         row[dx] = color;
     }
 
+    // 大块填充（工具栏底色、按钮、面板背景）按目标行序整段 std::fill；
+    // 旧实现逐像素 setPixel，90/270 度下等于每 4 字节打断一次 WC 缓冲。
     void fillRect(int x, int y, int width, int height, uint32_t color)
     {
-        for (int yy = y; yy < y + height; ++yy) {
-            for (int xx = x; xx < x + width; ++xx)
-                setPixel(xx, yy, color);
+        int x1 = std::max(x, 0);
+        int y1 = std::max(y, 0);
+        int x2 = std::min(x + width, static_cast<int>(m_panelWidth));
+        int y2 = std::min(y + height, static_cast<int>(m_panelHeight));
+        if (x2 <= x1 || y2 <= y1)
+            return;
+        auto rect = rotatedDestRect(x1, y1, x2, y2, m_panelWidth, m_panelHeight, m_rotation, 0);
+        int dx1 = std::clamp(rect.x1, 0, static_cast<int>(m_destinationWidth));
+        int dx2 = std::clamp(rect.x2, 0, static_cast<int>(m_destinationWidth));
+        int dy1 = std::clamp(rect.y1, 0, static_cast<int>(m_destinationHeight));
+        int dy2 = std::clamp(rect.y2, 0, static_cast<int>(m_destinationHeight));
+        for (int dy = dy1; dy < dy2; ++dy) {
+            auto* row = reinterpret_cast<uint32_t*>(m_destination + static_cast<size_t>(dy) * m_destinationPitch);
+            std::fill(row + dx1, row + dx2, color);
         }
     }
 
@@ -1159,10 +1222,7 @@ public:
             return false;
         }
 
-        auto* destination = static_cast<uint8_t*>(m_mapping);
-        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
-        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
-        drawChromeOverlay(destination, m_pitch, m_width, m_height, panel.width, panel.height, rotation);
+        copyRotatedPixels(source, sourceWidth, sourceHeight, sourceStride, rotation);
         return true;
     }
 
@@ -1201,14 +1261,70 @@ public:
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncStart);
 
         const auto* source = static_cast<const uint8_t*>(userData->sourceMapping) + sourceOffset;
-        auto* destination = static_cast<uint8_t*>(m_mapping);
-        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
-        copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
-        drawChromeOverlay(destination, m_pitch, m_width, m_height, panel.width, panel.height, rotation);
+        copyRotatedPixels(source, sourceWidth, sourceHeight, sourceStride, rotation);
 
         struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
         return true;
+    }
+
+    // 旋转 dumb buffer 的脏区簿记：两块缓冲轮换，每帧到来时把当前帧脏区累积到
+    // 所有候选缓冲上；被选中写入的缓冲消费自己的累计脏区（= 相对其上次内容的
+    // 全部差异），其余缓冲继续累积。无脏区信息或矩形过多时退化为整帧重拷。
+    void accumulateSourceDamage(const Vector<drm_mode_rect>& rects)
+    {
+        if (m_pendingFullRepaint)
+            return;
+        if (rects.isEmpty() || m_pendingDamage.size() + rects.size() > 16) {
+            m_pendingFullRepaint = true;
+            m_pendingDamage.clear();
+            return;
+        }
+        m_pendingDamage.appendVector(rects);
+    }
+
+    // 本次 copy 的目标坐标脏区：增量拷贝时为变换后的矩形（是相对上一次 scanout
+    // 内容差异的超集，作 FB_DAMAGE_CLIPS 安全），整帧拷贝时为空（不带 clips）。
+    Vector<drm_mode_rect> takeDestDamage() { return WTF::move(m_lastDestDamage); }
+
+    void copyRotatedPixels(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, OutputRotation rotation)
+    {
+        auto* destination = static_cast<uint8_t*>(m_mapping);
+        auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
+        auto topInset = chromeReservedTopInset(panel.height);
+        const auto& chrome = cachedChromeRenderState();
+        guint chromeHash = chromeStateCache().hash;
+        bool panelOpen = chrome.panel[0] && strcmp(chrome.panel, "none");
+        uint32_t availableHeight = panel.height > topInset ? panel.height - topInset : 0;
+
+        // 增量路径条件：本缓冲上帧内容有效且仅差累计脏区；chrome 状态与让位带
+        // 未变（resize 布局下工具栏与内容区不相交，无需重画 overlay）；无面板
+        // 悬浮在内容上、无显隐动画；源尺寸与内容区精确匹配（稳态）。
+        bool partial = !m_pendingFullRepaint && !m_pendingDamage.isEmpty()
+            && chromeLayoutResizeEnabled() && !panelOpen && !chromeAnimationActive()
+            && chromeHash == m_lastChromeHash && topInset == m_lastTopInset
+            && sourceWidth == panel.width && sourceHeight == availableHeight;
+
+        m_lastDestDamage.clear();
+        if (partial) {
+            for (const auto& rect : m_pendingDamage) {
+                int x1 = std::clamp<int>(rect.x1, 0, static_cast<int>(sourceWidth));
+                int x2 = std::clamp<int>(rect.x2, 0, static_cast<int>(sourceWidth));
+                int y1 = std::clamp<int>(rect.y1, 0, static_cast<int>(sourceHeight));
+                int y2 = std::clamp<int>(rect.y2, 0, static_cast<int>(sourceHeight));
+                if (x2 <= x1 || y2 <= y1)
+                    continue;
+                rotateRegionARGB8888(source, sourceStride, destination, m_pitch, panel.width, panel.height, rotation, topInset, x1, y1, x2 - x1, y2 - y1);
+                m_lastDestDamage.append(rotatedDestRect(x1, y1, x2, y2, panel.width, panel.height, rotation, topInset));
+            }
+        } else {
+            copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
+            drawChromeOverlay(destination, m_pitch, m_width, m_height, panel.width, panel.height, rotation);
+        }
+        m_pendingDamage.clear();
+        m_pendingFullRepaint = false;
+        m_lastTopInset = topInset;
+        m_lastChromeHash = chromeHash;
     }
 
     void setFenceFD(UnixFileDescriptor&& fenceFD)
@@ -1246,6 +1362,11 @@ private:
     uint32_t m_frameBufferID { 0 };
     void* m_mapping { nullptr };
     mutable UnixFileDescriptor m_fenceFD;
+    Vector<drm_mode_rect> m_pendingDamage;
+    bool m_pendingFullRepaint { true };
+    uint32_t m_lastTopInset { 0 };
+    guint m_lastChromeHash { 0 };
+    Vector<drm_mode_rect> m_lastDestDamage;
 };
 
 WPEBufferDRMUserData::~WPEBufferDRMUserData()
@@ -1756,6 +1877,11 @@ static DRMScanoutBuffer* drmScanoutBufferForRender(WPEViewDRM* view, WPEBuffer* 
         if (rotation != OutputRotation::Rotate0)
             return nextRotatedDMABufBuffer(view, buffer, rotation, error);
 
+        // 未旋转的 dmabuf 直接进 zero-copy scanout（无 CPU 合成步骤），
+        // drawChromeOverlay() 只在 CPU 拷贝路径（SHM / 旋转 dumb）里调用，
+        // 因此这条路径下不会画 WPE 侧工具栏。这是当前直扫设计的固有限制，
+        // 不是遗漏：若默认配置（rotation=0 + WPE_DRM_BUFFER_PATH=dma_heap）
+        // 需要工具栏常驻，要么强制走 dumb 合成路径，要么把工具栏做成独立 plane。
         auto* userData = static_cast<WPEBufferDRMUserData*>(wpe_buffer_get_user_data(buffer));
         auto* scanoutBuffer = userData ? userData->scanoutBuffer : nullptr;
         if (!scanoutBuffer)
@@ -1904,7 +2030,7 @@ WPE::DRM::Plane::Properties primaryPlaneProperties(const WPE::DRM::Plane& plane,
     properties.rotation.second = drmPlaneRotate0Value();
     static guint64 commitLogCounter = 0;
     commitLogCounter++;
-    if (commitLogCounter <= 8 || !(commitLogCounter % 60)) {
+    if (commitLogCounter <= 8 || !(commitLogCounter % 600)) {
         auto panel = configuredPanelSize();
         g_message("WPEViewDRM commit fit=%s panel=%ux%u drm_mode=%ux%u framebuffer=%ux%u src=%ux%u crtc=%ux%u+%u+%u commit=%" G_GUINT64_FORMAT,
             drmFitMode(), panel.width, panel.height,
@@ -1930,12 +2056,12 @@ WPE::DRM::Plane::Properties cursorPlaneProperties(uint32_t crtcID, const WPE::DR
     properties.crtcX.second = cursor.x();
     properties.crtcY.second = cursor.y();
     properties.crtcW.second = gbm_bo_get_width(cursor.buffer()->bufferObject());
-    properties.crtcH.second = gbm_bo_get_width(cursor.buffer()->bufferObject());
+    properties.crtcH.second = gbm_bo_get_height(cursor.buffer()->bufferObject());
     properties.fbID.second = cursor.buffer()->frameBufferID();
     properties.srcX.second = 0;
     properties.srcY.second = 0;
     properties.srcW.second = (static_cast<uint64_t>(gbm_bo_get_width(cursor.buffer()->bufferObject())) << 16);
-    properties.srcH.second = (static_cast<uint64_t>(gbm_bo_get_width(cursor.buffer()->bufferObject())) << 16);
+    properties.srcH.second = (static_cast<uint64_t>(gbm_bo_get_height(cursor.buffer()->bufferObject())) << 16);
     properties.rotation.second = drmPlaneRotate0Value();
     return properties;
 }
@@ -2109,6 +2235,12 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb)));
     if (priv->pendingBuffer || needsScanoutRebuild) {
         gint64 copyStartUS = g_get_monotonic_time();
+        if (rotation != OutputRotation::Rotate0 && priv->pendingBuffer) {
+            for (auto& candidate : priv->rotatedScanoutBuffers) {
+                if (candidate)
+                    candidate->accumulateSourceDamage(priv->damageRects);
+            }
+        }
         drmBuffer = drmScanoutBufferForRender(view, buffer, rotation, error);
         if (!drmBuffer)
             return FALSE;
@@ -2118,7 +2250,7 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
             || drmBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb)
             priv->copyTotalUS += g_get_monotonic_time() - copyStartUS;
         if (rotation != OutputRotation::Rotate0)
-            priv->damageRects.clear();
+            priv->damageRects = drmBuffer->takeDestDamage();
 
         if (priv->pendingBuffer) {
             drmBuffer->setFenceFD(UnixFileDescriptor { wpe_buffer_take_rendering_fence(buffer), UnixFileDescriptor::Adopt });

@@ -25,7 +25,6 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 - `src/`：MiniApp 前端壳。
   - `src/pages/index/`：启动页，显示模式选择、键盘测试、启动入口。
   - `src/pages/frame/`：全屏 `<hole>` 承载页，负责启动/停止 WPE、watchdog、键盘桥轮询。
-  - `src/pages/index0|90|180|270/`、`src/pages/frame0|90|180|270/`：框架旋转别名页，配合 `app.json` 的 `page_rotation_sku`。
   - `src/utils/keyboard.js`：HaasUI 系统键盘封装。
 - `jsapi/`：MiniApp native JSAPI 源码，模块名 `browser`。
 - `libs/`：打包用 JSAPI so。
@@ -176,3 +175,4 @@ Direct DRM 出屏、buffer 路径、WPE plane 与 MiniApp `<hole>` 合成、触�
 ```text
 tools/DRM_HOLE_RENDERING_PIPELINE.md
 ```
+1

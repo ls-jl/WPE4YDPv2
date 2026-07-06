@@ -265,9 +265,10 @@ export default {
       watchdogActive: false,
       leavingFrame: false,
       startToken: 0,
+      keyboardProfileMode: 'globalOnly',
+      keyboardProfileReason: 'default',
       keyboardSession: null,
       pollTimer: null,
-      keyboardGlobalOpenTimer: null,
       pollTick: 0,
       keyboardActiveUntil: 0,
       activeKeyboardRequest: null,
@@ -483,7 +484,8 @@ export default {
       }
     },
     setupKeyboard() {
-      if (this.keyboardSession) return
+      this.readKeyboardProfile()
+      if (this.keyboardSession || this.keyboardProfileMode !== 'globalOnly') return
       this.keyboardSession = new KeyboardSession({
         onConfirm: (text) => {
           const value = this.keyboardTextareaSeenInput ? this.keyboardTextareaValue : text
@@ -492,6 +494,21 @@ export default {
         onCancel: () => this.finishKeyboardRequest(false, ''),
       })
       this.keyboardSession.mount()
+    },
+    readKeyboardProfile() {
+      let profile = null
+      try {
+        if (browserPlayer.getKeyboardProfile) {
+          const raw = browserPlayer.getKeyboardProfile() || ''
+          profile = raw ? JSON.parse(raw) : null
+        }
+      } catch (err) {
+        console.warn(`read keyboard profile failed ${err}`)
+      }
+      const mode = profile && profile.mode === 'textareaOnly' ? 'textareaOnly' : 'globalOnly'
+      this.keyboardProfileMode = mode
+      this.keyboardProfileReason = profile && profile.reason ? `${profile.reason}` : 'default'
+      console.warn(`keyboard profile mode=${this.keyboardProfileMode} reason=${this.keyboardProfileReason}`)
     },
     teardownKeyboard() {
       this.stopPolling()
@@ -573,22 +590,13 @@ export default {
       this.keyboardTextareaVisible = false
       this.keyboardTextareaSeenInput = false
     },
-    clearKeyboardGlobalOpenTimer() {
-      if (this.keyboardGlobalOpenTimer) {
-        clearTimeout(this.keyboardGlobalOpenTimer)
-        this.keyboardGlobalOpenTimer = null
-      }
-    },
-    scheduleGlobalKeyboardOpen(request, options, textareaStarted) {
-      this.clearKeyboardGlobalOpenTimer()
-      this.keyboardGlobalOpenTimer = setTimeout(() => {
-        this.keyboardGlobalOpenTimer = null
-        if (!this.activeKeyboardRequest || this.activeKeyboardRequest.id !== request.id) return
-        const uuid = this.keyboardSession.open(options)
-        if (!uuid && !textareaStarted) {
-          this.finishKeyboardRequest(false, '')
-        }
-      }, 80)
+    openGlobalKeyboard(request) {
+      if (!request || !request.id || !this.keyboardSession) return false
+      const options = this.keyboardOptionsForRequest(request)
+      this.closeKeyboardTextarea()
+      const uuid = this.keyboardSession.open(options)
+      console.warn(`keyboard global request id=${request.id} kind=${request.kind || ''} uuid=${uuid || ''}`)
+      return !!uuid
     },
     onKeyboardTextareaInput(value) {
       this.keyboardTextareaValue = normalizeKeyboardText(value)
@@ -639,7 +647,8 @@ export default {
     },
     pollKeyboardRequest() {
       if (this.leavingFrame || this.activeKeyboardRequest) return
-      if (!browserPlayer.pollKeyboardRequest || !this.keyboardSession) return
+      if (!browserPlayer.pollKeyboardRequest) return
+      if (this.keyboardProfileMode === 'globalOnly' && !this.keyboardSession) return
       if (!this.browserRunning && !this.browserStarting) return
 
       let raw = ''
@@ -662,15 +671,20 @@ export default {
       if (!request || !request.id) return
 
       this.activeKeyboardRequest = request
-      console.warn(`keyboard request id=${request.id} kind=${request.kind || ''}`)
-      const options = this.keyboardOptionsForRequest(request)
-      const textareaStarted = this.openKeyboardTextarea(request)
-      this.scheduleGlobalKeyboardOpen(request, options, textareaStarted)
+      console.warn(`keyboard request id=${request.id} kind=${request.kind || ''} mode=${this.keyboardProfileMode}`)
+      if (this.keyboardProfileMode === 'textareaOnly') {
+        if (!this.openKeyboardTextarea(request)) {
+          this.finishKeyboardRequest(false, '')
+        }
+        return
+      }
+      if (!this.openGlobalKeyboard(request)) {
+        this.finishKeyboardRequest(false, '')
+      }
     },
     finishKeyboardRequest(confirmed, text) {
       const request = this.activeKeyboardRequest
       if (!request || !request.id) return
-      this.clearKeyboardGlobalOpenTimer()
       this.activeKeyboardRequest = null
       this.keyboardActiveUntil = Date.now() + 10000
       try {
@@ -687,7 +701,6 @@ export default {
       this.closeKeyboardTextarea()
     },
     cancelActiveKeyboardRequest(reason) {
-      this.clearKeyboardGlobalOpenTimer()
       if (this.activeKeyboardRequest) {
         console.warn(`keyboard cancel active reason=${reason || ''} id=${this.activeKeyboardRequest.id}`)
         this.finishKeyboardRequest(false, '')

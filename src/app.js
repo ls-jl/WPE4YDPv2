@@ -25,30 +25,6 @@ class App extends $falcon.App {
   }
 
   /**
-   * 应用生命周期,应用启动或应用从后台切换到前台时触发
-   */
-  onShow() {
-    super.onShow()
-    try {
-      $falcon.trigger('browser_app_show', {})
-    } catch (err) {
-      console.log(err)
-    }
-  }
-
-  /**
-   * 应用生命周期:应用退出前或者应用从前台切换到后台时触发
-   */
-  onHide() {
-    super.onHide()
-    try {
-      $falcon.trigger('browser_app_hide', {})
-    } catch (err) {
-      console.log(err)
-    }
-  }
-
-  /**
    * 应用生命周期:应用销毁前触发
    */
   onDestroy() {
