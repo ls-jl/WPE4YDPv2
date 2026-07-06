@@ -47,6 +47,8 @@
 #include <optional>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <wtf/FastMalloc.h>
@@ -1430,6 +1432,7 @@ struct _WPEViewDRMPrivate {
     gint64 frameThrottleIntervalUS { 0 };
     unsigned chromePollTick { 0 };
     OutputRotation outputRotation { OutputRotation::Rotate0 };
+    struct VideoOverlayState* videoOverlay { nullptr };
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEViewDRM, wpe_view_drm, WPE_TYPE_VIEW, WPEView)
 
@@ -1546,6 +1549,10 @@ static void wpeViewDRMCompleteSynchronousCommitIfNeeded(WPEViewDRM* view)
     wpeViewDRMFinishBufferCommit(view);
 }
 
+static void videoOverlayStart(WPEViewDRM*);
+static void videoOverlayStop(WPEViewDRM*);
+static void videoOverlayRecommit(WPEViewDRM*);
+
 static void wpeViewDRMConstructed(GObject* object)
 {
     G_OBJECT_CLASS(wpe_view_drm_parent_class)->constructed(object);
@@ -1624,6 +1631,8 @@ static void wpeViewDRMConstructed(GObject* object)
 
         if (!needsUpdate)
             return G_SOURCE_CONTINUE;
+        // 工具栏 inset/旋转变了，视频 overlay 的落屏矩形要跟着重算。
+        videoOverlayRecommit(view);
         if (priv->committedBuffer && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
             if (wpeViewDRMRequestUpdate(view, nullptr)) {
                 priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
@@ -1633,11 +1642,15 @@ static void wpeViewDRMConstructed(GObject* object)
         return G_SOURCE_CONTINUE;
     })), object, nullptr);
     g_source_attach(priv->chromeSource.get(), g_main_context_get_thread_default());
+
+    videoOverlayStart(WPE_VIEW_DRM(view));
 }
 
 static void wpeViewDRMDispose(GObject* object)
 {
     auto* priv = WPE_VIEW_DRM(object)->priv;
+
+    videoOverlayStop(WPE_VIEW_DRM(object));
 
     priv->cursorUpdateTimer = nullptr;
 
@@ -2163,6 +2176,473 @@ static bool wpeViewDRMCommitAtomic(WPEViewDRM* view, DRMScanoutBuffer* buffer, s
     wpeScreenDRMDestroyDumbBufferIfNeeded(screen, fd);
 
     return true;
+}
+
+// ===== 视频 overlay 直出（hole-punch）=====
+// WebProcess 端 GStreamerHolePunchQuirkRockchip 的 sink 通过 unix seqpacket
+// socket 把解码后的 NV12 dmabuf（mppvideodec+RGA 已按面板方向预旋转）逐帧
+// 发来；这里导入成 FB 放到空闲 overlay plane，zpos 压到 primary 之下，页面
+// 合成器在视频区域画的透明洞（per-pixel alpha）让视频透出。线格式必须与
+// Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp 中的
+// 定义保持一字不差。
+
+enum : uint32_t {
+    VideoOverlayMessageFrame = 1,
+    VideoOverlayMessageRect = 2,
+    VideoOverlayMessageHide = 3,
+};
+
+struct VideoOverlayWireMessage {
+    uint32_t type;
+    uint32_t fourcc;
+    uint32_t width;
+    uint32_t height;
+    uint32_t planeCount;
+    uint32_t strides[3];
+    uint32_t offsets[3];
+    int32_t rectX;
+    int32_t rectY;
+    int32_t rectWidth;
+    int32_t rectHeight;
+    uint64_t modifier;
+};
+
+struct VideoOverlayFB {
+    uint32_t fbID { 0 };
+    uint32_t handles[3] { 0, 0, 0 };
+};
+
+struct VideoOverlayState {
+    WPEViewDRM* view { nullptr };
+    int listenFD { -1 };
+    int clientFD { -1 };
+    GRefPtr<GSource> listenSource;
+    GRefPtr<GSource> clientSource;
+    const WPE::DRM::Plane* plane { nullptr };
+    VideoOverlayFB current;
+    VideoOverlayFB retired[2];
+    VideoOverlayWireMessage lastFrame;
+    uint64_t primaryZposRestore { 0 };
+    bool haveFrame { false };
+    bool planeEnabled { false };
+    bool zposUnsupported { false };
+    unsigned commitFailLogCount { 0 };
+};
+
+static const char* videoOverlaySocketPath()
+{
+    static const char* path = []() -> const char* {
+        const char* configured = getenv("WPE_VIDEO_OVERLAY_SOCKET");
+        if (configured && *configured)
+            return g_strdup(configured);
+        const char* varDir = getenv("WPE_VAR_DIR");
+        if (varDir && *varDir)
+            return g_strdup_printf("%s/wpe-video-overlay.sock", varDir);
+        return g_strdup_printf("/tmp/wpe-video-overlay-%u.sock", static_cast<unsigned>(getuid()));
+    }();
+    return path;
+}
+
+static void videoOverlayReleaseFB(int fd, VideoOverlayFB& fb)
+{
+    if (fb.fbID)
+        drmModeRmFB(fd, fb.fbID);
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!fb.handles[i])
+            continue;
+        // 同一 dmabuf 多平面共享一个 GEM handle，只 close 一次。
+        bool alreadyClosed = false;
+        for (unsigned j = 0; j < i; ++j) {
+            if (fb.handles[j] == fb.handles[i])
+                alreadyClosed = true;
+        }
+        if (!alreadyClosed) {
+            struct drm_gem_close close = { fb.handles[i], 0 };
+            ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close);
+        }
+        fb.handles[i] = 0;
+    }
+    fb.fbID = 0;
+}
+
+static void videoOverlayRetireCurrentFB(VideoOverlayState* overlay, int fd)
+{
+    if (!overlay->current.fbID)
+        return;
+    // 新 FB 的 NONBLOCK commit 成功后旧 FB 可能还有一个 vblank 在屏上，
+    // 立刻 RmFB 会把 plane 打灭；退役队列压两级再释放。
+    videoOverlayReleaseFB(fd, overlay->retired[1]);
+    overlay->retired[1] = overlay->retired[0];
+    overlay->retired[0] = overlay->current;
+    overlay->current = VideoOverlayFB();
+}
+
+static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uint32_t fbID, const VideoOverlayWireMessage& frame)
+{
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto* screen = WPE_SCREEN_DRM(wpeDisplayDRMGetScreen(display));
+    auto& crtc = wpeScreenDRMGetCrtc(screen);
+    auto* mode = wpeScreenDRMGetMode(screen);
+    auto fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    auto* priv = view->priv;
+
+    auto rotation = priv->outputRotation;
+    auto panel = configuredPanelSize();
+    uint32_t panelW = panel.width ? panel.width : mode->hdisplay;
+    uint32_t panelH = panel.height ? panel.height : mode->vdisplay;
+    uint32_t topInset = chromeReservedTopInset(panelH);
+
+    // 视图坐标矩形 → 旋转后 framebuffer 坐标（与 CPU 旋转拷贝同一套数学）。
+    auto rect = rotatedDestRect(frame.rectX, frame.rectY, frame.rectX + frame.rectWidth, frame.rectY + frame.rectHeight,
+        panelW, panelH, rotation, topInset);
+
+    // framebuffer 在 mode 里的放置偏移，与 destinationRectForBuffer 的
+    // panel-native 分支一致。视频最终要裁剪进图形内容条带区（panel-native
+    // 下面板只露出 fb 那一条，例如 480x960 mode 里 x∈[107,373)，出界部分
+    // 在挡板后且没有图形层打洞配合，不能让视频漏出去）。
+    int32_t offsetX = 0;
+    int32_t offsetY = 0;
+    int32_t contentX1 = 0;
+    int32_t contentY1 = 0;
+    int32_t contentX2 = mode->hdisplay;
+    int32_t contentY2 = mode->vdisplay;
+    if (shouldUsePanelNativeFit()) {
+        uint32_t fbW = std::min<uint32_t>(rotatedWidth(panelW, panelH, rotation), mode->hdisplay);
+        uint32_t fbH = std::min<uint32_t>(rotatedHeight(panelW, panelH, rotation), mode->vdisplay);
+        uint32_t maxX = mode->hdisplay > fbW ? mode->hdisplay - fbW : 0;
+        if (auto configuredX = configuredRotatedXOffset(maxX))
+            offsetX = configuredX.value();
+        else
+            offsetX = maxX / 2;
+        offsetY = mode->vdisplay > fbH ? (mode->vdisplay - fbH) / 2 : 0;
+        contentX1 = offsetX;
+        contentY1 = offsetY;
+        contentX2 = offsetX + fbW;
+        contentY2 = offsetY + fbH;
+    }
+
+    int32_t dstX1 = rect.x1 + offsetX;
+    int32_t dstY1 = rect.y1 + offsetY;
+    int32_t dstX2 = rect.x2 + offsetX;
+    int32_t dstY2 = rect.y2 + offsetY;
+    if (dstX2 <= dstX1 || dstY2 <= dstY1)
+        return false;
+
+    // 裁剪到内容条带区，源矩形按比例跟进（16.16 定点）。
+    int32_t fullW = dstX2 - dstX1;
+    int32_t fullH = dstY2 - dstY1;
+    int32_t clipX1 = std::max<int32_t>(dstX1, contentX1);
+    int32_t clipY1 = std::max<int32_t>(dstY1, contentY1);
+    int32_t clipX2 = std::min<int32_t>(dstX2, contentX2);
+    int32_t clipY2 = std::min<int32_t>(dstY2, contentY2);
+    if (clipX2 <= clipX1 || clipY2 <= clipY1) {
+        // 完全滚出屏幕：藏 plane 但保留帧，等矩形回来再显示。
+        if (overlay->planeEnabled) {
+            WPE::DRM::UniquePtr<drmModeAtomicReq> request(drmModeAtomicAlloc());
+            if (addPlaneProperties(request.get(), *overlay->plane, emptyPlaneProperties(*overlay->plane)))
+                drmModeAtomicCommit(fd, request.get(), DRM_MODE_ATOMIC_NONBLOCK, nullptr);
+            overlay->planeEnabled = false;
+        }
+        return true;
+    }
+
+    uint64_t srcFullW = static_cast<uint64_t>(frame.width) << 16;
+    uint64_t srcFullH = static_cast<uint64_t>(frame.height) << 16;
+    uint64_t srcX = srcFullW * (clipX1 - dstX1) / fullW;
+    uint64_t srcY = srcFullH * (clipY1 - dstY1) / fullH;
+    uint64_t srcW = srcFullW * (clipX2 - clipX1) / fullW;
+    uint64_t srcH = srcFullH * (clipY2 - clipY1) / fullH;
+
+    auto properties = overlay->plane->properties();
+    properties.crtcID.second = crtc.id();
+    properties.crtcX.second = clipX1;
+    properties.crtcY.second = clipY1;
+    properties.crtcW.second = clipX2 - clipX1;
+    properties.crtcH.second = clipY2 - clipY1;
+    properties.fbID.second = fbID;
+    properties.srcX.second = srcX;
+    properties.srcY.second = srcY;
+    properties.srcW.second = srcW;
+    properties.srcH.second = srcH;
+    properties.rotation.second = drmPlaneRotate0Value();
+
+    const auto& primaryPlane = wpeDisplayDRMGetPrimaryPlane(display);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool withZpos = !overlay->zposUnsupported && !attempt
+            && properties.zpos.first && primaryPlane.properties().zpos.first;
+        WPE::DRM::UniquePtr<drmModeAtomicReq> request(drmModeAtomicAlloc());
+        if (!addPlaneProperties(request.get(), *overlay->plane, WPE::DRM::Plane::Properties(properties)))
+            return false;
+        if (withZpos) {
+            // 视频压到 primary 之下，primary 靠透明洞的 per-pixel alpha 透出视频。
+            drmModeAtomicAddProperty(request.get(), overlay->plane->id(), properties.zpos.first, 0);
+            drmModeAtomicAddProperty(request.get(), primaryPlane.id(), primaryPlane.properties().zpos.first, 1);
+        }
+        if (!drmModeAtomicCommit(fd, request.get(), DRM_MODE_ATOMIC_NONBLOCK, nullptr)) {
+            overlay->planeEnabled = true;
+            return true;
+        }
+        if (errno == EBUSY)
+            return false; // 与页面提交撞车，丢这帧视频，下一帧再来。
+        if (withZpos) {
+            g_warning("WPEViewDRM video overlay: commit with zpos failed (%s), falling back to no-zpos (video above page)", strerror(errno));
+            overlay->zposUnsupported = true;
+            continue;
+        }
+        if (overlay->commitFailLogCount++ < 8)
+            g_warning("WPEViewDRM video overlay: atomic commit failed: %s", strerror(errno));
+        return false;
+    }
+    return false;
+}
+
+static void videoOverlayDisable(WPEViewDRM* view)
+{
+    auto* overlay = view->priv->videoOverlay;
+    if (!overlay || !overlay->plane)
+        return;
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    if (overlay->planeEnabled) {
+        WPE::DRM::UniquePtr<drmModeAtomicReq> request(drmModeAtomicAlloc());
+        bool success = addPlaneProperties(request.get(), *overlay->plane, emptyPlaneProperties(*overlay->plane));
+        const auto& primaryPlane = wpeDisplayDRMGetPrimaryPlane(display);
+        if (!overlay->zposUnsupported && primaryPlane.properties().zpos.first)
+            drmModeAtomicAddProperty(request.get(), primaryPlane.id(), primaryPlane.properties().zpos.first, overlay->primaryZposRestore);
+        if (success && drmModeAtomicCommit(fd, request.get(), 0, nullptr))
+            g_warning("WPEViewDRM video overlay: disable commit failed: %s", strerror(errno));
+        overlay->planeEnabled = false;
+    }
+    videoOverlayReleaseFB(fd, overlay->retired[1]);
+    videoOverlayReleaseFB(fd, overlay->retired[0]);
+    videoOverlayReleaseFB(fd, overlay->current);
+    overlay->haveFrame = false;
+}
+
+static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMessage& frame, int* fds, unsigned fdCount)
+{
+    auto* overlay = view->priv->videoOverlay;
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+
+    if (!fdCount || frame.planeCount < 1 || frame.planeCount > 3 || !frame.width || !frame.height)
+        return;
+    if (frame.fourcc != DRM_FORMAT_NV12 || !overlay->plane->supportsFormat(DRM_FORMAT_NV12, DRM_FORMAT_MOD_INVALID)) {
+        static bool warned;
+        if (!warned) {
+            g_warning("WPEViewDRM video overlay: unsupported fourcc %.4s", reinterpret_cast<const char*>(&frame.fourcc));
+            warned = true;
+        }
+        return;
+    }
+
+    VideoOverlayFB fb;
+    uint32_t pitches[4] = { 0, };
+    uint32_t offsets[4] = { 0, };
+    uint32_t handles[4] = { 0, };
+    for (unsigned i = 0; i < frame.planeCount; ++i) {
+        int dmabufFD = i < fdCount ? fds[i] : fds[fdCount - 1];
+        uint32_t handle = 0;
+        if (drmPrimeFDToHandle(fd, dmabufFD, &handle)) {
+            if (overlay->commitFailLogCount++ < 8)
+                g_warning("WPEViewDRM video overlay: drmPrimeFDToHandle failed: %s", strerror(errno));
+            videoOverlayReleaseFB(fd, fb);
+            return;
+        }
+        fb.handles[i] = handle;
+        handles[i] = handle;
+        pitches[i] = frame.strides[i];
+        offsets[i] = frame.offsets[i];
+    }
+
+    if (drmModeAddFB2(fd, frame.width, frame.height, frame.fourcc, handles, pitches, offsets, &fb.fbID, 0)) {
+        if (overlay->commitFailLogCount++ < 8)
+            g_warning("WPEViewDRM video overlay: drmModeAddFB2 %ux%u failed: %s", frame.width, frame.height, strerror(errno));
+        videoOverlayReleaseFB(fd, fb);
+        return;
+    }
+
+    if (!videoOverlayCommit(view, overlay, fb.fbID, frame)) {
+        videoOverlayReleaseFB(fd, fb);
+        return;
+    }
+
+    videoOverlayRetireCurrentFB(overlay, fd);
+    overlay->current = fb;
+    overlay->lastFrame = frame;
+    overlay->haveFrame = true;
+}
+
+// 布局变化（工具栏动画/旋转/矩形更新）后按最新状态重新提交当前帧。
+static void videoOverlayRecommit(WPEViewDRM* view)
+{
+    auto* overlay = view->priv->videoOverlay;
+    if (!overlay || !overlay->haveFrame || !overlay->current.fbID)
+        return;
+    videoOverlayCommit(view, overlay, overlay->current.fbID, overlay->lastFrame);
+}
+
+static void videoOverlayDropClient(WPEViewDRM* view)
+{
+    auto* overlay = view->priv->videoOverlay;
+    if (overlay->clientSource) {
+        g_source_destroy(overlay->clientSource.get());
+        overlay->clientSource = nullptr;
+    }
+    if (overlay->clientFD >= 0) {
+        close(overlay->clientFD);
+        overlay->clientFD = -1;
+    }
+    videoOverlayDisable(view);
+}
+
+static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gpointer userData)
+{
+    auto* view = WPE_VIEW_DRM(userData);
+    auto* overlay = view->priv->videoOverlay;
+
+    if (condition & (G_IO_ERR | G_IO_HUP)) {
+        videoOverlayDropClient(view);
+        return G_SOURCE_REMOVE;
+    }
+
+    VideoOverlayWireMessage message;
+    int fds[3] = { -1, -1, -1 };
+    unsigned fdCount = 0;
+
+    struct iovec vec = { &message, sizeof(message) };
+    char control[CMSG_SPACE(sizeof(fds))];
+    struct msghdr msg = { };
+    msg.msg_iov = &vec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t received = recvmsg(socketFD, &msg, MSG_CMSG_CLOEXEC);
+    if (received <= 0) {
+        if (received < 0 && (errno == EAGAIN || errno == EINTR))
+            return G_SOURCE_CONTINUE;
+        videoOverlayDropClient(view);
+        return G_SOURCE_REMOVE;
+    }
+
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
+            continue;
+        unsigned count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (unsigned i = 0; i < count && fdCount < 3; ++i)
+            fds[fdCount++] = reinterpret_cast<int*>(CMSG_DATA(cmsg))[i];
+    }
+
+    if (received == sizeof(message)) {
+        switch (message.type) {
+        case VideoOverlayMessageFrame:
+            videoOverlayHandleFrame(view, message, fds, fdCount);
+            break;
+        case VideoOverlayMessageRect:
+            if (overlay->haveFrame) {
+                overlay->lastFrame.rectX = message.rectX;
+                overlay->lastFrame.rectY = message.rectY;
+                overlay->lastFrame.rectWidth = message.rectWidth;
+                overlay->lastFrame.rectHeight = message.rectHeight;
+                videoOverlayRecommit(view);
+            }
+            break;
+        case VideoOverlayMessageHide:
+            videoOverlayDisable(view);
+            break;
+        default:
+            break;
+        }
+    }
+
+    for (unsigned i = 0; i < fdCount; ++i)
+        close(fds[i]);
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean videoOverlayAccept(int listenFD, GIOCondition condition, gpointer userData)
+{
+    auto* view = WPE_VIEW_DRM(userData);
+    auto* overlay = view->priv->videoOverlay;
+
+    if (condition & (G_IO_ERR | G_IO_HUP))
+        return G_SOURCE_REMOVE;
+
+    int clientFD = accept4(listenFD, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (clientFD < 0)
+        return G_SOURCE_CONTINUE;
+
+    if (overlay->clientFD >= 0)
+        videoOverlayDropClient(view);
+
+    overlay->clientFD = clientFD;
+    overlay->clientSource = adoptGRef(g_unix_fd_source_new(clientFD, static_cast<GIOCondition>(G_IO_IN | G_IO_ERR | G_IO_HUP)));
+    g_source_set_name(overlay->clientSource.get(), "WPE DRM video overlay client");
+    g_source_set_callback(overlay->clientSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(videoOverlayClientEvent)), view, nullptr);
+    g_source_attach(overlay->clientSource.get(), g_main_context_get_thread_default());
+    g_message("WPEViewDRM video overlay: client connected");
+    return G_SOURCE_CONTINUE;
+}
+
+static void videoOverlayStart(WPEViewDRM* view)
+{
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    const auto* plane = wpeDisplayDRMGetVideoOverlayPlane(display);
+    if (!plane)
+        return;
+
+    const char* path = videoOverlaySocketPath();
+    struct sockaddr_un address = { };
+    if (strlen(path) >= sizeof(address.sun_path)) {
+        g_warning("WPEViewDRM video overlay: socket path too long: %s", path);
+        return;
+    }
+
+    int listenFD = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (listenFD < 0)
+        return;
+
+    unlink(path);
+    address.sun_family = AF_UNIX;
+    strcpy(address.sun_path, path);
+    if (bind(listenFD, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) || listen(listenFD, 1)) {
+        g_warning("WPEViewDRM video overlay: failed to listen on %s: %s", path, strerror(errno));
+        close(listenFD);
+        return;
+    }
+
+    auto* overlay = new VideoOverlayState();
+    overlay->view = view;
+    overlay->listenFD = listenFD;
+    overlay->plane = plane;
+    overlay->primaryZposRestore = wpeDisplayDRMGetPrimaryPlane(display).properties().zpos.second;
+    view->priv->videoOverlay = overlay;
+
+    overlay->listenSource = adoptGRef(g_unix_fd_source_new(listenFD, static_cast<GIOCondition>(G_IO_IN | G_IO_ERR | G_IO_HUP)));
+    g_source_set_name(overlay->listenSource.get(), "WPE DRM video overlay listener");
+    g_source_set_callback(overlay->listenSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(videoOverlayAccept)), view, nullptr);
+    g_source_attach(overlay->listenSource.get(), g_main_context_get_thread_default());
+    g_message("WPEViewDRM video overlay: listening on %s (plane %u)", path, plane->id());
+}
+
+static void videoOverlayStop(WPEViewDRM* view)
+{
+    auto* overlay = view->priv->videoOverlay;
+    if (!overlay)
+        return;
+    videoOverlayDropClient(view);
+    if (overlay->listenSource) {
+        g_source_destroy(overlay->listenSource.get());
+        overlay->listenSource = nullptr;
+    }
+    if (overlay->listenFD >= 0) {
+        close(overlay->listenFD);
+        overlay->listenFD = -1;
+    }
+    unlink(videoOverlaySocketPath());
+    delete overlay;
+    view->priv->videoOverlay = nullptr;
 }
 
 static bool wpeViewDRMCommitLegacy(WPEViewDRM* view, const DRMScanoutBuffer& buffer, GError** error)

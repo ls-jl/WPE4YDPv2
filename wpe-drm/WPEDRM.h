@@ -127,6 +127,7 @@ public:
         Property fbDamageClips { 0, 0 };
         Property inFenceFD { 0, 0 };
         Property rotation { 0, 0 };
+        Property zpos { 0, 0 };
     };
 
     struct Format {

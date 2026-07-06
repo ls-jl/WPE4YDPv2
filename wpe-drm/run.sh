@@ -79,6 +79,14 @@ export MSE_MAX_BUFFER_SIZE="${MSE_MAX_BUFFER_SIZE:-V:40M,A:8M}"
 export WPE_TOUCH_HORIZONTAL_SCROLL="${WPE_TOUCH_HORIZONTAL_SCROLL:-1}"
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
 
+# 视频 KMS overlay 直出（hole-punch）：mppvideodec 解码 NV12 dmabuf 经 RGA
+# 预旋转后直接放 DRM overlay plane，跳过软件颜色转换与 Skia 合成。
+# WPE_VIDEO_OVERLAY=0 一键回退纯软件视频路径。
+if [ "${WPE_VIDEO_OVERLAY:-1}" = "1" ]; then
+    export WEBKIT_GST_HOLE_PUNCH_QUIRK="${WEBKIT_GST_HOLE_PUNCH_QUIRK:-rockchip}"
+    export WPE_VIDEO_OVERLAY_SOCKET="${WPE_VIDEO_OVERLAY_SOCKET:-$VAR_DIR/wpe-video-overlay.sock}"
+fi
+
 # 单任务内存倾斜：浏览器是前台唯一任务，把内存尽量让给它。
 # - oom_score_adj -600：内核 OOM 时优先杀其他进程（子进程继承）
 # - drop_caches：启动前释放系统攒的页缓存
