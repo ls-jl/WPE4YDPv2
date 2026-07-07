@@ -1,192 +1,99 @@
 # WPE4YDPv2
 
-词典笔 Direct WPE 浏览器壳。当前主线不是 MiniApp canvas/RGBFrame 刷图，而是：
+词典笔（Rockchip RK3562，1GB RAM / 4×A53 / 960x266 长条屏 / 无 GPU / 有 VPU+RGA）上的 Direct WPE 浏览器。整体链路：
 
 ```text
-MiniApp 启动壳 -> frame 页全屏 <hole> -> JSAPI fork/exec 包内 WPE runtime -> WPE 直接 DRM overlay 出屏
+MiniApp 启动壳 -> frame 页全屏 <hole> -> JSAPI fork/exec 包内 WPE runtime -> WPE 直接 DRM 出屏
+                                                     └-> 视频走独立 KMS overlay plane 直出（hole-punch）
 ```
 
-MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` 承载页；网页渲染、原生工具栏、触摸、滚动和 DRM 提交都由包内 WPE runtime 处理。
+MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` 承载页；网页渲染、原生工具栏、触摸滚动、DRM 提交和视频直出都由包内 WPE runtime（定制 WebKit 2.53.3 WPE port）完成。
 
-## 当前能力
+## 核心特性
 
-- 手动启动浏览器，默认不自动抢占 DRM。
-- 两种显示模式：
-  - 原生模式：WPE 方向跟 MiniApp/系统配置方向一致。
-  - 横屏旋转：在系统方向基础上旋转到横屏方向，用于横屏浏览体验。
-- 包内 WPE runtime：安装后直接从 `assets/wpe-runtime/` 运行，不再依赖外部 `/userdisk/wpe-drm2`。
-- 全屏 `<hole>`：MiniApp plane 挖洞露出下方 WPE DRM plane。
-- 系统配置自适应：优先读取 `/etc/miniapp/resources/cfg.json`，并结合 DRM mode 和 MiniApp hole 尺寸解析 `panelSize/drmMode/viewport/rotation/touchRotation`。
-- 系统键盘桥：WPE 写请求文件，MiniApp 拉起 HaasUI 键盘，再把确认结果写回 WPE。
-- 内置字体、CA 证书、Mesa 软件渲染、GStreamer 运行库和 WPE/WebKit 运行资源。
+- **包内自包含 runtime**：WebKit、Mesa 软渲染、GStreamer（含从设备拷入的 MPP 硬解/ALSA 等 13 个插件）、字体、CA 证书全部随包，安装后不依赖任何外部目录。
+- **视频 KMS overlay 直出（hole-punch）**：`mppvideodec` VPU 硬解 + RGA 硬件预旋转输出 NV12 dmabuf，经 unix socket 送 UI 进程放到空闲 Esmart overlay plane 直接扫描输出；页面合成器在视频区域打透明洞，zpos 分层保证弹幕/控件叠加正常。视频播放时全系统 ~74% idle（旧软件路径 videoconvert 一项即吃满多核）。抖音（MSE）与 bilibili 实测通过。`WPE_VIDEO_OVERLAY=0` 一键回退纯软件路径；同时仅一路直出，第二路视频自动走软件回退。
+- **内核按机型深度定制**：`-mcpu=cortex-a53` + ThinLTO + **PGO**（抖音/bilibili/百度等真机负载采样 profile-use）；裁剪 SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JS shell / PDFJS / MATHML / GPU_PROCESS；源码级 patch：tile 预取 2×→1×、soup 连接数调优、damage 传播 WPE 默认开启（CPU 合成只重绘脏区）。lib 174MB → 154MB。
+- **低内存自保**：内存上限按物理内存 68% 动态设定（1GB 机型 673MB，kill 阈值 0.92）；同一 URL 120 秒内被杀 3 次自动回主页的崩溃熔断；MSE 每 SourceBuffer 上限 304MB→40M(V)/8M(A)；JSC forceRAMSize/JIT 阈值等按 512MB 预算调优（见 `wpe-drm/run.sh` 注释）。
+- **单任务内存倾斜**：浏览器 oom_score_adj=-600、启动时 drop_caches、运行期 swappiness=100（退出恢复），后台进程冷页压进 512MB swap。
+- **移动 UA + 站点档案**：默认 Android Chrome UA；支持按站点切换 desktop/mobile 档案。
+- 原生工具栏 `inset` 布局（显隐不 resize WebView）、横向滚动、系统键盘桥、双显示模式（原生/横屏旋转）。
 
 ## 目录结构
 
-- `src/`：MiniApp 前端壳。
-  - `src/pages/index/`：启动页，显示模式选择、启动入口。
-  - `src/pages/frame/`：全屏 `<hole>` 承载页，负责启动/停止 WPE、watchdog、键盘桥轮询。
-  - `src/utils/display-resolver.js`、`browser-lifecycle.js`、`keyboard-bridge.js`：显示解析、WPE 生命周期和键盘桥逻辑。
-  - `src/utils/keyboard.js`：HaasUI 系统键盘封装。
-- `jsapi/`：MiniApp native JSAPI 源码，模块名 `browser`。
-- `libs/`：打包用 JSAPI so。
-  - `libs/arm64-orange/libjsapi_browser.so`：设备 ABI 目录下的实际 so（唯一入库源）。
-  - `libs/libjsapi_browser_12345.so`：MiniApp 模块加载入口用命名，由 `scripts/sync_generated.sh` 在构建前从上面拷贝生成，不入库。
-- `assets/wpe-runtime/`：包内直跑 WPE runtime。
-  - `run.sh`：WPE 启动脚本，由 `scripts/sync_generated.sh` 从 `wpe-drm/run.sh`（唯一维护源）拷贝生成。
-  - `wpe-drm-minimal`：Direct DRM WPE 启动器。
-  - `lib/`、`libexec/`、`share/`：WPE/WebKit/Mesa/GStreamer 等运行依赖。
-  - `etc/ssl/certs/ca-certificates.crt`：HTTPS 证书包。
-  - `assets/fonts/`：内置字体。
-- `wpe-drm/`：Direct DRM WPE 启动器和 DRM view 源码镜像。
-- `tools/RUNTIME_SIZE_REPORT.md`：当前 runtime 体积清单和后续瘦身建议。
-- `tools/`：开发文档。
-  - `tools/DRM_HOLE_RENDERING_PIPELINE.md`：DRM 出屏到 MiniApp `<hole>` 展示的完整链路文档。
-  - `tools/KEYBOARD_INPUT.md`：系统键盘调用参考。
-  - `tools/miniapp_docs.md`：MiniApp 文档整理。
-- `debug/`：本地调试页面（含 benchmark/*-test.html 等测试页，不随 runtime 打包）和触摸校准辅助文件。
-- `8001779591038449.1_0_0.amr`：当前打包产物（不入库）。
+- `src/`：MiniApp 前端壳（`pages/index` 启动页、`pages/frame` 全屏 hole 承载页、`utils/` 显示解析/生命周期/键盘桥）。
+- `jsapi/`：MiniApp native JSAPI（模块名 `browser`）源码。
+- `libs/arm64-orange/libjsapi_browser.so`：JSAPI so（唯一入库源；`libs/libjsapi_browser_12345.so` 由构建脚本生成，不入库）。
+- `assets/wpe-runtime/`：包内 WPE runtime。
+  - `run.sh`：启动脚本（由 `scripts/sync_generated.sh` 从 `wpe-drm/run.sh` 单源同步），所有运行期调优 env 的唯一维护处。
+  - `wpe-drm-minimal`：Direct DRM 浏览器壳（chrome 工具栏/多标签/历史/键盘桥/崩溃熔断）。
+  - `lib/libWPEWebKit-2.0.so.1.10.2`：定制 WebKit（Git LFS）。`lib/gstreamer-1.0/` 含设备拷入的解码插件。
+- `wpe-drm/`：**服务器 WebKit 树对应文件的本地镜像**（改动须双向同步）：
+  - `wpe-drm-minimal.c`、`run.sh`：应用层。
+  - `WPEViewDRM.cpp`（含 VideoOverlay 模块）、`WPEDisplayDRM.cpp/Private.h`、`WPEDRM.h/cpp`：WPEPlatform DRM 后端，对应 `Source/WebKit/WPEPlatform/wpe/drm/`。
+  - `GStreamerHolePunchQuirkRockchip.{h,cpp}`：视频直出 WebProcess 端 quirk，对应 `Source/WebCore/platform/gstreamer/`。
+- `tools/`：文档（`DRM_HOLE_RENDERING_PIPELINE.md` 出屏链路、`KEYBOARD_INPUT.md`、`RUNTIME_SIZE_REPORT.md` 体积清单）。
+- `debug/`：本地调试页（不随包）。
+- `8001779591038449.1_0_0.amr`：打包产物（Git LFS 入库）。
 
-## 构建
+## 构建与打包
 
 ```sh
-npm run build
+npm run build          # 产出 8001779591038449.1_0_0.amr
 ```
 
-构建前会自动执行 `scripts/sync_generated.sh`，把单源文件（`wpe-drm/run.sh`、`libs/arm64-orange/libjsapi_browser.so`）同步到打包位置。
-
-如果构建缓存中存在损坏的 runtime symlink，先清理缓存再构建：
+构建前自动执行 `scripts/sync_generated.sh` 同步单源文件。**assets 变更后打包若报 xkb 相关 ENOENT，先清缓存**：
 
 ```sh
-rm -rf .falcon_ .falcon_tmp
-npm run build
+rm -rf .falcon_ .falcon_tmp && npm run build
 ```
 
-构建成功后会生成：
+WebKit 内核与 `wpe-drm-minimal` 在 arm64 交叉编译服务器上构建（cmake 配置、PGO 采样重编流程、jsc shim 等细节较多，团队内部见构建服务器 `~/wpe-lite2/stripped/`；`wpe-drm/` 镜像文件改动后拷到服务器 WebKit 树重链，产物回填 `assets/wpe-runtime/`）。
 
-```text
-8001779591038449.1_0_0.amr
-```
+## 运行
 
-常见构建警告：
+1. 安装 amr（`miniapp_cli install <amr>`）。
+2. 启动 MiniApp 进入 `index` 启动页，选显示模式，点启动浏览器；或直接 `miniapp_cli start 8001779591038449 frame`。
+3. `frame` 页显示全屏 `<hole>`，WPE 从包内 runtime 起并直接 DRM 出屏。Home/退出时 JSAPI 停 WPE 释放 DRM。
 
-- `theme-default` 缺失：当前项目不依赖该主题，通常可忽略。
-- `browser/global` 模块无法静态解析：这是设备端 native JSAPI / HaasUI 模块，构建期警告通常可忽略。
+可写数据在 `$dataDir/browser/`：`wpe-drm.log`（每次启动截断重写）、`browser-state.ini`（标签/主页持久化）、`chrome-render-state.ini`、`keyboard/`、`fontconfig-cache/` 等。
 
-## 运行方式
+### 常用运行期开关（env，均有默认值，详见 run.sh）
 
-1. 安装 AMR 到设备。
-2. 启动 MiniApp 后停留在 `index` 启动页。
-3. 选择显示模式：
-   - `原生模式`：跟随设备 MiniApp 框架方向。
-   - `横屏旋转`：浏览器画面旋转到横屏方向。
-4. 点击 `启动浏览器`。
-5. 进入 `frame` 页后，MiniApp 显示全屏 `<hole>`，WPE 从包内 runtime 启动并通过 DRM overlay 出屏。
-
-Home 或页面退出时，`frame` 会调用 JSAPI 停止 WPE，释放 DRM plane。重新进入 MiniApp 后仍回到启动页，不会自动启动浏览器。
-
-## 关键运行路径
-
-安装后 runtime 应来自 MiniApp 包目录：
-
-```text
-$workspace/assets/wpe-runtime
-```
-
-可写数据仍放在 `$dataDir/browser/`：
-
-```text
-$dataDir/browser/wpe-drm.log
-$dataDir/browser/browser.pid
-$dataDir/browser/browser-state.ini
-$dataDir/browser/chrome-render-state.ini
-$dataDir/browser/keyboard/
-$dataDir/browser/runtime-tmp/
-$dataDir/browser/fontconfig-cache/
-$dataDir/browser/gst-registry.bin
-```
-
-不应该再依赖外部：
-
-```text
-/userdisk/wpe-drm2
-/userdisk/mesa
-/userdisk/chroot/rootfs/debian-12-arm64/opt/wpe-hostabi
-```
-
-默认也不加载系统 GStreamer 插件目录。需要调试系统 VPU/音频插件时显式设置：
-
-```sh
-WPE_USE_SYSTEM_GST=1
-```
-
-此时可通过 `WPE_SYSTEM_GST_PLUGIN_DIR` 指定系统插件目录；否则只使用包内 `assets/wpe-runtime/lib/gstreamer-1.0`。
-
-`WPE_CHROME_LAYOUT` 默认是 `inset`：WPE 原生工具栏显示/隐藏时不 resize WebView，只在 WPE framebuffer 合成阶段做视觉让位和坐标扣减。`resize` 仅作为调试开关保留。
-
-注意：`rotation=0` 且走 `dma_heap` zero-copy 直扫时不会绘制 WPE native toolbar，这是当前性能优先路径的预期行为；需要工具栏时使用旋转/CPU 合成路径，或后续实现独立 DRM plane toolbar。
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `WPE_VIDEO_OVERLAY` | `1` | 视频 KMS overlay 直出，`0` 回退软件路径 |
+| `WPE_CHROME_LAYOUT` | `inset` | 工具栏让位方式，`resize` 仅调试 |
+| `WPE_USE_SYSTEM_GST` | `0` | `1` 时附加系统 GStreamer 插件目录（调试用） |
+| `WPE_TOUCH_HORIZONTAL_SCROLL` | `1` | 宽页横向滑动 |
+| `WEBKIT_SKIA_ENABLE_CPU_RENDERING` | `1` | Skia 原生 CPU 光栅化（勿走软件 GL 模拟） |
+| `WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS` | `30` | 合成帧率上限 |
+| `MSE_MAX_BUFFER_SIZE` | `V:40M,A:8M` | MSE 每 SourceBuffer 缓冲上限 |
 
 ## 设备调试
 
-查看进程：
-
 ```sh
-adb shell "ps | grep -E 'wpe-drm-minimal|WPEWebProcess|WPENetworkProcess|WPEGPUProcess'"
+adb shell "ps | grep -E 'wpe-drm-minimal|WPEWebProcess|WPENetworkProcess'"
+adb shell "tail -n 200 /userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449/data/browser/wpe-drm.log"
+adb shell "cat /sys/kernel/debug/dri/0/state"        # DRM plane 状态（视频直出看 Esmart overlay plane 是否挂 NV12 fb）
+adb shell "killall wpe-drm-minimal WPEWebProcess WPENetworkProcess"
 ```
 
-查看 WPE 日志：
+热替换内核 lib 的坑：**amr 安装时会把 lib 符号链接实体化成 `.so`/`.so.1`/`.so.1.10.2` 三份完整拷贝，动态链接器按 soname 加载 `.so.1`**——只推 `.so.1.10.2` 不生效。热替换后在设备上把 `.so.1`/`.so` 改回指向 `.so.1.10.2` 的软链（还能省 322MB 闪存）。重启浏览器需先 `start ... index` 再 `start ... frame`（停在 frame 页时重复 start 是 no-op）。
 
-```sh
-adb shell "find /userdisk -name wpe-drm.log 2>/dev/null | head"
-adb shell "tail -n 200 <日志路径>"
-```
-
-查看 DRM state：
-
-```sh
-adb shell "cat /sys/kernel/debug/dri/0/state"
-```
-
-清理残留 WPE 进程：
-
-```sh
-adb shell "killall wpe-drm-minimal WPEWebProcess WPENetworkProcess WPEGPUProcess 2>/dev/null || true"
-```
-
-保持屏幕亮起：
-
-```sh
-adb shell "hal-screen keep"
-```
+远程导航技巧：改 `$dataDir/browser/browser-state.ini` 的 `[tab0] url=` 后重启浏览器即恢复到该页。
 
 ## Git / 大文件
 
-本仓库使用 Git LFS 保存超大产物：
-
-- `assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2`
-
-打包产物 `*.amr`、CMake 构建目录 `build-jsapi-host/` 与生成的 `libs/libjsapi_browser_12345.so` 均不入库。
-
-首次克隆后需要确保本机可用 Git LFS：
+Git LFS 管理超大文件：`assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2`、`*.amr` 打包产物。克隆后：
 
 ```sh
-git lfs install
-git lfs pull
+git lfs install && git lfs pull
 ```
 
-缓存和中间产物不应提交：
+`libs/libjsapi_browser_12345.so`、`.falcon_/` 等生成物与缓存不入库。
 
-```text
-.cache/
-.falcon_/
-.falcon_tmp/
-.rollback/
-```
+## 后续方向
 
-## 详细文档
-
-Direct DRM 出屏、buffer 路径、WPE plane 与 MiniApp `<hole>` 合成、触摸/键盘桥、常见故障排查，见：
-
-```text
-tools/DRM_HOLE_RENDERING_PIPELINE.md
-```
-1
+- 视频 overlay 二期：无 RGA 场景 CPU NV12 旋转兜底；plane 空闲时 in-fence 同步。
+- runtime 瘦身：见 `tools/RUNTIME_SIZE_REPORT.md`。

@@ -13,7 +13,7 @@ build/
 build-jsapi-host/
 
 # MiniApp packaged artifacts
-*.amr
+# *.amr 打包产物经 Git LFS 入库（见 .gitattributes）
 
 # Device/runtime archives
 *.tar
