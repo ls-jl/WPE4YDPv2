@@ -5,7 +5,7 @@
 ## Largest Libraries
 
 ```text
-154M  lib/libWPEWebKit-2.0.so.1.10.2（2026-07-07 重编：-mcpu=cortex-a53 + ThinLTO + 裁剪 SAMPLING_PROFILER/REMOTE_INSPECTOR/WEBDRIVER/JSSHELL/PDFJS/MATHML/GPU_PROCESS）
+147M  lib/libWPEWebKit-2.0.so.1.10.2（2026-07-07 重编：-mcpu=cortex-a53 + ThinLTO + PGO（抖音/bilibili/百度真机采样 profile-use）+ 裁剪 SAMPLING_PROFILER/REMOTE_INSPECTOR/WEBDRIVER/JSSHELL/PDFJS/MATHML/GPU_PROCESS + Rockchip hole-punch 视频 KMS overlay 直出）
  30M  lib/libicudata.so.72.1
  10M  lib/libgio-2.0.so.0
 5.4M  lib/libepoxy.so.0
