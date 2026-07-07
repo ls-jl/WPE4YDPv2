@@ -253,6 +253,22 @@ if [ -z "$WPE_DRM_DMA_HEAP" ]; then
         *) WPE_DRM_DMA_HEAP=/dev/dma_heap/system ;;
     esac
 fi
+# 2026-04 起的新内核可能没有 dma_heap 节点（实测 5.10.160 #6 黑屏根因：
+# WPE_DRM_BUFFER_PATH=dma_heap 强制路径无回退，WebProcess 产不出帧）。
+# 先在同目录里找可用 heap，全都没有就回退 SHM 路径。
+if [ ! -e "$WPE_DRM_DMA_HEAP" ]; then
+    for heap in /dev/dma_heap/system /dev/dma_heap/system-uncached /dev/dma_heap/*; do
+        if [ -e "$heap" ]; then
+            WPE_DRM_DMA_HEAP="$heap"
+            break
+        fi
+    done
+fi
+if [ ! -e "$WPE_DRM_DMA_HEAP" ]; then
+    echo "WPE warn: no dma_heap device available, falling back to SHM buffer path"
+    export WPE_DRM_FORCE_SHM=1
+    export WPE_DRM_BUFFER_PATH=shm
+fi
 export WPE_DRM_DMA_HEAP
 printf '%s\n' "$ROTATION" >"$WPE_DRM_ROTATION_FILE" 2>/dev/null || true
 echo "WPE launch: url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP keyboard_dir=$WPE_KEYBOARD_DIR"
