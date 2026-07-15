@@ -1,5 +1,7 @@
 # WPE4YDPv2
 
+[English](README.en.md) | 中文
+
 词典笔（Rockchip RK3562，1GB RAM / 4×A53 / 960x266 长条屏 / 无 GPU / 有 VPU+RGA）上的 Direct WPE 浏览器。整体链路：
 
 ```text
@@ -7,14 +9,14 @@ MiniApp 启动壳 -> frame 页全屏 <hole> -> JSAPI fork/exec 包内 WPE runtim
                                                      └-> 视频走独立 KMS overlay plane 直出（hole-punch）
 ```
 
-MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` 承载页；网页渲染、原生工具栏、触摸滚动、DRM 提交和视频直出都由包内 WPE runtime（定制 WebKit + Direct DRM 壳）承担。
+MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` 承载页；网页渲染、原生工具栏、触摸滚动、DRM 提交和视频直出都由包内 WPE runtime（定制 WebKit + `wpe-drm-minimal`）负责。
 
 ## 核心特性
 
 - **包内自包含 runtime**：WebKit、Mesa 软渲染、GStreamer（含从设备拷入的 MPP 硬解/ALSA 等 13 个插件）、字体、CA 证书全部随包，安装后不依赖任何外部目录。
 - **视频 KMS overlay 直出（hole-punch）**：`mppvideodec` VPU 硬解 + RGA 硬件预旋转输出 NV12 dmabuf，经 unix socket 送 UI 进程放到空闲 Esmart overlay plane 直接扫描输出。
-- **内核按机型深度定制**：`-mcpu=cortex-a53` + ThinLTO + **PGO**（抖音/bilibili/百度等真机负载采样 profile-use）；裁剪 SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL 等。
-- **低内存自保**：内存上限按物理内存 68% 动态设定（1GB 机型 673MB，kill 阈值 0.92）；同一 URL 120 秒内被杀 3 次自动回主页的崩溃熔断；MSE 每 SourceBuffer 限流。
+- **内核按机型深度定制**：`-mcpu=cortex-a53` + ThinLTO + **PGO**（抖音/bilibili/百度等真机负载采样 profile-use）；裁剪 SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS 等。
+- **低内存自保**：内存上限按物理内存 68% 动态设定（1GB 机型 673MB，kill 阈值 0.92）；同一 URL 120 秒内被杀 3 次自动回主页的崩溃熔断；MSE 每 SourceBuffer 缓冲上限。
 - **单任务内存倾斜**：浏览器 oom_score_adj=-600、启动时 drop_caches、运行期 swappiness=100（退出恢复），后台进程冷页压进 512MB swap。
 - **移动 UA + 站点档案**：默认 Android Chrome UA；支持按站点切换 desktop/mobile 档案。
 - 原生工具栏 `inset` 布局（显隐不 resize WebView）、横向滚动、系统键盘桥、双显示模式（原生/横屏旋转）。
@@ -32,7 +34,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `wpe-drm-minimal.c`、`run.sh`：应用层。
   - `WPEViewDRM.cpp`（含 VideoOverlay 模块）、`WPEDisplayDRM.cpp/Private.h`、`WPEDRM.h/cpp`：WPEPlatform DRM 后端，对应 `Source/WebKit/WPEPlatform/wpe/drm/`。
   - `GStreamerHolePunchQuirkRockchip.{h,cpp}`：视频直出 WebProcess 端 quirk，对应 `Source/WebCore/platform/gstreamer/`。
-  - `webkit-patches/`：**服务器 WebKit 树里其他子系统的源码级补丁**（按 `Source/` 原始路径镜像），清单和原因见 `webkit-patches/README.md`——包括 dma-heap 黑名单探测、hole-punch quirk 注册、RGA 预旋转、tile 预取倍数、连接数调优等。
+  - `webkit-patches/`：**服务器 WebKit 树里其他子系统的源码级补丁**（按 `Source/` 原始路径镜像），清单和原因见 `webkit-patches/README.md`——包括 dma-heap 黑名单等。
 - `tools/`：文档（`DRM_HOLE_RENDERING_PIPELINE.md` 出屏链路、`KEYBOARD_INPUT.md`、`RUNTIME_SIZE_REPORT.md` 体积清单）。
 - `debug/`：本地调试页（不随包）。
 - `8001779591038449.1_0_0.amr`：打包产物（Git LFS 入库）。
@@ -49,7 +51,7 @@ npm run build          # 产出 8001779591038449.1_0_0.amr
 rm -rf .falcon_ .falcon_tmp && npm run build
 ```
 
-WebKit 内核与 `wpe-drm-minimal` 在 arm64 交叉编译服务器上构建（cmake 配置、PGO 采样重编流程、jsc shim 等细节较多，团队内部见构建服务器 `~/wpe-lite2/stripped/`）。
+WebKit 内核与 `wpe-drm-minimal` 在 arm64 交叉编译服务器上构建（cmake 配置、PGO 采样重编流程、jsc shim 等细节较多，团队内部见构建服务器 `~/wpe-lite2/stripped/...` 文档）。
 
 ## 运行
 
@@ -80,7 +82,7 @@ adb shell "cat /sys/kernel/debug/dri/0/state"        # DRM plane 状态（视频
 adb shell "killall wpe-drm-minimal WPEWebProcess WPENetworkProcess"
 ```
 
-热替换内核 lib 的坑：**amr 安装时会把 lib 符号链接实体化成 `.so`/`.so.1`/`.so.1.10.2` 三份完整拷贝，动态链接器按 soname 加载 `.so.1`**——只推 `.so.1.10.2` 不够，三份都要同步替换。
+热替换内核 lib 的坑：**amr 安装时会把 lib 符号链接实体化成 `.so`/`.so.1`/`.so.1.10.2` 三份完整拷贝，动态链接器按 soname 加载 `.so.1`**——只推 `.so.1.10.2` 不够，需三份同时替换。
 
 远程导航技巧：改 `$dataDir/browser/browser-state.ini` 的 `[tab0] url=` 后重启浏览器即恢复到该页。
 
@@ -98,7 +100,7 @@ git lfs install && git lfs pull
 
 本项目原创代码（`src/`、`jsapi/`、`scripts/`、`tools/` 等）采用 [MIT License](LICENSE)。
 
-`wpe-drm/` 目录下镜像自 WPE WebKit 项目的文件保留其原始许可证（BSD-2-Clause / LGPL-2.0-or-later），**不受根目录 `LICENSE` 覆盖**。完整的第三方许可清单、适用文件范围及 LGPL 合规注意事项见 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)。
+`wpe-drm/` 目录下镜像自 WPE WebKit 项目的文件保留其原始许可证（BSD-2-Clause / LGPL-2.0-or-later），**不受根目录 `LICENSE` 覆盖**。完整的第三方许可清单、原因见 `wpe-drm/webkit-patches/README.md`。
 
 ## 后续方向
 
