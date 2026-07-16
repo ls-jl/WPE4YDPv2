@@ -88,11 +88,23 @@ adb shell "killall wpe-drm-minimal WPEWebProcess WPENetworkProcess"
 
 ## Git / 大文件
 
-Git LFS 管理超大文件：`assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2`、`*.amr` 打包产物。克隆后：
+Git LFS 管理超大文件：`assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2`、`*.amr` 打包产物。
+
+克隆前先装好 git-lfs 最省事，LFS 内容会随 `git clone` 自动下载：
+
+```sh
+brew install git-lfs   # 或 apt install git-lfs
+git lfs install        # 每台机器装一次即可
+git clone https://github.com/ls-jl/WPE4YDPv2.git
+```
+
+如果已经 clone 过才装 git-lfs，工作区里这两个文件此时只是几十字节的指针文本，需要补拉一次：
 
 ```sh
 git lfs install && git lfs pull
 ```
+
+**注意**：GitHub 网页的 Download ZIP 不会下载 LFS 真实内容（打包出来的还是指针文本），必须走 `git clone`。
 
 `libs/libjsapi_browser_12345.so`、`.falcon_/` 等生成物与缓存不入库。
 
