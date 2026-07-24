@@ -20,12 +20,74 @@ reject_lfs_pointer() {
   fi
 }
 
+validate_webkit_elf() {
+  path="$1"
+  min_size=$((100 * 1024 * 1024))
+  size="$(wc -c <"$path" | tr -d ' ')"
+  description="$(file -b "$path")"
+
+  case "$description" in
+    *ELF*) ;;
+    *)
+      echo "error: WebKit runtime is not an ELF binary: $description" >&2
+      exit 1
+      ;;
+  esac
+  case "$description" in
+    *"missing section headers"*|*"section extending past end of file"*)
+      echo "error: WebKit runtime is truncated: $description" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$size" -lt "$min_size" ]; then
+    echo "error: WebKit runtime is unexpectedly small: $size bytes" >&2
+    exit 1
+  fi
+}
+
 require_file "$ROOT/wpe-drm/run.sh"
 require_file "$ROOT/libs/arm64-orange/libjsapi_browser.so"
+require_file "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
+for runtime_file in \
+  lib/libcrypto.so.3 \
+  lib/libssl.so.3 \
+  lib/libsrtp2.so.2.8.0 \
+  lib/libnice.so.10.14.0 \
+  lib/libgstsctp-1.0.so.0.2212.0 \
+  lib/libgstwebrtc-1.0.so.0.2212.0 \
+  lib/libgstwebrtcnice-1.0.so.0.2212.0 \
+  lib/gstreamer-1.0/libgstnice.so \
+  lib/gstreamer-1.0/libgstrtp.so \
+  lib/gstreamer-1.0/libgstrtpmanager.so \
+  lib/gstreamer-1.0/libgstsrtp.so \
+  lib/gstreamer-1.0/libgstdtls.so \
+  lib/gstreamer-1.0/libgstsctp.so \
+  lib/gstreamer-1.0/libgstwebrtc.so
+do
+  require_file "$ROOT/assets/wpe-runtime/$runtime_file"
+done
 reject_lfs_pointer "$ROOT/libs/arm64-orange/libjsapi_browser.so"
+reject_lfs_pointer "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
+validate_webkit_elf "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
 
 cp "$ROOT/wpe-drm/run.sh" "$ROOT/assets/wpe-runtime/run.sh"
 chmod +x "$ROOT/assets/wpe-runtime/run.sh"
+
+PLUGIN_DIR="$ROOT/assets/wpe-runtime/lib/gstreamer-1.0"
+PLUGIN_FINGERPRINT="$ROOT/assets/wpe-runtime/share/gstreamer-plugin-set.sha256"
+mkdir -p "$(dirname "$PLUGIN_FINGERPRINT")"
+(
+  cd "$PLUGIN_DIR"
+  find . -maxdepth 1 -type f -name '*.so' | LC_ALL=C sort | while IFS= read -r plugin; do
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$plugin"
+    else
+      shasum -a 256 "$plugin"
+    fi
+  done
+) >"$PLUGIN_FINGERPRINT.tmp"
+mv "$PLUGIN_FINGERPRINT.tmp" "$PLUGIN_FINGERPRINT"
+chmod 600 "$PLUGIN_FINGERPRINT"
 
 cp "$ROOT/libs/arm64-orange/libjsapi_browser.so" "$ROOT/libs/libjsapi_browser_12345.so"
 chmod +x "$ROOT/libs/libjsapi_browser_12345.so"

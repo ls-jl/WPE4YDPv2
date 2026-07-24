@@ -244,6 +244,13 @@ void GStreamerQuirksManager::configureElement(GstElement* element, OptionSet<Ele
 
 std::optional<bool> GStreamerQuirksManager::isHardwareAccelerated(GstElementFactory* factory) const
 {
+    if (factory) {
+        const char* factoryName = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+        if (factoryName && !g_strcmp0(factoryName, "mppvideodec")) {
+            GST_DEBUG("Setting %" GST_PTR_FORMAT " as hardware accelerated Rockchip MPP decoder", factory);
+            return true;
+        }
+    }
     for (const auto& quirk : m_quirks) {
         auto result = quirk->isHardwareAccelerated(factory);
         if (!result)

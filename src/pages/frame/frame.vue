@@ -39,6 +39,8 @@ export default {
       keyboard: createKeyboardBridgeState(),
       browserLifecycle: null,
       keyboardBridge: null,
+      pageVisible: true,
+      keyboardHideTimer: null,
     }
   },
   mounted() {
@@ -68,6 +70,7 @@ export default {
       }
     },
     teardownControllers() {
+      this.clearKeyboardHideTimer()
       if (this.keyboardBridge) {
         this.keyboardBridge.teardown()
       }
@@ -102,9 +105,26 @@ export default {
       this.ensureControllers()
       this.keyboardBridge.onTextareaBlur()
     },
+    clearKeyboardHideTimer() {
+      if (!this.keyboardHideTimer) return
+      clearTimeout(this.keyboardHideTimer)
+      this.keyboardHideTimer = null
+    },
+    onKeyboardBridgeInactive() {
+      this.clearKeyboardHideTimer()
+      this.keyboardHideTimer = setTimeout(() => {
+        this.keyboardHideTimer = null
+        if (this.pageVisible || this.keyboardBridge.isActive()) return
+        console.warn('wpe hidden after keyboard closed; stopping browser')
+        this.browserLifecycle.stop()
+      }, 3000)
+    },
     onShow() {
       if (this.isStopOnly()) return
       this.ensureControllers()
+      this.pageVisible = true
+      this.clearKeyboardHideTimer()
+      this.keyboardBridge.reconcileActiveRequest()
       if (!this.browser.leaving) {
         this.browserLifecycle.start()
       }
@@ -112,6 +132,7 @@ export default {
     onHide() {
       console.warn('wpe frame onHide')
       this.ensureControllers()
+      this.pageVisible = false
       if (this.keyboardBridge.isActive()) {
         console.warn('wpe frame onHide ignored while keyboard active')
         return
@@ -121,6 +142,8 @@ export default {
     onUnload() {
       console.warn('wpe frame onUnload')
       this.ensureControllers()
+      this.pageVisible = false
+      this.clearKeyboardHideTimer()
       this.browserLifecycle.stop()
       this.teardownControllers()
     },

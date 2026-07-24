@@ -157,6 +157,37 @@ static bool writeFile(const std::string& path, const std::string& value, mode_t 
     return ok;
 }
 
+static bool writeFileAtomic(const std::string& path, const std::string& value,
+    mode_t mode = 0600, bool syncToDisk = true)
+{
+    ensureDirRecursive(parentDir(path));
+    std::string pattern = path + ".tmp.XXXXXX";
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    int fd = mkstemp(buffer.data());
+    if (fd < 0) return false;
+    fchmod(fd, mode);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    const char* ptr = value.data();
+    size_t left = value.size();
+    bool ok = true;
+    while (left > 0) {
+        ssize_t written = write(fd, ptr, left);
+        if (written <= 0) {
+            ok = false;
+            break;
+        }
+        ptr += written;
+        left -= static_cast<size_t>(written);
+    }
+    if (ok && syncToDisk && fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(buffer.data(), path.c_str()) != 0) ok = false;
+    if (!ok) unlink(buffer.data());
+    if (ok) chmod(path.c_str(), mode);
+    return ok;
+}
+
 static std::string jsonEscape(const std::string& value)
 {
     std::string out;
@@ -273,7 +304,8 @@ static bool prepareKeyboardDirs(const std::string& workdir)
     if (workdir.empty()) return false;
     const std::string keyboardDir = keyboardDirForWorkdir(workdir);
     return ensureDirRecursive(joinPath(keyboardDir, "requests")) &&
-        ensureDirRecursive(joinPath(keyboardDir, "responses"));
+        ensureDirRecursive(joinPath(keyboardDir, "responses")) &&
+        ensureDirRecursive(joinPath(keyboardDir, "status"));
 }
 
 static int waitForProcessExit(pid_t pid, int timeoutMs)
@@ -676,6 +708,7 @@ public:
         const std::string displaySource = getStringProperty(ctx, options, "displaySource", "unknown");
         const std::string browserMode = getStringProperty(ctx, options, "browserMode", "");
         const std::string touchDevice = getStringProperty(ctx, options, "touchDevice", "");
+        const std::string gpuMode = getStringProperty(ctx, options, "gpuMode", "auto");
         const std::string drm = getStringProperty(ctx, options, "drm", "/dev/dri/card0");
         const int rotation = getIntProperty(ctx, options, "rotation", kDefaultRotation);
         const int touchRotation = getIntProperty(ctx, options, "touchRotation", rotation);
@@ -709,6 +742,7 @@ public:
         }
         removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "requests"));
         removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "responses"));
+        removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "status"));
         if (!prepareKeyboardDirs(workdir)) {
             throwError(info, std::string("keyboard dir mkdir failed: ") + keyboardDirForWorkdir(workdir));
             return;
@@ -733,7 +767,7 @@ public:
             setpgid(0, 0);
             chdir(runtimePath.c_str());
 
-            int logFd = open(logPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0666);
+            int logFd = open(logPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
             if (logFd >= 0) {
                 dup2(logFd, STDOUT_FILENO);
                 dup2(logFd, STDERR_FILENO);
@@ -744,6 +778,10 @@ public:
             setenv("WPE_VAR_DIR", workdir.c_str(), 1);
             setenv("WPE_CHROME_STATE", joinPath(workdir, "browser-state.ini").c_str(), 1);
             setenv("WPE_CHROME_RENDER_STATE", joinPath(workdir, "chrome-render-state.ini").c_str(), 1);
+            setenv("WPE_BROWSER_DB", joinPath(workdir, "browser.sqlite3").c_str(), 1);
+            setenv("WPE_PROFILES_DIR", joinPath(workdir, "profiles").c_str(), 1);
+            setenv("WPE_PROFILE_SWITCH_FILE", joinPath(workdir, "profile-switch.request").c_str(), 1);
+            setenv("WPE_CHROME_FONT", joinPath(runtimePath, "assets/fonts/miniapp/NotoSansSC-Regular.otf").c_str(), 1);
             setenv("WPE_KEYBOARD_DIR", keyboardDirForWorkdir(workdir).c_str(), 1);
             setenv("WPE_DRM_RUNTIME_DIR", joinPath(workdir, "runtime-tmp").c_str(), 1);
             setenv("WPE_DRM_SKIP_MASTER", "1", 0);
@@ -763,6 +801,7 @@ public:
             setenv("WPE_PANEL_ROTATION", rotationValue.c_str(), 1);
             setenv("WPE_TOUCH_ROTATION", touchRotationValue.c_str(), 1);
             if (!touchDevice.empty()) setenv("WPE_TOUCH_DEVICE", touchDevice.c_str(), 1);
+            setenv("WPE_GPU_MODE", gpuMode.c_str(), 1);
             const std::string touchOffsetXValue = std::to_string(touchOffsetX);
             const std::string touchOffsetYValue = std::to_string(touchOffsetY);
             setenv("WPE_TOUCH_OFFSET_X", touchOffsetXValue.c_str(), 1);
@@ -879,6 +918,28 @@ public:
         info.GetReturnValue().Set(readFile(requestPath));
     }
 
+    void pollKeyboardCompletion(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        const std::string id = getStringProperty(ctx, options, "id", "");
+        if (workdir.empty() || !isSafeKeyboardId(id)) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+        const std::string statusPath = joinPath(
+            joinPath(keyboardDirForWorkdir(workdir), "status"), id + ".json");
+        struct stat st;
+        if (stat(statusPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+        const std::string value = readFile(statusPath);
+        unlink(statusPath.c_str());
+        info.GetReturnValue().Set(value);
+    }
+
     void respondKeyboardRequest(JQFunctionInfo& info)
     {
         JSContext* ctx = info.GetContext();
@@ -887,6 +948,7 @@ public:
         const std::string id = getStringProperty(ctx, options, "id", "");
         const bool confirmed = getBoolProperty(ctx, options, "confirmed", false);
         const std::string text = getStringProperty(ctx, options, "text", "");
+        const int sequence = std::max(0, getIntProperty(ctx, options, "sequence", 0));
 
         if (workdir.empty()) {
             throwError(info, "workdir is empty");
@@ -904,11 +966,14 @@ public:
         const std::string keyboardDir = keyboardDirForWorkdir(workdir);
         const std::string responsesDir = joinPath(keyboardDir, "responses");
         const std::string responsePath = joinPath(responsesDir, id + (confirmed ? ".ok" : ".cancel"));
-        if (!writeFile(responsePath, confirmed ? text : "", 0600, true)) {
+        std::ostringstream payload;
+        payload << "{\"sequence\":" << sequence;
+        if (confirmed) payload << ",\"text\":\"" << jsonEscape(text) << "\"";
+        payload << "}";
+        if (!writeFileAtomic(responsePath, payload.str(), 0600, true)) {
             throwError(info, std::string("keyboard response write failed: ") + responsePath + ": " + std::strerror(errno));
             return;
         }
-        unlink(joinPath(joinPath(keyboardDir, "requests"), "current.json").c_str());
         publishState("keyboard_response", id + (confirmed ? ":ok" : ":cancel"));
         info.GetReturnValue().Set(true);
     }
@@ -920,6 +985,7 @@ public:
         const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
         const std::string id = getStringProperty(ctx, options, "id", "");
         const std::string text = getStringProperty(ctx, options, "text", "");
+        const int sequence = std::max(0, getIntProperty(ctx, options, "sequence", 0));
 
         if (workdir.empty()) {
             throwError(info, "workdir is empty");
@@ -936,7 +1002,9 @@ public:
 
         const std::string keyboardDir = keyboardDirForWorkdir(workdir);
         const std::string updatePath = joinPath(joinPath(keyboardDir, "responses"), id + ".update");
-        if (!writeFile(updatePath, text, 0600, false)) {
+        std::ostringstream payload;
+        payload << "{\"sequence\":" << sequence << ",\"text\":\"" << jsonEscape(text) << "\"}";
+        if (!writeFileAtomic(updatePath, payload.str(), 0600, false)) {
             throwError(info, std::string("keyboard update write failed: ") + updatePath + ": " + std::strerror(errno));
             return;
         }
@@ -1118,6 +1186,7 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("stopBrowser", &JSBrowserPlayer::stopBrowser);
     tpl->SetProtoMethod("isBrowserRunning", &JSBrowserPlayer::isBrowserRunning);
     tpl->SetProtoMethod("pollKeyboardRequest", &JSBrowserPlayer::pollKeyboardRequest);
+    tpl->SetProtoMethod("pollKeyboardCompletion", &JSBrowserPlayer::pollKeyboardCompletion);
     tpl->SetProtoMethod("updateKeyboardRequest", &JSBrowserPlayer::updateKeyboardRequest);
     tpl->SetProtoMethod("respondKeyboardRequest", &JSBrowserPlayer::respondKeyboardRequest);
     tpl->SetProtoMethod("getKeyboardProfile", &JSBrowserPlayer::getKeyboardProfile);

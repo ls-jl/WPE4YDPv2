@@ -4,17 +4,20 @@ export function createKeyboardBridgeState() {
   return {
     profileMode: 'globalOnly',
     profileReason: 'default',
+    phase: 'idle',
     session: null,
     pollTimer: null,
     pollTick: 0,
-    activeUntil: 0,
     activeRequest: null,
+    sequence: 0,
+    lastUpdateText: null,
+    completionDeadline: 0,
+    completedRequestIds: {},
     textareaVisible: false,
     textareaFocused: false,
     textareaValue: '',
     textareaInputType: 'ZhCNPreferred',
     textareaMaxlength: 512,
-    textareaActive: false,
     textareaSeenInput: false,
   }
 }
@@ -28,10 +31,9 @@ function normalizeKeyboardText(value) {
       return value.records[0].text
     }
   }
-  if (typeof value === 'string') {
+  if (typeof value === 'string' && value.trim().charAt(0) === '{') {
     try {
-      const parsed = JSON.parse(value)
-      return normalizeKeyboardText(parsed) || value
+      return normalizeKeyboardText(JSON.parse(value))
     } catch (err) {
       return value
     }
@@ -59,10 +61,7 @@ export class KeyboardBridge {
     this.readProfile()
     if (this.state.session || this.state.profileMode !== 'globalOnly') return
     this.state.session = new KeyboardSession({
-      onConfirm: (text) => {
-        const value = this.state.textareaSeenInput ? this.state.textareaValue : text
-        this.finishRequest(true, value)
-      },
+      onConfirm: (text) => this.finishRequest(true, text),
       onCancel: () => this.finishRequest(false, ''),
     })
     this.state.session.mount()
@@ -70,8 +69,11 @@ export class KeyboardBridge {
 
   teardown() {
     this.stopPolling()
-    this.cancelActiveRequest('teardown')
-    this.closeTextarea()
+    if (this.state.activeRequest && this.state.phase !== 'responding') {
+      this.writeResponse(false, '')
+    }
+    this.closeLocalKeyboard()
+    this.resetActiveRequest('teardown', false)
     if (this.state.session) {
       this.state.session.unmount()
       this.state.session = null
@@ -100,25 +102,70 @@ export class KeyboardBridge {
   }
 
   stopPolling() {
-    if (this.state.pollTimer) {
-      clearInterval(this.state.pollTimer)
-      this.state.pollTimer = null
-    }
+    if (!this.state.pollTimer) return
+    clearInterval(this.state.pollTimer)
+    this.state.pollTimer = null
   }
 
   onPollTick() {
     this.state.pollTick += 1
-    const active = Date.now() < this.state.activeUntil
-    if (active || this.state.pollTick % 3 === 0) {
-      this.pollRequest()
+    this.pruneCompletedRequests()
+    if (this.state.activeRequest) {
+      this.pollCompletion()
+      if (this.state.phase === 'responding' && this.state.completionDeadline > 0 &&
+          Date.now() >= this.state.completionDeadline) {
+        console.warn(`keyboard completion timeout id=${this.state.activeRequest.id}`)
+        this.resetActiveRequest('completion timeout')
+      }
+      return
     }
+    if (this.state.pollTick % 3 === 0) this.pollRequest()
+  }
+
+  reconcileActiveRequest() {
+    if (this.state.activeRequest) {
+      this.pollCompletion()
+      return false
+    }
+    this.pollRequest()
+    return false
+  }
+
+  pollCompletion() {
+    const request = this.state.activeRequest
+    if (!request || !request.id || !this.browserPlayer.pollKeyboardCompletion) return
+    let raw = ''
+    try {
+      raw = this.browserPlayer.pollKeyboardCompletion({
+        workdir: this.workdir(),
+        id: request.id,
+      }) || ''
+    } catch (err) {
+      console.warn(`poll keyboard completion failed ${err}`)
+      return
+    }
+    if (!raw) return
+    let completion = null
+    try {
+      completion = JSON.parse(raw)
+    } catch (err) {
+      console.warn(`parse keyboard completion failed ${err}`)
+      return
+    }
+    if (!completion || `${completion.id || ''}` !== `${request.id}`) return
+    console.warn(`keyboard completion id=${request.id} status=${completion.status || 'unknown'} detail=${completion.detail || ''}`)
+    this.resetActiveRequest(`native ${completion.status || 'completed'}`)
   }
 
   optionsForRequest(request) {
     const kind = request && request.kind ? `${request.kind}` : ''
     const text = request && request.text != null ? `${request.text}` : ''
-    const placeholder = request && request.placeholder ? `${request.placeholder}` : (kind === 'web_input' ? '请输入内容' : '输入网址或搜索')
-    const inputType = request && request.inputType ? `${request.inputType}` : (kind === 'web_input' ? 'ZhCNPreferred' : 'EnUSPreferred')
+    const placeholder = request && request.placeholder
+      ? `${request.placeholder}`
+      : (kind === 'web_input' ? '请输入内容' : '输入网址或搜索')
+    const inputType = request && request.inputType
+      ? `${request.inputType}`
+      : (kind === 'web_input' ? 'ZhCNPreferred' : 'EnUSPreferred')
     let maxlength = request && request.maxlength != null ? Number(request.maxlength) : 512
     if (!Number.isFinite(maxlength)) maxlength = 512
     return {
@@ -134,99 +181,104 @@ export class KeyboardBridge {
   }
 
   openTextarea(request) {
-    if (!request || !request.id) return false
     const options = this.optionsForRequest(request)
-    this.state.textareaValue = options.text || ''
-    this.state.textareaInputType = options.inputType || 'ZhCNPreferred'
+    this.state.textareaValue = options.text
+    this.state.textareaInputType = options.inputType
     this.state.textareaMaxlength = options.maxlength || 512
     this.state.textareaVisible = true
     this.state.textareaFocused = false
-    this.state.textareaActive = true
     this.state.textareaSeenInput = false
-    console.warn(`keyboard textarea request id=${request.id} kind=${request.kind || ''} type=${this.state.textareaInputType}`)
+    this.state.phase = 'opening'
+    console.warn(`keyboard textarea request id=${request.id} kind=${request.kind || ''} type=${options.inputType}`)
     setTimeout(() => {
-      if (!this.state.activeRequest || this.state.activeRequest.id !== request.id) return
+      if (!this.isCurrentRequest(request.id) || this.state.phase !== 'opening') return
       this.state.textareaFocused = true
+      this.state.phase = 'active'
       try {
         const field = this.component.$refs.keyboardTextarea
         if (field && field.focus) field.focus()
       } catch (err) {
         console.warn(`keyboard textarea focus failed ${err}`)
+        this.finishRequest(false, '')
       }
     }, 0)
     return true
   }
 
-  closeTextarea() {
-    this.state.textareaFocused = false
-    this.state.textareaActive = false
-    this.state.textareaVisible = false
-    this.state.textareaSeenInput = false
-  }
-
   openGlobal(request) {
-    if (!request || !request.id || !this.state.session) return false
-    const options = this.optionsForRequest(request)
+    if (!this.state.session) return false
     this.closeTextarea()
-    const uuid = this.state.session.open(options)
+    this.state.phase = 'opening'
+    const uuid = this.state.session.open(this.optionsForRequest(request))
+    if (uuid) this.state.phase = 'active'
     console.warn(`keyboard global request id=${request.id} kind=${request.kind || ''} uuid=${uuid || ''}`)
     return !!uuid
   }
 
-  onTextareaInput(value) {
-    this.state.textareaValue = normalizeKeyboardText(value)
-    this.state.textareaSeenInput = true
-    console.warn(`keyboard textarea input ${this.state.textareaValue || ''}`)
-    this.updateRequest(this.state.textareaValue)
+  closeTextarea() {
+    this.state.textareaFocused = false
+    this.state.textareaVisible = false
+    this.state.textareaSeenInput = false
   }
 
-  onTextareaConfirm(value) {
-    if (!this.state.activeRequest) return
-    const text = this.state.textareaSeenInput ? this.state.textareaValue : normalizeKeyboardText(value)
-    this.state.textareaValue = text
-    console.warn(`keyboard textarea confirm ${text || ''}`)
-    this.finishRequest(true, text)
-    if (this.state.session && this.state.session.isActive()) {
-      this.state.session.close()
-    }
+  closeLocalKeyboard() {
+    if (this.state.session && this.state.session.isActive()) this.state.session.close()
     this.closeTextarea()
   }
 
+  onTextareaInput(value) {
+    if (!this.state.activeRequest || this.state.phase === 'responding') return
+    const text = normalizeKeyboardText(value)
+    this.state.textareaValue = text
+    this.state.textareaSeenInput = true
+    if (this.state.lastUpdateText === text) return
+    this.state.lastUpdateText = text
+    this.state.sequence += 1
+    this.updateRequest(text, this.state.sequence)
+  }
+
+  onTextareaConfirm(value) {
+    if (!this.state.activeRequest || this.state.phase === 'responding') return
+    const eventText = normalizeKeyboardText(value)
+    const text = this.state.textareaSeenInput ? this.state.textareaValue : eventText
+    this.finishRequest(true, text)
+  }
+
   onTextareaFocus() {
-    this.state.textareaActive = true
+    if (this.state.phase === 'opening') this.state.phase = 'active'
     console.warn('keyboard textarea focused')
   }
 
   onTextareaBlur() {
     this.state.textareaFocused = false
     console.warn('keyboard textarea blurred')
+    const requestId = this.state.activeRequest ? this.state.activeRequest.id : ''
     setTimeout(() => {
-      if (!this.state.activeRequest) return
-      if (this.state.session && this.state.session.isActive()) return
-      if (this.state.textareaFocused) return
-      console.warn(`keyboard textarea cancel id=${this.state.activeRequest.id}`)
+      if (!requestId || !this.isCurrentRequest(requestId)) return
+      if (this.state.phase === 'responding' || this.state.textareaFocused) return
+      console.warn(`keyboard textarea cancel id=${requestId}`)
       this.finishRequest(false, '')
-      this.closeTextarea()
-    }, 250)
+    }, 300)
   }
 
-  updateRequest(text) {
+  updateRequest(text, sequence) {
     const request = this.state.activeRequest
     if (!request || !request.id || !this.browserPlayer.updateKeyboardRequest) return
     try {
       this.browserPlayer.updateKeyboardRequest({
         workdir: this.workdir(),
         id: request.id,
-        text: `${text || ''}`,
+        sequence,
+        text,
       })
-      console.warn(`keyboard update id=${request.id} kind=${request.kind || ''} bytes=${`${text || ''}`.length}`)
+      console.warn(`keyboard update id=${request.id} kind=${request.kind || ''} sequence=${sequence} bytes=${text.length}`)
     } catch (err) {
       console.warn(`update keyboard request failed ${err}`)
     }
   }
 
   pollRequest() {
-    if (this.component.browser.leaving || this.state.activeRequest) return
+    if (this.component.browser.leaving || this.state.phase !== 'idle') return
     if (!this.browserPlayer.pollKeyboardRequest) return
     if (this.state.profileMode === 'globalOnly' && !this.state.session) return
     if (this.runningGetter && !this.runningGetter()) return
@@ -239,8 +291,6 @@ export class KeyboardBridge {
       return
     }
     if (!raw) return
-    this.state.activeUntil = Date.now() + 10000
-
     let request = null
     try {
       request = JSON.parse(raw)
@@ -248,52 +298,93 @@ export class KeyboardBridge {
       console.warn(`parse keyboard request failed ${err}`)
       return
     }
-    if (!request || !request.id) return
+    if (!request || !request.id || this.state.completedRequestIds[request.id]) return
 
     this.state.activeRequest = request
+    this.state.sequence = 0
+    this.state.lastUpdateText = request.text == null ? '' : `${request.text}`
+    this.state.completionDeadline = 0
     console.warn(`keyboard request id=${request.id} kind=${request.kind || ''} mode=${this.state.profileMode}`)
-    if (this.state.profileMode === 'textareaOnly') {
-      if (!this.openTextarea(request)) {
-        this.finishRequest(false, '')
-      }
-      return
-    }
-    if (!this.openGlobal(request)) {
-      this.finishRequest(false, '')
-    }
+    const opened = this.state.profileMode === 'textareaOnly'
+      ? this.openTextarea(request)
+      : this.openGlobal(request)
+    if (!opened) this.finishRequest(false, '')
   }
 
-  finishRequest(confirmed, text) {
+  writeResponse(confirmed, text) {
     const request = this.state.activeRequest
-    if (!request || !request.id) return
-    this.state.activeRequest = null
-    this.state.activeUntil = Date.now() + 10000
+    if (!request || !request.id) return false
     try {
       this.browserPlayer.respondKeyboardRequest({
         workdir: this.workdir(),
         id: request.id,
+        sequence: this.state.sequence,
         confirmed: !!confirmed,
-        text: confirmed ? `${text || ''}` : '',
+        text: confirmed ? text : '',
       })
-      console.warn(`keyboard ${confirmed ? 'confirmed' : 'cancelled'} id=${request.id} kind=${request.kind || ''}`)
+      console.warn(`keyboard ${confirmed ? 'confirmed' : 'cancelled'} id=${request.id} kind=${request.kind || ''} sequence=${this.state.sequence}`)
+      return true
     } catch (err) {
       console.warn(`respond keyboard request failed ${err}`)
+      return false
     }
-    this.closeTextarea()
+  }
+
+  finishRequest(confirmed, value) {
+    if (!this.state.activeRequest || this.state.phase === 'responding') return
+    const text = normalizeKeyboardText(value)
+    if (confirmed && text !== this.state.lastUpdateText) {
+      this.state.lastUpdateText = text
+      this.state.sequence += 1
+    }
+    this.state.phase = 'responding'
+    this.state.completionDeadline = Date.now() + 5000
+    this.writeResponse(confirmed, text)
+    this.closeLocalKeyboard()
+  }
+
+  resetActiveRequest(reason, notify = true) {
+    const request = this.state.activeRequest
+    if (request && request.id) this.state.completedRequestIds[request.id] = Date.now() + 10000
+    this.closeLocalKeyboard()
+    this.state.activeRequest = null
+    this.state.sequence = 0
+    this.state.lastUpdateText = null
+    this.state.completionDeadline = 0
+    this.state.phase = 'idle'
+    console.warn(`keyboard session reset reason=${reason || ''}`)
+    if (notify) this.notifyInactive()
+  }
+
+  pruneCompletedRequests() {
+    const now = Date.now()
+    Object.keys(this.state.completedRequestIds).forEach((id) => {
+      if (this.state.completedRequestIds[id] <= now) delete this.state.completedRequestIds[id]
+    })
+  }
+
+  isCurrentRequest(id) {
+    return !!(this.state.activeRequest && `${this.state.activeRequest.id}` === `${id}`)
+  }
+
+  notifyInactive() {
+    if (!this.component || !this.component.onKeyboardBridgeInactive) return
+    setTimeout(() => this.component.onKeyboardBridgeInactive(), 0)
   }
 
   cancelActiveRequest(reason) {
-    if (this.state.activeRequest) {
-      console.warn(`keyboard cancel active reason=${reason || ''} id=${this.state.activeRequest.id}`)
-      this.finishRequest(false, '')
+    if (!this.state.activeRequest) {
+      this.closeLocalKeyboard()
+      return
     }
-    if (this.state.session && this.state.session.isActive()) {
-      this.state.session.close()
-    }
-    this.closeTextarea()
+    console.warn(`keyboard cancel active reason=${reason || ''} id=${this.state.activeRequest.id}`)
+    if (this.state.phase !== 'responding') this.writeResponse(false, '')
+    this.resetActiveRequest(reason || 'cancelled')
   }
 
   isActive() {
-    return !!((this.state.session && this.state.session.isActive()) || this.state.textareaActive)
+    return this.state.phase !== 'idle' ||
+      !!(this.state.session && this.state.session.isActive()) ||
+      this.state.textareaVisible
   }
 }

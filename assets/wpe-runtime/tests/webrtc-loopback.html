@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WebRTC DataChannel Test</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #101214; color: #f5f7fa; font: 16px sans-serif; }
+    main { box-sizing: border-box; height: 100%; padding: 16px; }
+    h1 { margin: 0 0 10px; font-size: 22px; }
+    pre { margin: 0; white-space: pre-wrap; color: #62b5ff; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>WebRTC DataChannel</h1>
+    <pre id="status">starting</pre>
+  </main>
+  <script>
+    const status = document.querySelector('#status');
+    const left = new RTCPeerConnection();
+    const right = new RTCPeerConnection();
+    let connected = false;
+    let pongReceived = false;
+    let captureDenied = false;
+
+    function log(message) {
+      status.textContent += `\n${message}`;
+      console.log(`WEBRTC_TEST ${message}`);
+    }
+
+    function updateResult() {
+      if (!connected || !pongReceived || !captureDenied)
+        return;
+      document.title = 'PASS WebRTC ICE DataChannel';
+      log('PASS ICE + DataChannel');
+    }
+
+    function updateConnection(label, peer) {
+      log(`${label}=${peer.connectionState} ice=${peer.iceConnectionState}`);
+      connected = connected || peer.connectionState === 'connected' || peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed';
+      updateResult();
+    }
+
+    left.onicecandidate = ({ candidate }) => candidate && right.addIceCandidate(candidate);
+    right.onicecandidate = ({ candidate }) => candidate && left.addIceCandidate(candidate);
+    left.onconnectionstatechange = () => updateConnection('left', left);
+    right.onconnectionstatechange = () => updateConnection('right', right);
+    left.oniceconnectionstatechange = () => updateConnection('left', left);
+    right.oniceconnectionstatechange = () => updateConnection('right', right);
+    right.ondatachannel = ({ channel }) => {
+      channel.onmessage = ({ data }) => {
+        log(`right received=${data}`);
+        channel.send('pong');
+      };
+    };
+
+    const channel = left.createDataChannel('loopback');
+    channel.onopen = () => {
+      log('channel=open');
+      channel.send('ping');
+    };
+    channel.onmessage = ({ data }) => {
+      log(`left received=${data}`);
+      pongReceived = data === 'pong';
+      updateResult();
+    };
+
+    (async () => {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+        throw new Error('getUserMedia unavailable');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      stream.getTracks().forEach(track => track.stop());
+      document.title = 'FAIL capture allowed';
+      log('FAIL local capture was allowed');
+    })().catch(error => {
+      captureDenied = true;
+      log(`capture denied=${error.name || error}`);
+      updateResult();
+    });
+
+    (async () => {
+      const offer = await left.createOffer();
+      await left.setLocalDescription(offer);
+      await right.setRemoteDescription(offer);
+      const answer = await right.createAnswer();
+      await right.setLocalDescription(answer);
+      await left.setRemoteDescription(answer);
+      status.textContent = 'offer/answer complete';
+      console.log('WEBRTC_TEST offer/answer complete');
+    })().catch(error => {
+      document.title = 'FAIL WebRTC';
+      log(`FAIL ${error.stack || error}`);
+    });
+
+    setTimeout(() => {
+      if (document.title.startsWith('PASS'))
+        return;
+      document.title = 'FAIL WebRTC timeout';
+      log('FAIL timeout');
+    }, 10000);
+  </script>
+</body>
+</html>

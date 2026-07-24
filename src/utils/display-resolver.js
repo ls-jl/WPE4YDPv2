@@ -393,6 +393,7 @@ export async function browserOptions(component, browserPlayer, options) {
     touchOffsetY: Number.isFinite(Number(display.touchOffsetY)) ? Number(display.touchOffsetY) : 0,
     fpsMax: Number.isFinite(Number(display.fpsMax)) ? Number(display.fpsMax) : 0,
     drm: options.drm || '/dev/dri/card0',
+    gpuMode: options.gpuMode || 'auto',
     useOverlay: true,
     overlayZpos: 0,
   }

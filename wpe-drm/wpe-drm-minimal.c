@@ -15,6 +15,7 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 #include <wpe/drm/wpe-drm.h>
+#include "browser-profile-store.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <gio/gio.h>
@@ -34,8 +35,25 @@
 
 static GMainLoop *main_loop = NULL;
 static guint64 frame_count = 0;
-static gint64 frame_stats_start_us = 0;
+static gint64 frame_stats_window_start_us = 0;
+static guint64 frame_stats_window_start_count = 0;
 static GHashTable *tls_exception_hosts = NULL;
+static gboolean gpu_render_profile = FALSE;
+static int runtime_exit_code = 0;
+static guint gpu_first_frame_timeout_source_id = 0;
+
+typedef struct {
+    BrowserProfileStore *store;
+    BrowserProfile profile;
+    gboolean guest;
+    char *root;
+    char *runtime;
+    char *data;
+    char *cache;
+    char *cookie_jar;
+} BrowserProfileRuntime;
+
+static BrowserProfileRuntime profile_runtime;
 
 static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *uri);
 
@@ -44,12 +62,27 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 #define MAX_BROWSER_HISTORY 16
 #define BROWSER_URL_MAX 512
 #define BROWSER_TITLE_MAX 160
+#define CHROME_TOOLBAR_MARGIN 8
+#define CHROME_TOOLBAR_BUTTON_COUNT 5
+#define CHROME_TOOLBAR_LEGACY_BUTTON_COUNT 6
+#define CHROME_TABS_HEADER_HEIGHT 28
+#define CHROME_TABS_FOOTER_HEIGHT 40
+#define CHROME_TABS_ROW_HEIGHT 34
+#define CHROME_TABS_CLOSE_HIT_WIDTH 42
 
 typedef enum {
     CHROME_PANEL_NONE = 0,
-    CHROME_PANEL_ADDRESS,
     CHROME_PANEL_TABS,
-    CHROME_PANEL_SETTINGS
+    CHROME_PANEL_MENU,
+    CHROME_PANEL_SETTINGS,
+    CHROME_PANEL_PRIVACY,
+    CHROME_PANEL_CLEAR_SITE_DATA,
+    CHROME_PANEL_PROFILES,
+    CHROME_PANEL_PROFILE_MANAGE,
+    CHROME_PANEL_PROFILE_DELETE,
+    CHROME_PANEL_HISTORY,
+    CHROME_PANEL_BOOKMARKS,
+    CHROME_PANEL_CLEAR_HISTORY
 } ChromePanel;
 
 typedef struct {
@@ -68,6 +101,7 @@ typedef struct {
     double max_move_sq;
     gboolean scrolling;
     gboolean chrome_consumed;
+    gboolean tabs_scroll_candidate;
 } TouchSlot;
 
 typedef struct {
@@ -91,7 +125,6 @@ typedef struct {
     double show_up_px;
     double show_up_min_velocity_px_s;
     gint64 transition_us;
-    char *state_path;
     char *render_state_path;
     char *home_url;
     BrowserTab tabs[MAX_BROWSER_TABS];
@@ -106,12 +139,23 @@ typedef struct {
     gboolean suppress_history;
     guint layout_timer;
     char site_profile[16];
+    BrowserCookiePolicy cookie_policy;
+    guint panel_page;
+    gboolean panel_delete_mode;
+    gboolean site_data_clearing;
+    char site_data_status[64];
+    GPtrArray *panel_profiles;
+    GPtrArray *panel_pages;
+    int64_t current_visit_id;
+    double tabs_scroll_offset;
+    gint64 tabs_scroll_last_publish_us;
 } BrowserChrome;
 
 typedef struct {
     WPEView *view;
     WPEToplevel *toplevel;
     WebKitWebView *web_view;
+    WebKitNetworkSession *network_session;
     int viewport_width;
     int viewport_height;
     int panel_width;
@@ -146,6 +190,8 @@ typedef struct {
     gboolean touch_scroll_invert_y;
     gboolean send_touch_events;
     gboolean synthesize_pointer_tap;
+    char input_profile[16];
+    gboolean game_input_active;
     gboolean native_scroll_scheduled;
     guint native_scroll_source_id;
     gboolean scroll_active;
@@ -173,11 +219,20 @@ typedef struct {
     char *keyboard_active_kind;
     char *keyboard_pending_text;
     gboolean keyboard_pending_text_valid;
+    guint64 keyboard_last_sequence;
+    gboolean keyboard_apply_in_flight;
+    char *keyboard_queued_text;
+    guint64 keyboard_queued_sequence;
+    gboolean keyboard_queued_commit;
+    gboolean keyboard_terminal_pending;
     gint64 keyboard_active_us;
     gint64 last_pointer_tap_us;
     BrowserChrome chrome;
     TouchSlot slots[MAX_TOUCH_SLOTS];
 } AppState;
+
+static WebKitCookieAcceptPolicy webkit_cookie_policy(BrowserCookiePolicy policy);
+static void chrome_switch_profile(AppState *state, int64_t profile_id, gboolean guest);
 
 static gboolean env_enabled(const char *name, gboolean default_value)
 {
@@ -291,9 +346,17 @@ static int normalize_rotation_degrees(int rotation)
 static const char *chrome_panel_name(ChromePanel panel)
 {
     switch (panel) {
-    case CHROME_PANEL_ADDRESS: return "address";
     case CHROME_PANEL_TABS: return "tabs";
+    case CHROME_PANEL_MENU: return "menu";
     case CHROME_PANEL_SETTINGS: return "settings";
+    case CHROME_PANEL_PRIVACY: return "privacy & cookies";
+    case CHROME_PANEL_CLEAR_SITE_DATA: return "clear site data?";
+    case CHROME_PANEL_PROFILES: return "profiles";
+    case CHROME_PANEL_PROFILE_MANAGE: return "profile";
+    case CHROME_PANEL_PROFILE_DELETE: return "delete profile?";
+    case CHROME_PANEL_HISTORY: return "history";
+    case CHROME_PANEL_BOOKMARKS: return "bookmarks";
+    case CHROME_PANEL_CLEAR_HISTORY: return "clear history?";
     case CHROME_PANEL_NONE:
     default:
         return "none";
@@ -304,13 +367,48 @@ static ChromePanel chrome_panel_from_name(const char *name)
 {
     if (!name)
         return CHROME_PANEL_NONE;
-    if (!g_ascii_strcasecmp(name, "address"))
-        return CHROME_PANEL_ADDRESS;
     if (!g_ascii_strcasecmp(name, "tabs"))
         return CHROME_PANEL_TABS;
+    if (!g_ascii_strcasecmp(name, "menu"))
+        return CHROME_PANEL_MENU;
     if (!g_ascii_strcasecmp(name, "settings"))
         return CHROME_PANEL_SETTINGS;
+    if (!g_ascii_strcasecmp(name, "privacy & cookies"))
+        return CHROME_PANEL_PRIVACY;
+    if (!g_ascii_strcasecmp(name, "profiles"))
+        return CHROME_PANEL_PROFILES;
+    if (!g_ascii_strcasecmp(name, "profile"))
+        return CHROME_PANEL_PROFILE_MANAGE;
+    if (!g_ascii_strcasecmp(name, "history"))
+        return CHROME_PANEL_HISTORY;
+    if (!g_ascii_strcasecmp(name, "bookmarks"))
+        return CHROME_PANEL_BOOKMARKS;
     return CHROME_PANEL_NONE;
+}
+
+static ChromePanel chrome_panel_parent(ChromePanel panel)
+{
+    switch (panel) {
+    case CHROME_PANEL_SETTINGS:
+    case CHROME_PANEL_PRIVACY:
+    case CHROME_PANEL_PROFILES:
+    case CHROME_PANEL_HISTORY:
+    case CHROME_PANEL_BOOKMARKS:
+        return CHROME_PANEL_MENU;
+    case CHROME_PANEL_PROFILE_MANAGE:
+        return CHROME_PANEL_PROFILES;
+    case CHROME_PANEL_PROFILE_DELETE:
+        return CHROME_PANEL_PROFILE_MANAGE;
+    case CHROME_PANEL_CLEAR_HISTORY:
+        return CHROME_PANEL_HISTORY;
+    case CHROME_PANEL_CLEAR_SITE_DATA:
+        return CHROME_PANEL_PRIVACY;
+    case CHROME_PANEL_TABS:
+    case CHROME_PANEL_MENU:
+    case CHROME_PANEL_NONE:
+    default:
+        return CHROME_PANEL_NONE;
+    }
 }
 
 static BrowserTab *chrome_active_tab(BrowserChrome *chrome)
@@ -407,6 +505,7 @@ static void chrome_apply_site_profile(AppState *state)
 }
 
 static void chrome_apply_layout(AppState *state, const char *reason);
+static void chrome_set_visible(AppState *state, gboolean visible);
 
 static void chrome_request_frame(AppState *state)
 {
@@ -415,6 +514,132 @@ static void chrome_request_frame(AppState *state)
     int width = state->viewport_width > 0 ? state->viewport_width : wpe_view_get_width(state->view);
     int height = state->viewport_height > 0 ? state->viewport_height : wpe_view_get_height(state->view);
     wpe_view_resized(state->view, width, height);
+}
+
+typedef struct {
+    int panel_x;
+    int panel_y;
+    int panel_width;
+    int panel_height;
+    int list_top;
+    int list_height;
+    int footer_top;
+    int row_height;
+    int header_height;
+    int footer_height;
+    double max_scroll;
+} ChromeTabsGeometry;
+
+static int chrome_toolbar_legacy_button_width(int panel_width)
+{
+    int button_x = panel_width / 2 + CHROME_TOOLBAR_MARGIN;
+    return MAX(36, (panel_width - button_x - CHROME_TOOLBAR_MARGIN)
+        / CHROME_TOOLBAR_LEGACY_BUTTON_COUNT);
+}
+
+static int chrome_toolbar_controls_x(int panel_width)
+{
+    return panel_width / 2 + CHROME_TOOLBAR_MARGIN
+        + chrome_toolbar_legacy_button_width(panel_width);
+}
+
+static int chrome_address_right(int panel_width)
+{
+    return chrome_toolbar_controls_x(panel_width) - CHROME_TOOLBAR_MARGIN;
+}
+
+static ChromeTabsGeometry chrome_tabs_geometry(AppState *state)
+{
+    int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
+    int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
+    int chrome_height = state ? state->chrome.height : 44;
+    ChromeTabsGeometry geometry = {
+        .panel_x = chrome_address_right(panel_width),
+        .panel_y = chrome_height,
+        .panel_width = panel_width - chrome_address_right(panel_width),
+        .panel_height = MAX(0, panel_height - chrome_height),
+        .row_height = CHROME_TABS_ROW_HEIGHT,
+        .header_height = CHROME_TABS_HEADER_HEIGHT,
+        .footer_height = CHROME_TABS_FOOTER_HEIGHT,
+    };
+    geometry.list_top = geometry.panel_y + geometry.header_height;
+    geometry.footer_top = panel_height - geometry.footer_height;
+    geometry.list_height = MAX(0, geometry.footer_top - geometry.list_top);
+    int content_height = (state ? state->chrome.tab_count : 0) * geometry.row_height;
+    geometry.max_scroll = MAX(0, content_height - geometry.list_height);
+    return geometry;
+}
+
+static void chrome_clamp_tabs_scroll(AppState *state)
+{
+    ChromeTabsGeometry geometry = chrome_tabs_geometry(state);
+    state->chrome.tabs_scroll_offset = CLAMP(state->chrome.tabs_scroll_offset, 0.0,
+                                              geometry.max_scroll);
+}
+
+static void chrome_position_active_tab(AppState *state)
+{
+    BrowserChrome *chrome = &state->chrome;
+    ChromeTabsGeometry geometry = chrome_tabs_geometry(state);
+    if (chrome->tab_count <= 1 || chrome->active <= 0)
+        chrome->tabs_scroll_offset = 0;
+    else if (chrome->active >= chrome->tab_count - 1)
+        chrome->tabs_scroll_offset = geometry.max_scroll;
+    else {
+        double active_center = ((double)chrome->active + 0.5) * geometry.row_height;
+        chrome->tabs_scroll_offset = active_center - (double)geometry.list_height / 2.0;
+        chrome_clamp_tabs_scroll(state);
+    }
+}
+
+static void chrome_open_tabs_panel(AppState *state)
+{
+    state->chrome.panel = CHROME_PANEL_TABS;
+    chrome_set_visible(state, TRUE);
+    chrome_position_active_tab(state);
+}
+
+static void chrome_refresh_profiles(BrowserChrome *chrome)
+{
+    g_clear_pointer(&chrome->panel_profiles, g_ptr_array_unref);
+    if (!profile_runtime.store)
+        return;
+    GError *error = NULL;
+    chrome->panel_profiles = browser_profile_store_list_profiles(profile_runtime.store, &error);
+    if (!chrome->panel_profiles)
+        g_warning("Profile list failed: %s", error ? error->message : "unknown");
+    g_clear_error(&error);
+}
+
+static void chrome_refresh_pages(BrowserChrome *chrome, gboolean bookmarks)
+{
+    g_clear_pointer(&chrome->panel_pages, g_ptr_array_unref);
+    if (profile_runtime.guest || !profile_runtime.store)
+        return;
+    GError *error = NULL;
+    guint offset = chrome->panel_page * 6;
+    chrome->panel_pages = bookmarks
+        ? browser_profile_store_list_bookmarks(profile_runtime.store, profile_runtime.profile.id,
+                                               offset, 6, &error)
+        : browser_profile_store_list_visits(profile_runtime.store, profile_runtime.profile.id,
+                                            offset, 6, &error);
+    if (!chrome->panel_pages)
+        g_warning("%s list failed: %s", bookmarks ? "Bookmark" : "History",
+                  error ? error->message : "unknown");
+    g_clear_error(&error);
+}
+
+static const char *cookie_policy_label(BrowserCookiePolicy policy)
+{
+    switch (policy) {
+    case BROWSER_COOKIE_NO_THIRD_PARTY:
+        return "NO THIRD PARTY";
+    case BROWSER_COOKIE_ACCEPT_NEVER:
+        return "NEVER";
+    case BROWSER_COOKIE_ACCEPT_ALL:
+    default:
+        return "ALL";
+    }
 }
 
 static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
@@ -428,37 +653,42 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
     if (chrome->panel == CHROME_PANEL_NONE)
         return;
 
-    if (chrome->panel == CHROME_PANEL_ADDRESS) {
-        const char *entries[] = {
-            "HOME  https://m.baidu.com/",
-            "BAIDU https://m.baidu.com/",
-            "BING  https://www.bing.com/"
-        };
-        for (unsigned i = 0; i < G_N_ELEMENTS(entries); ++i) {
-            snprintf(line, sizeof(line), "line%d", line_count);
-            g_key_file_set_string(key_file, "panel", line, entries[i]);
-            line_count++;
-        }
-        if (tab && tab->url[0]) {
-            snprintf(line, sizeof(line), "line%d", line_count);
-            g_key_file_set_string(key_file, "panel", line, "RELOAD CURRENT");
-            line_count++;
-        }
+    if (chrome->panel == CHROME_PANEL_MENU) {
+        gboolean bookmarked = !profile_runtime.guest && tab && tab->url[0]
+            && browser_profile_store_has_bookmark(profile_runtime.store,
+                                                  profile_runtime.profile.id, tab->url);
+        g_key_file_set_string(key_file, "panel", "line0",
+                              bookmarked ? "REMOVE BOOKMARK" : "ADD BOOKMARK");
+        g_key_file_set_string(key_file, "panel", "line1", "HISTORY");
+        g_key_file_set_string(key_file, "panel", "line2", "BOOKMARKS");
+        snprintf(line, sizeof(line), "PROFILES  %s%s",
+                 profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+                 profile_runtime.guest ? " (GUEST)" : "");
+        g_key_file_set_string(key_file, "panel", "line3", line);
+        g_key_file_set_string(key_file, "panel", "line4", "PRIVACY & COOKIES");
+        g_key_file_set_string(key_file, "panel", "line5", "SETTINGS");
+        line_count = 6;
     } else if (chrome->panel == CHROME_PANEL_TABS) {
         for (int i = 0; i < chrome->tab_count && line_count < 8; ++i) {
             BrowserTab *item = &chrome->tabs[i];
             char value[96];
-            snprintf(value, sizeof(value), "%c TAB %d %s", i == chrome->active ? '*' : ' ', i + 1, item->title[0] ? item->title : item->url);
+            snprintf(value, sizeof(value), "%d  %s", i + 1,
+                     item->title[0] ? item->title : item->url);
             snprintf(line, sizeof(line), "line%d", line_count);
             g_key_file_set_string(key_file, "panel", line, value);
             line_count++;
         }
-        snprintf(line, sizeof(line), "line%d", line_count);
-        g_key_file_set_string(key_file, "panel", line, "NEW TAB");
-        line_count++;
-        snprintf(line, sizeof(line), "line%d", line_count);
-        g_key_file_set_string(key_file, "panel", line, "CLOSE TAB");
-        line_count++;
+        ChromeTabsGeometry geometry = chrome_tabs_geometry(state);
+        g_key_file_set_integer(key_file, "panel", "x", geometry.panel_x);
+        g_key_file_set_integer(key_file, "panel", "y", geometry.panel_y);
+        g_key_file_set_integer(key_file, "panel", "width", geometry.panel_width);
+        g_key_file_set_integer(key_file, "panel", "height", geometry.panel_height);
+        g_key_file_set_integer(key_file, "panel", "header_height", geometry.header_height);
+        g_key_file_set_integer(key_file, "panel", "footer_height", geometry.footer_height);
+        g_key_file_set_integer(key_file, "panel", "row_height", geometry.row_height);
+        g_key_file_set_double(key_file, "panel", "scroll_offset", chrome->tabs_scroll_offset);
+        g_key_file_set_boolean(key_file, "panel", "can_add",
+                               chrome->tab_count < MAX_BROWSER_TABS);
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
         const char *home = chrome->home_url && chrome->home_url[0] ? chrome->home_url : default_home_url();
         snprintf(line, sizeof(line), "SET HOME %.80s", home);
@@ -470,6 +700,79 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         g_key_file_set_string(key_file, "panel", "line3", "CLEAR CACHE");
         g_key_file_set_string(key_file, "panel", "line4", "ABOUT WPE DRM2");
         line_count = 5;
+    } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
+        snprintf(line, sizeof(line), "COOKIE POLICY %s", cookie_policy_label(chrome->cookie_policy));
+        g_key_file_set_string(key_file, "panel", "line0", line);
+        g_key_file_set_string(key_file, "panel", "line1",
+                              chrome->site_data_clearing ? "CLEARING SITE DATA..." : "CLEAR COOKIES & SITE DATA");
+        line_count = 2;
+        if (chrome->site_data_status[0]) {
+            g_key_file_set_string(key_file, "panel", "line2", chrome->site_data_status);
+            line_count = 3;
+        }
+    } else if (chrome->panel == CHROME_PANEL_CLEAR_SITE_DATA) {
+        g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
+        g_key_file_set_string(key_file, "panel", "line1", "CONFIRM CLEAR COOKIES & SITE DATA");
+        line_count = 2;
+    } else if (chrome->panel == CHROME_PANEL_PROFILES) {
+        if (!chrome->panel_profiles)
+            chrome_refresh_profiles(chrome);
+        guint offset = chrome->panel_page * 4;
+        for (guint index = 0; chrome->panel_profiles
+                && index < 4 && offset + index < chrome->panel_profiles->len; ++index) {
+            BrowserProfile *profile = g_ptr_array_index(chrome->panel_profiles, offset + index);
+            snprintf(line, sizeof(line), "line%d", line_count);
+            char value[128];
+            snprintf(value, sizeof(value), "%c %s%s",
+                     !profile_runtime.guest && profile->id == profile_runtime.profile.id ? '*' : ' ',
+                     profile->name, profile->is_default ? " [DEFAULT]" : "");
+            g_key_file_set_string(key_file, "panel", line, value);
+            line_count++;
+        }
+        g_key_file_set_string(key_file, "panel", "line4", "GUEST                 NEW PROFILE");
+        line_count = 5;
+        g_key_file_set_string(key_file, "panel", "line5", "PREV       NEXT       MANAGE ACTIVE");
+        line_count = 6;
+    } else if (chrome->panel == CHROME_PANEL_PROFILE_MANAGE) {
+        snprintf(line, sizeof(line), "RENAME %s",
+                 profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT");
+        g_key_file_set_string(key_file, "panel", "line0", line);
+        g_key_file_set_string(key_file, "panel", "line1",
+                              profile_runtime.profile.is_default ? "DELETE DISABLED (DEFAULT)" : "DELETE PROFILE");
+        line_count = 2;
+    } else if (chrome->panel == CHROME_PANEL_PROFILE_DELETE) {
+        g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
+        g_key_file_set_string(key_file, "panel", "line1", "CONFIRM DELETE PROFILE");
+        line_count = 2;
+    } else if (chrome->panel == CHROME_PANEL_HISTORY
+               || chrome->panel == CHROME_PANEL_BOOKMARKS) {
+        gboolean bookmarks = chrome->panel == CHROME_PANEL_BOOKMARKS;
+        if (!chrome->panel_pages)
+            chrome_refresh_pages(chrome, bookmarks);
+        for (guint index = 0; chrome->panel_pages && index < chrome->panel_pages->len; ++index) {
+            BrowserStoredPage *page = g_ptr_array_index(chrome->panel_pages, index);
+            snprintf(line, sizeof(line), "line%d", line_count);
+            char value[128];
+            snprintf(value, sizeof(value), "%s%s",
+                     chrome->panel_delete_mode ? "DELETE " : "",
+                     page->title && page->title[0] ? page->title : page->url);
+            g_key_file_set_string(key_file, "panel", line, value);
+            line_count++;
+        }
+        while (line_count < 6) {
+            snprintf(line, sizeof(line), "line%d", line_count++);
+            g_key_file_set_string(key_file, "panel", line, "-");
+        }
+        g_key_file_set_string(key_file, "panel", "line6", "PREV PAGE                 NEXT PAGE");
+        g_key_file_set_string(key_file, "panel", "line7",
+                              bookmarks
+                                ? (chrome->panel_delete_mode ? "DONE DELETING" : "DELETE MODE")
+                                : (chrome->panel_delete_mode ? "DONE DELETING      CLEAR HISTORY" : "DELETE MODE        CLEAR HISTORY"));
+        line_count = 8;
+    } else if (chrome->panel == CHROME_PANEL_CLEAR_HISTORY) {
+        g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
+        g_key_file_set_string(key_file, "panel", "line1", "CONFIRM CLEAR HISTORY");
+        line_count = 2;
     }
 
     g_key_file_set_integer(key_file, "panel", "line_count", line_count);
@@ -514,6 +817,9 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_integer(key_file, "chrome", "tab_count", chrome->tab_count);
     g_key_file_set_integer(key_file, "chrome", "active_tab", chrome->active);
     g_key_file_set_string(key_file, "chrome", "site_profile", normalize_site_profile(chrome->site_profile));
+    g_key_file_set_string(key_file, "chrome", "profile",
+                          profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT");
+    g_key_file_set_boolean(key_file, "chrome", "guest_profile", profile_runtime.guest);
     char *transition_us = g_strdup_printf("%" G_GINT64_FORMAT, chrome->transition_us);
     g_key_file_set_string(key_file, "chrome", "transition_us", transition_us);
     g_free(transition_us);
@@ -542,37 +848,38 @@ static void chrome_save_state(AppState *state)
     if (!chrome->enabled)
         return;
 
-    GKeyFile *key_file = g_key_file_new();
-    g_key_file_set_string(key_file, "settings", "home_url", chrome->home_url ? chrome->home_url : default_home_url());
-    g_key_file_set_boolean(key_file, "settings", "touch_debug", chrome->touch_debug);
-    g_key_file_set_string(key_file, "settings", "site_profile", normalize_site_profile(chrome->site_profile));
-    g_key_file_set_integer(key_file, "tabs", "active", chrome->active);
-    g_key_file_set_integer(key_file, "tabs", "count", chrome->tab_count);
-    g_key_file_set_integer(key_file, "tabs", "next_id", chrome->next_tab_id);
-
-    for (int i = 0; i < chrome->tab_count; ++i) {
-        BrowserTab *tab = &chrome->tabs[i];
-        char group[32];
-        snprintf(group, sizeof(group), "tab%d", i);
-        g_key_file_set_integer(key_file, group, "id", tab->id);
-        g_key_file_set_string(key_file, group, "url", tab->url);
-        g_key_file_set_string(key_file, group, "title", tab->title);
-        if (tab->back_count)
-            g_key_file_set_string_list(key_file, group, "back", (const gchar * const *)tab->back, tab->back_count);
-        if (tab->forward_count)
-            g_key_file_set_string_list(key_file, group, "forward", (const gchar * const *)tab->forward, tab->forward_count);
+    if (!profile_runtime.guest && profile_runtime.store) {
+        GError *error = NULL;
+        GPtrArray *tabs = g_ptr_array_new_with_free_func((GDestroyNotify)browser_stored_tab_free);
+        for (int index = 0; index < chrome->tab_count; ++index) {
+            BrowserTab *source = &chrome->tabs[index];
+            BrowserStoredTab *tab = g_new0(BrowserStoredTab, 1);
+            tab->logical_id = source->id;
+            tab->url = g_strdup(source->url);
+            tab->title = g_strdup(source->title);
+            tab->active = index == chrome->active;
+            tab->back = g_ptr_array_new_with_free_func(g_free);
+            tab->forward = g_ptr_array_new_with_free_func(g_free);
+            for (int item = 0; item < source->back_count; ++item)
+                g_ptr_array_add(tab->back, g_strdup(source->back[item]));
+            for (int item = 0; item < source->forward_count; ++item)
+                g_ptr_array_add(tab->forward, g_strdup(source->forward[item]));
+            g_ptr_array_add(tabs, tab);
+        }
+        gboolean success = browser_profile_store_set_home_url(profile_runtime.store,
+                profile_runtime.profile.id,
+                chrome->home_url ? chrome->home_url : default_home_url(), &error)
+            && browser_profile_store_set_site_profile(profile_runtime.store,
+                profile_runtime.profile.id, normalize_site_profile(chrome->site_profile), &error)
+            && browser_profile_store_set_cookie_policy(profile_runtime.store,
+                profile_runtime.profile.id, chrome->cookie_policy, &error)
+            && browser_profile_store_save_tabs(profile_runtime.store,
+                profile_runtime.profile.id, tabs, chrome->next_tab_id, &error);
+        if (!success)
+            g_warning("Profile state save failed: %s", error ? error->message : "unknown");
+        g_clear_error(&error);
+        g_ptr_array_unref(tabs);
     }
-
-    gsize length = 0;
-    gchar *data = g_key_file_to_data(key_file, &length, NULL);
-    if (data) {
-        static gchar *last_saved_state;
-        static gsize last_saved_state_length;
-        if (!chrome_write_file_if_changed(chrome->state_path, data, length, &last_saved_state, &last_saved_state_length))
-            g_warning("Failed to write chrome state: %s", chrome->state_path);
-    }
-    g_free(data);
-    g_key_file_unref(key_file);
     chrome_update_render_state(state);
     chrome_apply_layout(state, "chrome_state");
 }
@@ -714,13 +1021,14 @@ static void chrome_new_tab(AppState *state, const char *url)
     chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
 }
 
-static void chrome_close_active_tab(AppState *state)
+static void chrome_close_tab(AppState *state, int index)
 {
     BrowserChrome *chrome = &state->chrome;
-    if (chrome->tab_count <= 0)
+    if (chrome->tab_count <= 0 || index < 0 || index >= chrome->tab_count)
         return;
-    chrome_clear_tab(&chrome->tabs[chrome->active]);
-    for (int i = chrome->active; i < chrome->tab_count - 1; ++i)
+    gboolean closed_active = index == chrome->active;
+    chrome_clear_tab(&chrome->tabs[index]);
+    for (int i = index; i < chrome->tab_count - 1; ++i)
         chrome->tabs[i] = chrome->tabs[i + 1];
     memset(&chrome->tabs[chrome->tab_count - 1], 0, sizeof(BrowserTab));
     chrome->tab_count--;
@@ -729,9 +1037,22 @@ static void chrome_close_active_tab(AppState *state)
         chrome->active = 0;
         chrome->tabs[0].id = chrome->next_tab_id++;
         chrome_set_tab_url(&chrome->tabs[0], chrome->home_url ? chrome->home_url : default_home_url());
-    } else if (chrome->active >= chrome->tab_count)
+        closed_active = TRUE;
+    } else if (index < chrome->active)
+        chrome->active--;
+    else if (chrome->active >= chrome->tab_count)
         chrome->active = chrome->tab_count - 1;
-    chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
+    chrome_clamp_tabs_scroll(state);
+    if (closed_active) {
+        chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
+        chrome->panel = CHROME_PANEL_TABS;
+        chrome_clamp_tabs_scroll(state);
+        chrome_save_state(state);
+        chrome_request_frame(state);
+    } else {
+        chrome_save_state(state);
+        chrome_request_frame(state);
+    }
 }
 
 static void chrome_switch_tab(AppState *state, int index)
@@ -789,6 +1110,95 @@ static char *json_escape_string(const char *value)
     char *result = out->str;
     g_slice_free(GString, out);
     return result;
+}
+
+static int json_hex_value(char value)
+{
+    if (value >= '0' && value <= '9')
+        return value - '0';
+    if (value >= 'a' && value <= 'f')
+        return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F')
+        return value - 'A' + 10;
+    return -1;
+}
+
+static char *json_payload_text(const char *payload, gboolean *has_text)
+{
+    if (has_text)
+        *has_text = FALSE;
+    if (!payload)
+        return g_strdup("");
+    if (payload[0] != '{') {
+        if (has_text)
+            *has_text = TRUE;
+        return g_strdup(payload);
+    }
+
+    const char *position = strstr(payload, "\"text\"");
+    if (!position)
+        return g_strdup("");
+    position = strchr(position + 6, ':');
+    if (!position)
+        return g_strdup("");
+    position++;
+    while (g_ascii_isspace(*position))
+        position++;
+    if (*position != '"')
+        return g_strdup("");
+    position++;
+
+    GString *result = g_string_new(NULL);
+    while (*position && *position != '"') {
+        if (*position != '\\') {
+            g_string_append_c(result, *position++);
+            continue;
+        }
+        position++;
+        switch (*position) {
+        case '"': g_string_append_c(result, '"'); position++; break;
+        case '\\': g_string_append_c(result, '\\'); position++; break;
+        case 'n': g_string_append_c(result, '\n'); position++; break;
+        case 'r': g_string_append_c(result, '\r'); position++; break;
+        case 't': g_string_append_c(result, '\t'); position++; break;
+        case 'u': {
+            gunichar character = 0;
+            gboolean valid = TRUE;
+            for (int index = 1; index <= 4; ++index) {
+                int digit = json_hex_value(position[index]);
+                if (digit < 0) {
+                    valid = FALSE;
+                    break;
+                }
+                character = (character << 4) | (gunichar)digit;
+            }
+            if (valid) {
+                g_string_append_unichar(result, character);
+                position += 5;
+            } else
+                position++;
+            break;
+        }
+        case '\0': break;
+        default: g_string_append_c(result, *position++); break;
+        }
+    }
+    if (has_text)
+        *has_text = TRUE;
+    return g_string_free(result, FALSE);
+}
+
+static guint64 json_payload_sequence(const char *payload)
+{
+    if (!payload || payload[0] != '{')
+        return 0;
+    const char *position = strstr(payload, "\"sequence\"");
+    if (!position)
+        return 0;
+    position = strchr(position + 10, ':');
+    if (!position)
+        return 0;
+    return g_ascii_strtoull(position + 1, NULL, 10);
 }
 
 static char *js_quote_string(const char *value)
@@ -941,6 +1351,44 @@ static char *keyboard_path(AppState *state, const char *subdir, const char *file
     return path;
 }
 
+typedef struct {
+    AppState *state;
+    char *request_id;
+    guint64 sequence;
+    gboolean commit;
+} KeyboardApplyContext;
+
+static void keyboard_write_completion(AppState *state, const char *status, const char *detail)
+{
+    if (!state || !state->keyboard_active_id)
+        return;
+    char *filename = g_strdup_printf("%s.json", state->keyboard_active_id);
+    char *path = keyboard_path(state, "status", filename);
+    char *status_json = json_escape_string(status ? status : "unknown");
+    char *detail_json = json_escape_string(detail ? detail : "");
+    char *payload = g_strdup_printf(
+        "{\"id\":\"%s\",\"status\":\"%s\",\"detail\":\"%s\"}",
+        state->keyboard_active_id, status_json, detail_json);
+    if (!path || !g_file_set_contents(path, payload, -1, NULL))
+        g_warning("Keyboard completion write failed: id=%s", state->keyboard_active_id);
+    else
+        chmod(path, 0600);
+    g_free(payload);
+    g_free(detail_json);
+    g_free(status_json);
+    g_free(path);
+    g_free(filename);
+}
+
+static void keyboard_notify_page_complete(AppState *state)
+{
+    if (!state || !state->web_view)
+        return;
+    const char *script = "if(window.__haasKeyboardComplete)window.__haasKeyboardComplete();";
+    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL,
+                                        NULL, NULL, NULL, NULL);
+}
+
 static void keyboard_clear_active(AppState *state)
 {
     if (!state)
@@ -954,34 +1402,92 @@ static void keyboard_clear_active(AppState *state)
         if (request_path)
             g_unlink(request_path);
         g_free(request_path);
+        const char *suffixes[] = { ".update", ".ok", ".cancel" };
+        for (unsigned index = 0; index < G_N_ELEMENTS(suffixes); ++index) {
+            char *filename = g_strdup_printf("%s%s", state->keyboard_active_id, suffixes[index]);
+            char *response_path = keyboard_path(state, "responses", filename);
+            if (response_path)
+                g_unlink(response_path);
+            g_free(response_path);
+            g_free(filename);
+        }
     }
     g_clear_pointer(&state->keyboard_active_id, g_free);
     g_clear_pointer(&state->keyboard_active_kind, g_free);
     g_clear_pointer(&state->keyboard_pending_text, g_free);
+    g_clear_pointer(&state->keyboard_queued_text, g_free);
     state->keyboard_pending_text_valid = FALSE;
+    state->keyboard_last_sequence = 0;
+    state->keyboard_apply_in_flight = FALSE;
+    state->keyboard_queued_sequence = 0;
+    state->keyboard_queued_commit = FALSE;
+    state->keyboard_terminal_pending = FALSE;
     state->keyboard_active_us = 0;
 }
 
-static void on_keyboard_apply_finished(GObject *object, GAsyncResult *result, gpointer user_data)
+static void keyboard_finish_active(AppState *state, const char *status, const char *detail)
 {
-    (void)user_data;
-    GError *error = NULL;
-    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
-    if (!value) {
-        g_warning("Keyboard apply failed: %s", error ? error->message : "unknown");
-        if (error)
-            g_error_free(error);
+    if (!state || !state->keyboard_active_id)
         return;
-    }
-    char *str = jsc_value_to_string(value);
-    g_print("Keyboard apply result: %s\n", str ? str : "(null)");
-    g_free(str);
-    g_object_unref(value);
+    g_print("Keyboard terminal: id=%s kind=%s status=%s detail=%s\n",
+            state->keyboard_active_id,
+            state->keyboard_active_kind ? state->keyboard_active_kind : "",
+            status ? status : "unknown", detail ? detail : "");
+    keyboard_write_completion(state, status, detail);
+    keyboard_notify_page_complete(state);
+    keyboard_clear_active(state);
 }
 
-static void keyboard_insert_web_text(AppState *state, const char *text, gboolean commit)
+static void keyboard_start_web_apply(AppState *state, const char *text,
+                                     guint64 sequence, gboolean commit);
+
+static void on_keyboard_apply_finished(GObject *object, GAsyncResult *result, gpointer user_data)
 {
-    if (!state || !state->web_view)
+    KeyboardApplyContext *context = (KeyboardApplyContext *)user_data;
+    AppState *state = context ? context->state : NULL;
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    char *apply_result = value ? jsc_value_to_string(value) : NULL;
+    if (!value) {
+        g_warning("Keyboard apply failed: %s", error ? error->message : "unknown");
+    } else {
+        g_print("Keyboard apply result: id=%s sequence=%" G_GUINT64_FORMAT " commit=%d %s\n",
+                context->request_id, context->sequence, context->commit,
+                apply_result ? apply_result : "(null)");
+        g_object_unref(value);
+    }
+    g_clear_error(&error);
+
+    if (!state || !state->keyboard_active_id ||
+        g_strcmp0(state->keyboard_active_id, context->request_id)) {
+        g_free(apply_result);
+        g_free(context->request_id);
+        g_free(context);
+        return;
+    }
+
+    state->keyboard_apply_in_flight = FALSE;
+    if (state->keyboard_queued_text) {
+        char *next_text = g_steal_pointer(&state->keyboard_queued_text);
+        guint64 next_sequence = state->keyboard_queued_sequence;
+        gboolean next_commit = state->keyboard_queued_commit;
+        state->keyboard_queued_sequence = 0;
+        state->keyboard_queued_commit = FALSE;
+        keyboard_start_web_apply(state, next_text, next_sequence, next_commit);
+        g_free(next_text);
+    } else if (context->commit && state->keyboard_terminal_pending) {
+        gboolean applied = apply_result && strstr(apply_result, "apply_ok=1");
+        keyboard_finish_active(state, "confirmed", applied ? "applied" : "apply_failed");
+    }
+    g_free(apply_result);
+    g_free(context->request_id);
+    g_free(context);
+}
+
+static void keyboard_start_web_apply(AppState *state, const char *text,
+                                     guint64 sequence, gboolean commit)
+{
+    if (!state || !state->web_view || !state->keyboard_active_id)
         return;
     char *quoted = js_quote_string(text ? text : "");
     char *script = g_strdup_printf(
@@ -990,36 +1496,68 @@ static void keyboard_insert_web_text(AppState *state, const char *text, gboolean
         "return 'apply_ok=0 target_alive=0 reason=no_bridge';"
         "})(%s,%s)",
         quoted, commit ? "true" : "false");
-    g_print("Keyboard insert web text: bytes=%zu commit=%d\n", strlen(text ? text : ""), commit);
-    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, on_keyboard_apply_finished, NULL);
+    KeyboardApplyContext *context = g_new0(KeyboardApplyContext, 1);
+    context->state = state;
+    context->request_id = g_strdup(state->keyboard_active_id);
+    context->sequence = sequence;
+    context->commit = commit;
+    state->keyboard_apply_in_flight = TRUE;
+    g_print("Keyboard apply queued: id=%s sequence=%" G_GUINT64_FORMAT " bytes=%zu commit=%d\n",
+            state->keyboard_active_id, sequence, strlen(text ? text : ""), commit);
+    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL,
+                                        on_keyboard_apply_finished, context);
     g_free(script);
     g_free(quoted);
 }
 
-static void keyboard_handle_update(AppState *state, const char *text)
+static void keyboard_queue_web_apply(AppState *state, const char *text,
+                                     guint64 sequence, gboolean commit)
+{
+    if (state->keyboard_apply_in_flight) {
+        g_free(state->keyboard_queued_text);
+        state->keyboard_queued_text = g_strdup(text ? text : "");
+        state->keyboard_queued_sequence = sequence;
+        state->keyboard_queued_commit = commit;
+        return;
+    }
+    keyboard_start_web_apply(state, text, sequence, commit);
+}
+
+static void keyboard_handle_update(AppState *state, const char *text, guint64 sequence)
 {
     if (!state || !state->keyboard_active_id || !state->keyboard_active_kind)
         return;
 
+    if (!sequence)
+        sequence = state->keyboard_last_sequence + 1;
+    if (sequence <= state->keyboard_last_sequence) {
+        g_print("Keyboard update ignored: id=%s sequence=%" G_GUINT64_FORMAT " last=%" G_GUINT64_FORMAT "\n",
+                state->keyboard_active_id, sequence, state->keyboard_last_sequence);
+        return;
+    }
+    state->keyboard_last_sequence = sequence;
     g_free(state->keyboard_pending_text);
     state->keyboard_pending_text = g_strdup(text ? text : "");
     state->keyboard_pending_text_valid = TRUE;
-    g_print("Keyboard update: id=%s kind=%s bytes=%zu\n",
+    g_print("Keyboard update: id=%s kind=%s sequence=%" G_GUINT64_FORMAT " bytes=%zu\n",
             state->keyboard_active_id,
             state->keyboard_active_kind,
+            sequence,
             strlen(text ? text : ""));
 
     if (!g_strcmp0(state->keyboard_active_kind, "web_input"))
-        keyboard_insert_web_text(state, text, FALSE);
+        keyboard_queue_web_apply(state, text, sequence, FALSE);
 }
 
-static void keyboard_handle_response(AppState *state, gboolean confirmed, const char *text)
+static void keyboard_handle_response(AppState *state, gboolean confirmed, const char *text,
+                                     gboolean has_text, guint64 sequence)
 {
     if (!state || !state->keyboard_active_id || !state->keyboard_active_kind)
         return;
 
-    const char *final_text = text ? text : "";
-    if (confirmed && state->keyboard_pending_text_valid && state->keyboard_pending_text)
+    const char *final_text = has_text ? (text ? text : "") : "";
+    if (confirmed && (!has_text || (sequence && sequence < state->keyboard_last_sequence)) &&
+        state->keyboard_pending_text_valid && state->keyboard_pending_text)
         final_text = state->keyboard_pending_text;
 
     g_print("Keyboard %s: id=%s kind=%s bytes=%zu\n",
@@ -1046,11 +1584,47 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
                 chrome_request_frame(state);
             } else
                 g_warning("Ignoring blocked home URL input: bytes=%zu", strlen(final_text));
-        } else if (!g_strcmp0(state->keyboard_active_kind, "web_input"))
-            keyboard_insert_web_text(state, final_text, TRUE);
+        } else if (!g_strcmp0(state->keyboard_active_kind, "profile_new")) {
+            BrowserProfile profile = { 0 };
+            GError *error = NULL;
+            if (!browser_profile_store_create_profile(profile_runtime.store, final_text,
+                                                      &profile, &error))
+                g_warning("Profile create failed: %s", error ? error->message : "unknown");
+            else {
+                g_print("Profile created: id=%" G_GINT64_FORMAT " name=%s\n",
+                        profile.id, profile.name);
+                chrome_switch_profile(state, profile.id, FALSE);
+            }
+            browser_profile_clear(&profile);
+            g_clear_error(&error);
+        } else if (!g_strcmp0(state->keyboard_active_kind, "profile_rename")) {
+            GError *error = NULL;
+            if (!browser_profile_store_rename_profile(profile_runtime.store,
+                    profile_runtime.profile.id, final_text, &error))
+                g_warning("Profile rename failed: %s", error ? error->message : "unknown");
+            else {
+                char *normalized = NULL;
+                if (browser_profile_store_is_name_valid(final_text, &normalized, NULL)) {
+                    g_free(profile_runtime.profile.name);
+                    profile_runtime.profile.name = normalized;
+                }
+                state->chrome.panel = CHROME_PANEL_PROFILE_MANAGE;
+                chrome_update_render_state(state);
+                g_print("Profile renamed: id=%" G_GINT64_FORMAT " name=%s\n",
+                        profile_runtime.profile.id, profile_runtime.profile.name);
+            }
+            g_clear_error(&error);
+        } else if (!g_strcmp0(state->keyboard_active_kind, "web_input")) {
+            guint64 final_sequence = MAX(sequence, state->keyboard_last_sequence);
+            if (!final_sequence)
+                final_sequence = 1;
+            state->keyboard_terminal_pending = TRUE;
+            keyboard_queue_web_apply(state, final_text, final_sequence, TRUE);
+            return;
+        }
     }
-
-    keyboard_clear_active(state);
+    keyboard_finish_active(state, confirmed ? "confirmed" : "cancelled",
+                           confirmed ? "accepted" : "user_cancelled");
 }
 
 /* 注意:该轮询只在键盘会话激活期间存在(keyboard_request 创建、
@@ -1070,7 +1644,7 @@ static gboolean keyboard_response_tick(gpointer user_data)
         g_warning("Keyboard timeout: id=%s kind=%s", state->keyboard_active_id,
                   state->keyboard_active_kind ? state->keyboard_active_kind : "");
         state->keyboard_response_source_id = 0;
-        keyboard_clear_active(state);
+        keyboard_finish_active(state, "expired", "timeout");
         return G_SOURCE_REMOVE;
     }
 
@@ -1088,7 +1662,14 @@ static gboolean keyboard_response_tick(gpointer user_data)
     gsize length = 0;
     if (update_path && g_file_get_contents(update_path, &contents, &length, NULL)) {
         g_unlink(update_path);
-        keyboard_handle_update(state, contents ? contents : "");
+        gboolean has_text = FALSE;
+        guint64 sequence = json_payload_sequence(contents);
+        char *text = json_payload_text(contents, &has_text);
+        if (has_text)
+            keyboard_handle_update(state, text, sequence);
+        else
+            g_warning("Keyboard update ignored: malformed payload id=%s", state->keyboard_active_id);
+        g_free(text);
         g_free(contents);
         contents = NULL;
     }
@@ -1102,7 +1683,11 @@ static gboolean keyboard_response_tick(gpointer user_data)
             g_free(cancel_path);
         }
         state->keyboard_response_source_id = 0;
-        keyboard_handle_response(state, TRUE, contents ? contents : "");
+        gboolean has_text = FALSE;
+        guint64 sequence = json_payload_sequence(contents);
+        char *text = json_payload_text(contents, &has_text);
+        keyboard_handle_response(state, TRUE, text, has_text, sequence);
+        g_free(text);
         g_free(contents);
         return G_SOURCE_REMOVE;
     }
@@ -1112,7 +1697,7 @@ static gboolean keyboard_response_tick(gpointer user_data)
         g_unlink(cancel_path);
         g_free(cancel_path);
         state->keyboard_response_source_id = 0;
-        keyboard_handle_response(state, FALSE, "");
+        keyboard_handle_response(state, FALSE, "", FALSE, 0);
         return G_SOURCE_REMOVE;
     }
     g_free(cancel_path);
@@ -1138,10 +1723,13 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
 
     char *requests_dir = g_build_filename(state->keyboard_dir, "requests", NULL);
     char *responses_dir = g_build_filename(state->keyboard_dir, "responses", NULL);
+    char *status_dir = g_build_filename(state->keyboard_dir, "status", NULL);
     g_mkdir_with_parents(requests_dir, 0700);
     g_mkdir_with_parents(responses_dir, 0700);
+    g_mkdir_with_parents(status_dir, 0700);
     g_free(requests_dir);
     g_free(responses_dir);
+    g_free(status_dir);
 
     state->keyboard_next_id++;
     char *id = g_strdup_printf("%" G_GUINT64_FORMAT "_%" G_GINT64_FORMAT,
@@ -1162,10 +1750,12 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
 
     gboolean ok = path && g_file_set_contents(path, payload, -1, NULL);
     if (ok) {
+        chmod(path, 0600);
         state->keyboard_active_id = g_strdup(id);
         state->keyboard_active_kind = g_strdup(kind ? kind : "");
         state->keyboard_pending_text = g_strdup(text ? text : "");
         state->keyboard_pending_text_valid = FALSE;
+        state->keyboard_last_sequence = 0;
         state->keyboard_active_us = g_get_monotonic_time();
         guint poll_ms = (guint)env_double("WPE_KEYBOARD_POLL_MS", 30);
         if (poll_ms < 16)
@@ -1252,14 +1842,17 @@ static void on_keyboard_script_message(WebKitUserContentManager *manager, JSCVal
     gint64 pointer_gate_us = (gint64)env_double("WPE_KEYBOARD_POINTER_GATE_MS", 2000) * 1000;
     gint64 since_pointer_us = state->last_pointer_tap_us > 0 ? g_get_monotonic_time() - state->last_pointer_tap_us : G_MAXINT64;
     if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
-        keyboard_request(state, "web_input",
-                         params_get_string(params, "text", ""),
-                         params_get_string(params, "placeholder", "请输入内容"),
-                         params_get_string(params, "inputType", "ZhCNPreferred"),
-                         params_get_int(params, "maxlength", 100),
-                         params_get_bool(params, "multiLinesEditVisible", FALSE));
-    } else
+        if (!keyboard_request(state, "web_input",
+                              params_get_string(params, "text", ""),
+                              params_get_string(params, "placeholder", "请输入内容"),
+                              params_get_string(params, "inputType", "ZhCNPreferred"),
+                              params_get_int(params, "maxlength", 100),
+                              params_get_bool(params, "multiLinesEditVisible", FALSE)))
+            keyboard_notify_page_complete(state);
+    } else {
         g_print("Keyboard web_input ignored: no recent pointer tap since_us=%" G_GINT64_FORMAT "\n", since_pointer_us);
+        keyboard_notify_page_complete(state);
+    }
     g_hash_table_unref(params);
     g_free(message);
 }
@@ -1276,12 +1869,15 @@ static void setup_keyboard_bridge(AppState *state)
     state->keyboard_dir = g_strdup(keyboard_dir);
     char *requests_dir = g_build_filename(state->keyboard_dir, "requests", NULL);
     char *responses_dir = g_build_filename(state->keyboard_dir, "responses", NULL);
+    char *status_dir = g_build_filename(state->keyboard_dir, "status", NULL);
     g_mkdir_with_parents(requests_dir, 0700);
     g_mkdir_with_parents(responses_dir, 0700);
-    g_print("Keyboard bridge: dir=%s requests=%s responses=%s\n",
-            state->keyboard_dir, requests_dir, responses_dir);
+    g_mkdir_with_parents(status_dir, 0700);
+    g_print("Keyboard bridge: dir=%s requests=%s responses=%s status=%s\n",
+            state->keyboard_dir, requests_dir, responses_dir, status_dir);
     g_free(requests_dir);
     g_free(responses_dir);
+    g_free(status_dir);
 }
 
 static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppState *state)
@@ -1300,7 +1896,7 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "window.__haasKeyboardTarget=null;"
         "window.__haasKeyboardTargetId='';"
         "window.__haasKeyboardSeq=1;"
-        "window.__haasKeyboardLastAt=0;"
+        "window.__haasKeyboardInFlight=false;"
         "function editable(el){return !!(el&&((el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(el.type||''))||el.tagName==='TEXTAREA'||el.isContentEditable)&&!el.disabled&&!el.readOnly);}"
         "function closestEditable(el){while(el&&el!==document){if(editable(el))return el;el=el.parentElement;}return null;}"
         "function enc(v){return encodeURIComponent(v==null?'':String(v));}"
@@ -1308,13 +1904,13 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "function typeOf(el){var t=String(el.getAttribute('type')||'').toLowerCase();if(t==='number'||t==='tel')return 'Number';if(t==='email'||t==='url'||t==='password')return 'EnUSPreferred';return 'ZhCNPreferred';}"
         "function mark(el){var id=el.getAttribute('data-haas-keyboard-id');if(!id){id='hk'+Date.now().toString(36)+(window.__haasKeyboardSeq++).toString(36);try{el.setAttribute('data-haas-keyboard-id',id);}catch(e){}}window.__haasKeyboardTargetId=id||'';return id||'';}"
         "function findTarget(){var el=window.__haasKeyboardTarget;if(editable(el)&&document.documentElement&&document.documentElement.contains(el))return el;var id=window.__haasKeyboardTargetId;if(id&&document.querySelector){try{el=document.querySelector('[data-haas-keyboard-id=\"'+id+'\"]');if(editable(el))return el;}catch(e){}}el=document.activeElement;if(editable(el))return el;return null;}"
-        "function request(el){el=closestEditable(el);if(!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;var now=Date.now();if(window.__haasKeyboardTarget===el&&now-window.__haasKeyboardLastAt<600)return;window.__haasKeyboardTarget=el;mark(el);window.__haasKeyboardLastAt=now;var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
-        "document.addEventListener('focusin',function(e){var el=closestEditable(e.target);if(el)setTimeout(function(){request(el);},0);},true);"
+        "function request(el){el=closestEditable(el);if(window.__haasKeyboardInFlight||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
         "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var el=closestEditable(e.target);if(el)setTimeout(function(){request(el);},0);},true);"
         "function diffType(oldv,newv){oldv=String(oldv==null?'':oldv);newv=String(newv==null?'':newv);if(newv.length<oldv.length){return oldv.indexOf(newv)===0?'deleteContentBackward':'deleteContentForward';}if(newv.length>oldv.length){return newv.indexOf(oldv)===0?'insertText':'insertReplacementText';}return 'insertReplacementText';}"
         "function makeInputEvent(name,typ,data,cancelable){try{return new InputEvent(name,{bubbles:true,cancelable:!!cancelable,inputType:typ,data:data});}catch(e){var ev=document.createEvent('Event');ev.initEvent(name,true,!!cancelable);try{ev.inputType=typ;ev.data=data;}catch(_e){}return ev;}}"
         "function nativeSet(el,value,oldv){if(el.isContentEditable){el.textContent=value;return;}var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,value);else el.value=value;var tracker=el._valueTracker;if(tracker){try{tracker.setValue(oldv);}catch(e){}}if(el.setSelectionRange){try{el.setSelectionRange(String(value).length,String(value).length);}catch(e){}}}"
         "window.__haasKeyboardSetText=function(text,commit){var el=findTarget();if(!editable(el))return 'apply_ok=0 target_alive=0 reason=no_target';var value=String(text==null?'':text);var oldv=valueOf(el);var typ=diffType(oldv,value);var data=typ.indexOf('delete')===0?null:value;try{el.focus();}catch(e){}try{el.dispatchEvent(makeInputEvent('beforeinput',typ,data,true));nativeSet(el,value,oldv);el.dispatchEvent(makeInputEvent('input',typ,data,false));if(commit){var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}return 'apply_ok=1 target_alive=1 inputType='+typ+' value='+enc(valueOf(el))+' commit='+(commit?1:0);}catch(e){return 'apply_ok=0 target_alive=1 reason='+enc(e&&e.message?e.message:String(e));}};"
+        "window.__haasKeyboardComplete=function(){window.__haasKeyboardInFlight=false;};"
         "})();";
     WebKitUserScript *script = webkit_user_script_new(source,
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
@@ -1369,25 +1965,178 @@ static void chrome_toggle_site_profile(AppState *state)
     chrome_load_url(state, reload_url, FALSE);
 }
 
-static void chrome_select_panel_row(AppState *state, int row)
+static void chrome_apply_cookie_policy(AppState *state, BrowserCookiePolicy policy)
+{
+    if (!state || !state->network_session)
+        return;
+    state->chrome.cookie_policy = policy;
+    profile_runtime.profile.cookie_policy = policy;
+    WebKitCookieManager *manager = webkit_network_session_get_cookie_manager(state->network_session);
+    webkit_cookie_manager_set_accept_policy(manager, webkit_cookie_policy(policy));
+    chrome_save_state(state);
+    g_print("Cookie policy changed: profile=%s policy=%s\n",
+            profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+            browser_cookie_policy_name(policy));
+}
+
+static void chrome_cycle_cookie_policy(AppState *state)
+{
+    BrowserCookiePolicy policy = state->chrome.cookie_policy;
+    if (profile_runtime.guest) {
+        g_print("Guest cookie policy remains session-only\n");
+        return;
+    }
+    policy = policy == BROWSER_COOKIE_ACCEPT_ALL ? BROWSER_COOKIE_NO_THIRD_PARTY
+        : policy == BROWSER_COOKIE_NO_THIRD_PARTY ? BROWSER_COOKIE_ACCEPT_NEVER
+        : BROWSER_COOKIE_ACCEPT_ALL;
+    chrome_apply_cookie_policy(state, policy);
+}
+
+static gboolean chrome_write_profile_switch(const char *value)
+{
+    const char *path = g_getenv("WPE_PROFILE_SWITCH_FILE");
+    char *fallback = NULL;
+    if (!path || !path[0]) {
+        const char *var_dir = g_getenv("WPE_VAR_DIR");
+        fallback = g_build_filename(var_dir && var_dir[0] ? var_dir : "/tmp",
+                                    "profile-switch.request", NULL);
+        path = fallback;
+    }
+    char *directory = g_path_get_dirname(path);
+    g_mkdir_with_parents(directory, 0700);
+    chmod(directory, 0700);
+    g_free(directory);
+    char *contents = g_strdup_printf("%s\n", value);
+    gboolean success = g_file_set_contents(path, contents, -1, NULL);
+    if (success)
+        chmod(path, 0600);
+    else
+        g_warning("Profile switch file write failed: %s", path);
+    g_free(contents);
+    g_free(fallback);
+    return success;
+}
+
+static void chrome_switch_profile(AppState *state, int64_t profile_id, gboolean guest)
+{
+    if (!state)
+        return;
+    chrome_save_state(state);
+    GError *error = NULL;
+    char value[32];
+    if (guest)
+        g_strlcpy(value, "guest", sizeof(value));
+    else {
+        if (!browser_profile_store_set_active_profile(profile_runtime.store, profile_id, &error)) {
+            g_warning("Profile switch rejected: %s", error ? error->message : "unknown");
+            g_clear_error(&error);
+            return;
+        }
+        g_snprintf(value, sizeof(value), "%" G_GINT64_FORMAT, profile_id);
+    }
+    if (!chrome_write_profile_switch(value))
+        return;
+    g_print("Profile switch requested: from=%s to=%s exit=75\n",
+            profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT", value);
+    runtime_exit_code = 75;
+    if (main_loop)
+        g_main_loop_quit(main_loop);
+}
+
+static void on_clear_site_data_finished(GObject *object, GAsyncResult *result, gpointer user_data)
+{
+    AppState *state = (AppState *)user_data;
+    if (!state)
+        return;
+
+    GError *error = NULL;
+    gboolean success = webkit_website_data_manager_clear_finish(
+        WEBKIT_WEBSITE_DATA_MANAGER(object), result, &error);
+    state->chrome.site_data_clearing = FALSE;
+    g_strlcpy(state->chrome.site_data_status,
+              success ? "SITE DATA CLEARED" : "CLEAR FAILED",
+              sizeof(state->chrome.site_data_status));
+    if (success)
+        g_print("Profile site data cleared: profile=%s guest=%d\n",
+                profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+                profile_runtime.guest);
+    else
+        g_warning("Profile site data clear failed: %s", error ? error->message : "unknown");
+    g_clear_error(&error);
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
+}
+
+static void chrome_clear_site_data(AppState *state)
+{
+    if (!state || !state->network_session || state->chrome.site_data_clearing)
+        return;
+    WebKitWebsiteDataManager *manager = webkit_network_session_get_website_data_manager(state->network_session);
+    state->chrome.site_data_clearing = TRUE;
+    state->chrome.site_data_status[0] = '\0';
+    state->chrome.panel = CHROME_PANEL_PRIVACY;
+    webkit_website_data_manager_clear(manager, WEBKIT_WEBSITE_DATA_ALL, 0, NULL,
+                                      on_clear_site_data_finished, state);
+    g_print("Profile site data clear requested: profile=%s guest=%d\n",
+            profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+            profile_runtime.guest);
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
+}
+
+static void chrome_open_history(AppState *state, gboolean bookmarks)
 {
     BrowserChrome *chrome = &state->chrome;
-    if (chrome->panel == CHROME_PANEL_ADDRESS) {
-        if (row == 0)
-            chrome_load_url(state, chrome->home_url ? chrome->home_url : default_home_url(), TRUE);
-        else if (row == 1)
-            chrome_load_url(state, "https://m.baidu.com/", TRUE);
+    chrome->panel = bookmarks ? CHROME_PANEL_BOOKMARKS : CHROME_PANEL_HISTORY;
+    chrome->panel_page = 0;
+    chrome->panel_delete_mode = FALSE;
+    chrome_refresh_pages(chrome, bookmarks);
+    chrome_update_render_state(state);
+}
+
+static void chrome_go_panel_back(AppState *state)
+{
+    BrowserChrome *chrome = &state->chrome;
+    ChromePanel parent = chrome_panel_parent(chrome->panel);
+    chrome->panel = parent;
+    chrome->panel_page = 0;
+    chrome->panel_delete_mode = FALSE;
+    if (parent == CHROME_PANEL_PROFILES)
+        chrome_refresh_profiles(chrome);
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
+}
+
+static void chrome_select_panel_row(AppState *state, double x, int row)
+{
+    BrowserChrome *chrome = &state->chrome;
+    int panel_width = state->panel_width > 0 ? state->panel_width : 960;
+    if (chrome->panel == CHROME_PANEL_MENU) {
+        if (row == 0 && !profile_runtime.guest) {
+            BrowserTab *tab = chrome_active_tab(chrome);
+            if (tab && tab->url[0]) {
+                GError *error = NULL;
+                gboolean added = FALSE;
+                if (!browser_profile_store_toggle_bookmark(profile_runtime.store,
+                        profile_runtime.profile.id, tab->url, tab->title, &added, &error))
+                    g_warning("Bookmark toggle failed: %s", error ? error->message : "unknown");
+                else
+                    g_print("Bookmark %s: %s\n", added ? "added" : "removed", tab->url);
+                g_clear_error(&error);
+            }
+        } else if (row == 1)
+            chrome_open_history(state, FALSE);
         else if (row == 2)
-            chrome_load_url(state, "https://www.bing.com/", TRUE);
-        else if (row == 3)
-            chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
-    } else if (chrome->panel == CHROME_PANEL_TABS) {
-        if (row >= 0 && row < chrome->tab_count)
-            chrome_switch_tab(state, row);
-        else if (row == chrome->tab_count)
-            chrome_new_tab(state, chrome->home_url);
-        else if (row == chrome->tab_count + 1)
-            chrome_close_active_tab(state);
+            chrome_open_history(state, TRUE);
+        else if (row == 3) {
+            chrome->panel = CHROME_PANEL_PROFILES;
+            chrome->panel_page = 0;
+            chrome_refresh_profiles(chrome);
+        } else if (row == 4) {
+            chrome->panel = CHROME_PANEL_PRIVACY;
+            chrome->site_data_status[0] = '\0';
+        } else if (row == 5)
+            chrome->panel = CHROME_PANEL_SETTINGS;
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
         if (row == 0) {
             chrome->panel = CHROME_PANEL_NONE;
@@ -1401,14 +2150,194 @@ static void chrome_select_panel_row(AppState *state, int row)
             chrome_save_state(state);
         } else if (row == 3) {
             chrome_clear_cache();
-            chrome->panel = CHROME_PANEL_NONE;
+            chrome->panel = CHROME_PANEL_MENU;
             chrome_save_state(state);
         } else if (row == 4) {
-            g_print("About: Direct WPE DRM browser chrome\n");
+            g_print("About: Direct WPE DRM browser profile=%s guest=%d\n",
+                    profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+                    profile_runtime.guest);
+        }
+    } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
+        if (row == 0)
+            chrome_cycle_cookie_policy(state);
+        else if (row == 1 && !chrome->site_data_clearing) {
+            chrome->panel = CHROME_PANEL_CLEAR_SITE_DATA;
+            chrome_update_render_state(state);
+        }
+    } else if (chrome->panel == CHROME_PANEL_CLEAR_SITE_DATA) {
+        if (row == 0)
+            chrome->panel = CHROME_PANEL_PRIVACY;
+        else if (row == 1)
+            chrome_clear_site_data(state);
+    } else if (chrome->panel == CHROME_PANEL_PROFILES) {
+        guint offset = chrome->panel_page * 4;
+        if (row >= 0 && row < 4 && chrome->panel_profiles
+                && offset + row < chrome->panel_profiles->len) {
+            BrowserProfile *profile = g_ptr_array_index(chrome->panel_profiles, offset + row);
+            if (!profile_runtime.guest && profile->id == profile_runtime.profile.id) {
+                chrome->panel = CHROME_PANEL_PROFILE_MANAGE;
+                chrome_update_render_state(state);
+            } else
+                chrome_switch_profile(state, profile->id, FALSE);
+        } else if (row == 4) {
+            if (x < panel_width / 2)
+                chrome_switch_profile(state, 0, TRUE);
+            else
+                keyboard_request(state, "profile_new", "", "新建 Profile 名称",
+                                 "ZhCNPreferred", 20, FALSE);
+        } else if (row == 5) {
+            if (x < panel_width / 3) {
+                if (chrome->panel_page > 0)
+                    chrome->panel_page--;
+                chrome_refresh_profiles(chrome);
+            } else if (x < panel_width * 2 / 3) {
+                if (chrome->panel_profiles
+                        && (chrome->panel_page + 1) * 4 < chrome->panel_profiles->len)
+                    chrome->panel_page++;
+                chrome_refresh_profiles(chrome);
+            } else {
+                chrome->panel = CHROME_PANEL_PROFILE_MANAGE;
+                chrome_update_render_state(state);
+            }
+        }
+    } else if (chrome->panel == CHROME_PANEL_PROFILE_MANAGE) {
+        if (row == 0 && !profile_runtime.guest)
+            keyboard_request(state, "profile_rename", profile_runtime.profile.name,
+                             "重命名 Profile", "ZhCNPreferred", 20, FALSE);
+        else if (row == 1 && !profile_runtime.guest && !profile_runtime.profile.is_default) {
+            chrome->panel = CHROME_PANEL_PROFILE_DELETE;
+            chrome_update_render_state(state);
+        }
+    } else if (chrome->panel == CHROME_PANEL_PROFILE_DELETE) {
+        if (row == 0) {
+            chrome->panel = CHROME_PANEL_PROFILE_MANAGE;
+        } else if (row == 1) {
+            GError *error = NULL;
+            int64_t fallback = 0;
+            if (!browser_profile_store_prepare_delete_profile(profile_runtime.store,
+                    profile_runtime.profile.id, &fallback, &error))
+                g_warning("Profile delete failed: %s", error ? error->message : "unknown");
+            else {
+                char value[32];
+                g_snprintf(value, sizeof(value), "%" G_GINT64_FORMAT, fallback);
+                if (chrome_write_profile_switch(value)) {
+                    runtime_exit_code = 75;
+                    if (main_loop)
+                        g_main_loop_quit(main_loop);
+                }
+            }
+            g_clear_error(&error);
+        }
+    } else if (chrome->panel == CHROME_PANEL_HISTORY
+               || chrome->panel == CHROME_PANEL_BOOKMARKS) {
+        gboolean bookmarks = chrome->panel == CHROME_PANEL_BOOKMARKS;
+        if (row >= 0 && row < 6 && chrome->panel_pages
+                && row < (int)chrome->panel_pages->len) {
+            BrowserStoredPage *page = g_ptr_array_index(chrome->panel_pages, row);
+            if (chrome->panel_delete_mode) {
+                GError *error = NULL;
+                gboolean success = bookmarks
+                    ? browser_profile_store_delete_bookmark(profile_runtime.store,
+                        profile_runtime.profile.id, page->id, &error)
+                    : browser_profile_store_delete_visit(profile_runtime.store,
+                        profile_runtime.profile.id, page->id, &error);
+                if (!success)
+                    g_warning("Page entry delete failed: %s", error ? error->message : "unknown");
+                g_clear_error(&error);
+                chrome_refresh_pages(chrome, bookmarks);
+            } else {
+                char *url = g_strdup(page->url);
+                chrome->panel = CHROME_PANEL_NONE;
+                chrome_load_url(state, url, TRUE);
+                g_free(url);
+            }
+        } else if (row == 6) {
+            if (x < panel_width / 2) {
+                if (chrome->panel_page > 0)
+                    chrome->panel_page--;
+            } else if (chrome->panel_pages && chrome->panel_pages->len == 6)
+                chrome->panel_page++;
+            chrome_refresh_pages(chrome, bookmarks);
+        } else if (row == 7) {
+            if (bookmarks || x < panel_width / 2)
+                chrome->panel_delete_mode = !chrome->panel_delete_mode;
+            else {
+                chrome->panel = CHROME_PANEL_CLEAR_HISTORY;
+                chrome_update_render_state(state);
+            }
+        }
+    } else if (chrome->panel == CHROME_PANEL_CLEAR_HISTORY) {
+        if (row == 0) {
+            chrome->panel = CHROME_PANEL_HISTORY;
+            chrome_refresh_pages(chrome, FALSE);
+        } else if (row == 1 && !profile_runtime.guest) {
+            GError *error = NULL;
+            if (!browser_profile_store_clear_visits(profile_runtime.store,
+                    profile_runtime.profile.id, &error))
+                g_warning("History clear failed: %s", error ? error->message : "unknown");
+            g_clear_error(&error);
+            chrome->panel = CHROME_PANEL_HISTORY;
+            chrome->panel_page = 0;
+            chrome_refresh_pages(chrome, FALSE);
         }
     }
     chrome_update_render_state(state);
     chrome_request_frame(state);
+}
+
+static gboolean chrome_handle_tabs_panel_tap(AppState *state, double x, double y)
+{
+    BrowserChrome *chrome = &state->chrome;
+    if (chrome->panel != CHROME_PANEL_TABS)
+        return FALSE;
+    ChromeTabsGeometry geometry = chrome_tabs_geometry(state);
+    if (y < geometry.panel_y)
+        return FALSE;
+
+    if (x < geometry.panel_x || x >= geometry.panel_x + geometry.panel_width) {
+        chrome->panel = CHROME_PANEL_NONE;
+        chrome_save_state(state);
+        chrome_request_frame(state);
+        g_print("Chrome tabs: outside dismiss x=%.1f y=%.1f\n", x, y);
+        return TRUE;
+    }
+    if (y < geometry.list_top) {
+        chrome_go_panel_back(state);
+        return TRUE;
+    }
+    if (y >= geometry.footer_top) {
+        if (chrome->tab_count >= MAX_BROWSER_TABS) {
+            g_print("Chrome tabs: new tab disabled count=%d max=%d\n",
+                    chrome->tab_count, MAX_BROWSER_TABS);
+            return TRUE;
+        }
+        g_print("Chrome tabs: new tab x=%.1f y=%.1f\n", x, y);
+        chrome_new_tab(state, chrome->home_url);
+        return TRUE;
+    }
+    if (geometry.list_height <= 0)
+        return TRUE;
+
+    int row = (int)floor((y - geometry.list_top + chrome->tabs_scroll_offset)
+                         / geometry.row_height);
+    if (row < 0 || row >= chrome->tab_count)
+        return TRUE;
+    int close_x = geometry.panel_x + geometry.panel_width
+        - CHROME_TABS_CLOSE_HIT_WIDTH;
+    if (x >= close_x) {
+        g_print("Chrome tabs: close row=%d active=%d\n", row, chrome->active);
+        chrome_close_tab(state, row);
+        return TRUE;
+    }
+
+    g_print("Chrome tabs: select row=%d active=%d\n", row, chrome->active);
+    chrome->panel = CHROME_PANEL_NONE;
+    if (row == chrome->active) {
+        chrome_save_state(state);
+        chrome_request_frame(state);
+    } else
+        chrome_switch_tab(state, row);
+    return TRUE;
 }
 
 static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
@@ -1428,11 +2357,19 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
 
     int toolbar_y = chrome_toolbar_y(chrome);
     int panel_y = toolbar_y + chrome->height;
-    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y + 30) {
-        int row = (int)((y - panel_y - 30) / 28);
+    if (chrome_handle_tabs_panel_tap(state, x, y))
+        return;
+    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y && y < panel_y + 22) {
+        g_print("Chrome tap: panel back from=%s x=%.1f y=%.1f\n",
+                chrome_panel_name(chrome->panel), x, y);
+        chrome_go_panel_back(state);
+        return;
+    }
+    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y + 22) {
+        int row = (int)((y - panel_y - 22) / 24);
         if (row >= 0) {
             g_print("Chrome tap: panel=%s row=%d x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), row, x, y);
-            chrome_select_panel_row(state, row);
+            chrome_select_panel_row(state, x, row);
         }
         return;
     }
@@ -1447,22 +2384,29 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
     }
 
     int panel_width = state->panel_width > 0 ? state->panel_width : 960;
-    if (x < panel_width / 2) {
+    if (x < chrome_address_right(panel_width)) {
         BrowserTab *tab = chrome_active_tab(chrome);
-        const char *current = tab && tab->url[0] ? tab->url : (chrome->home_url ? chrome->home_url : default_home_url());
+        const char *current = tab && tab->url[0]
+            ? tab->url
+            : (chrome->home_url ? chrome->home_url : default_home_url());
         chrome->panel = CHROME_PANEL_NONE;
         chrome_set_visible(state, TRUE);
         chrome_save_state(state);
         chrome_request_frame(state);
-        keyboard_request(state, "address", current, "输入网址或搜索", "EnUSPreferred", 512, FALSE);
-        g_print("Chrome tap: address keyboard x=%.1f y=%.1f\n", x, y);
+        g_print("Chrome tap: edit address x=%.1f y=%.1f\n", x, y);
+        keyboard_request(state, "address", current, "输入网址或搜索",
+                         "EnUSPreferred", 512, FALSE);
         return;
     }
 
-    int button_x = panel_width / 2 + 8;
-    int button_w = MAX(36, (panel_width - button_x - 8) / 6);
+    int button_x = chrome_toolbar_controls_x(panel_width);
+    int button_w = chrome_toolbar_legacy_button_width(panel_width);
+    if (x < button_x) {
+        g_print("Chrome tap ignored: toolbar gap x=%.1f button_x=%d\n", x, button_x);
+        return;
+    }
     int index = (int)((x - button_x) / button_w);
-    if (index < 0 || index > 5) {
+    if (index < 0 || index >= CHROME_TOOLBAR_BUTTON_COUNT) {
         g_print("Chrome tap ignored: button index=%d x=%.1f y=%.1f button_x=%d button_w=%d\n",
                 index, x, y, button_x, button_w);
         return;
@@ -1475,21 +2419,23 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
         g_print("Chrome tap: forward x=%.1f y=%.1f\n", x, y);
         chrome_go_forward(state);
     } else if (index == 2) {
-        chrome->panel = chrome->panel == CHROME_PANEL_TABS ? CHROME_PANEL_NONE : CHROME_PANEL_TABS;
+        if (chrome->panel == CHROME_PANEL_TABS)
+            chrome->panel = CHROME_PANEL_NONE;
+        else
+            chrome_open_tabs_panel(state);
         g_print("Chrome tap: tabs panel=%s x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), x, y);
         chrome_save_state(state);
     } else if (index == 3) {
-        g_print("Chrome tap: new tab x=%.1f y=%.1f\n", x, y);
-        chrome_new_tab(state, chrome->home_url);
-    } else if (index == 4) {
         g_print("Chrome tap: %s x=%.1f y=%.1f\n", chrome->loading ? "stop" : "reload", x, y);
         if (chrome->loading)
             webkit_web_view_stop_loading(state->web_view);
         else if (chrome_active_tab(chrome))
             chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
-    } else if (index == 5) {
-        chrome->panel = chrome->panel == CHROME_PANEL_SETTINGS ? CHROME_PANEL_NONE : CHROME_PANEL_SETTINGS;
-        g_print("Chrome tap: settings panel=%s x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), x, y);
+    } else if (index == 4) {
+        chrome->panel = chrome->panel == CHROME_PANEL_MENU ? CHROME_PANEL_NONE : CHROME_PANEL_MENU;
+        chrome->panel_page = 0;
+        chrome->panel_delete_mode = FALSE;
+        g_print("Chrome tap: menu panel=%s x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), x, y);
         chrome_save_state(state);
     }
     chrome_update_render_state(state);
@@ -1506,7 +2452,8 @@ static gboolean chrome_touch_down_consumes(AppState *state, double x, double y)
         return TRUE;
     int toolbar_y = chrome_toolbar_y(chrome);
     int panel_y = toolbar_y + chrome->height;
-    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y && y <= 240)
+    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y
+            && y <= (state->panel_height > 0 ? state->panel_height : 266))
         return TRUE;
     int hit_top = toolbar_y < 0 ? 0 : toolbar_y;
     int hit_bottom = toolbar_y + chrome->height + chrome_toolbar_hit_slop();
@@ -1590,10 +2537,13 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     chrome->hide_down_px = env_double("WPE_CHROME_HIDE_DOWN_PX", 96);
     chrome->show_up_px = env_double("WPE_CHROME_SHOW_UP_PX", 180);
     chrome->show_up_min_velocity_px_s = env_double("WPE_CHROME_SHOW_UP_MIN_VELOCITY", 700);
-    chrome->state_path = g_strdup(g_getenv("WPE_CHROME_STATE") && g_getenv("WPE_CHROME_STATE")[0] ? g_getenv("WPE_CHROME_STATE") : "/tmp/wpe-drm2-browser-state.ini");
     chrome->render_state_path = g_strdup(g_getenv("WPE_CHROME_RENDER_STATE") && g_getenv("WPE_CHROME_RENDER_STATE")[0] ? g_getenv("WPE_CHROME_RENDER_STATE") : "/tmp/wpe-drm2-chrome-state.ini");
-    chrome->home_url = g_strdup(default_home_url());
-    g_strlcpy(chrome->site_profile, "mobile", sizeof(chrome->site_profile));
+    chrome->home_url = g_strdup(profile_runtime.profile.home_url && profile_runtime.profile.home_url[0]
+        ? profile_runtime.profile.home_url : default_home_url());
+    g_strlcpy(chrome->site_profile,
+              normalize_site_profile(profile_runtime.profile.site_profile),
+              sizeof(chrome->site_profile));
+    chrome->cookie_policy = profile_runtime.profile.cookie_policy;
     chrome->tab_count = 1;
     chrome->active = 0;
     chrome->next_tab_id = 2;
@@ -1603,54 +2553,43 @@ static void chrome_load_state(AppState *state, const char *initial_url)
             chrome->enabled, chrome->height,
             chrome->hide_down_px, chrome->show_up_px, chrome->show_up_min_velocity_px_s);
 
-    GKeyFile *key_file = g_key_file_new();
-    if (g_key_file_load_from_file(key_file, chrome->state_path, G_KEY_FILE_NONE, NULL)) {
-        gchar *home = g_key_file_get_string(key_file, "settings", "home_url", NULL);
-        if (home && home[0]) {
-            g_free(chrome->home_url);
-            chrome->home_url = home;
-            home = NULL;
-        }
-        g_free(home);
-        gchar *site_profile = g_key_file_get_string(key_file, "settings", "site_profile", NULL);
-        g_strlcpy(chrome->site_profile, normalize_site_profile(site_profile), sizeof(chrome->site_profile));
-        g_free(site_profile);
-        chrome->touch_debug = g_key_file_get_boolean(key_file, "settings", "touch_debug", NULL);
-        int count = g_key_file_get_integer(key_file, "tabs", "count", NULL);
-        if (count > 0 && count <= MAX_BROWSER_TABS) {
-            for (int i = 0; i < chrome->tab_count; ++i)
-                chrome_clear_tab(&chrome->tabs[i]);
-            chrome->tab_count = count;
-            chrome->active = CLAMP(g_key_file_get_integer(key_file, "tabs", "active", NULL), 0, count - 1);
-            chrome->next_tab_id = MAX(1, g_key_file_get_integer(key_file, "tabs", "next_id", NULL));
-            for (int i = 0; i < count; ++i) {
-                BrowserTab *tab = &chrome->tabs[i];
-                char group[32];
-                snprintf(group, sizeof(group), "tab%d", i);
-                tab->id = g_key_file_get_integer(key_file, group, "id", NULL);
-                if (!tab->id)
-                    tab->id = i + 1;
-                gchar *url = g_key_file_get_string(key_file, group, "url", NULL);
-                chrome_set_tab_url(tab, url && url[0] ? url : chrome->home_url);
-                g_free(url);
-                gchar *title = g_key_file_get_string(key_file, group, "title", NULL);
-                if (title)
-                    g_strlcpy(tab->title, title, sizeof(tab->title));
-                g_free(title);
-                gsize list_len = 0;
-                gchar **list = g_key_file_get_string_list(key_file, group, "back", &list_len, NULL);
-                for (gsize j = 0; list && j < list_len && tab->back_count < MAX_BROWSER_HISTORY; ++j)
-                    tab->back[tab->back_count++] = g_strdup(list[j]);
-                g_strfreev(list);
-                list_len = 0;
-                list = g_key_file_get_string_list(key_file, group, "forward", &list_len, NULL);
-                for (gsize j = 0; list && j < list_len && tab->forward_count < MAX_BROWSER_HISTORY; ++j)
-                    tab->forward[tab->forward_count++] = g_strdup(list[j]);
-                g_strfreev(list);
+    if (!profile_runtime.guest && profile_runtime.store) {
+        GError *error = NULL;
+        guint next_tab_id = 2;
+        GPtrArray *stored_tabs = browser_profile_store_load_tabs(profile_runtime.store,
+            profile_runtime.profile.id, &next_tab_id, &error);
+        if (!stored_tabs)
+            g_warning("Profile tabs load failed: %s", error ? error->message : "unknown");
+        else if (stored_tabs->len) {
+            chrome_clear_tab(&chrome->tabs[0]);
+            chrome->tab_count = MIN((int)stored_tabs->len, MAX_BROWSER_TABS);
+            chrome->active = 0;
+            chrome->next_tab_id = MAX(2, next_tab_id);
+            for (int index = 0; index < chrome->tab_count; ++index) {
+                BrowserStoredTab *stored = g_ptr_array_index(stored_tabs, index);
+                BrowserTab *tab = &chrome->tabs[index];
+                tab->id = stored->logical_id ? stored->logical_id : (guint)index + 1;
+                chrome_set_tab_url(tab, stored->url && stored->url[0] ? stored->url : chrome->home_url);
+                if (stored->title)
+                    g_strlcpy(tab->title, stored->title, sizeof(tab->title));
+                for (guint item = 0; stored->back && item < stored->back->len
+                        && tab->back_count < MAX_BROWSER_HISTORY; ++item)
+                    tab->back[tab->back_count++] = g_strdup(g_ptr_array_index(stored->back, item));
+                for (guint item = 0; stored->forward && item < stored->forward->len
+                        && tab->forward_count < MAX_BROWSER_HISTORY; ++item)
+                    tab->forward[tab->forward_count++] = g_strdup(g_ptr_array_index(stored->forward, item));
+                if (stored->active)
+                    chrome->active = index;
             }
         }
+        g_clear_error(&error);
+        g_clear_pointer(&stored_tabs, g_ptr_array_unref);
     }
-    g_key_file_unref(key_file);
+    g_print("Chrome profile state: name=%s guest=%d home=%s site_profile=%s cookie_policy=%s tabs=%d active=%d\n",
+            profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+            profile_runtime.guest, chrome->home_url,
+            chrome->site_profile, browser_cookie_policy_name(chrome->cookie_policy),
+            chrome->tab_count, chrome->active);
     chrome_update_render_state(state);
 }
 
@@ -1659,14 +2598,18 @@ static void chrome_destroy(AppState *state)
     if (!state)
         return;
     BrowserChrome *chrome = &state->chrome;
-    chrome_save_state(state);
+    if (runtime_exit_code != 75)
+        chrome_save_state(state);
+    else
+        chrome_update_render_state(state);
     if (chrome->layout_timer) {
         g_source_remove(chrome->layout_timer);
         chrome->layout_timer = 0;
     }
     for (int i = 0; i < chrome->tab_count; ++i)
         chrome_clear_tab(&chrome->tabs[i]);
-    g_free(chrome->state_path);
+    g_clear_pointer(&chrome->panel_profiles, g_ptr_array_unref);
+    g_clear_pointer(&chrome->panel_pages, g_ptr_array_unref);
     g_free(chrome->render_state_path);
     g_free(chrome->home_url);
 }
@@ -1878,7 +2821,7 @@ static void schedule_scroll_stop(AppState *state)
 
 static void send_touch_event(AppState *state, WPEEventType type, guint32 sequence_id, double x, double y, guint32 time_ms)
 {
-    if (!state->send_touch_events)
+    if (!state->send_touch_events && !state->game_input_active)
         return;
 
     double view_y = web_event_y(state, y);
@@ -2145,13 +3088,21 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             slot->max_move_sq = 0;
             slot->scrolling = FALSE;
             slot->chrome_consumed = chrome_touch_down_consumes(state, slot->x, slot->y);
+            slot->tabs_scroll_candidate = FALSE;
+            if (slot->chrome_consumed && state->chrome.panel == CHROME_PANEL_TABS) {
+                ChromeTabsGeometry geometry = chrome_tabs_geometry(state);
+                slot->tabs_scroll_candidate = slot->x >= geometry.panel_x
+                    && slot->x < geometry.panel_x + geometry.panel_width
+                    && slot->y >= geometry.list_top
+                    && slot->y < geometry.footer_top;
+            }
             g_print("Touch down: raw=%d,%d mapped=%.1f,%.1f chrome=%d visible=%d panel=%s\n",
                     slot->raw_x, slot->raw_y, slot->x, slot->y, slot->chrome_consumed,
                     state->chrome.visible, chrome_panel_name(state->chrome.panel));
-            if (!slot->chrome_consumed && !state->touch_scroll_fallback)
+            if (!slot->chrome_consumed && (state->game_input_active || !state->touch_scroll_fallback))
                 send_touch_event(state, WPE_EVENT_TOUCH_DOWN, i, slot->x, slot->y, time_ms);
         } else if (slot->just_up) {
-            if (!slot->chrome_consumed && !state->touch_scroll_fallback)
+            if (!slot->chrome_consumed && (state->game_input_active || !state->touch_scroll_fallback))
                 send_touch_event(state, WPE_EVENT_TOUCH_UP, i, slot->last_x, slot->last_y, time_ms);
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
             if (slot->chrome_consumed) {
@@ -2159,10 +3110,14 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
                 if (chrome_tap_limit > tap_limit)
                     tap_limit = chrome_tap_limit;
             }
-            if (!slot->scrolling && slot->max_move_sq <= tap_limit * tap_limit) {
+            if (slot->chrome_consumed && slot->tabs_scroll_candidate && slot->scrolling) {
+                chrome_clamp_tabs_scroll(state);
+                chrome_update_render_state(state);
+                chrome_request_frame(state);
+            } else if (!slot->scrolling && slot->max_move_sq <= tap_limit * tap_limit) {
                 if (slot->chrome_consumed)
                     chrome_handle_toolbar_tap(state, slot->last_x, slot->last_y);
-                else
+                else if (!state->game_input_active)
                     send_pointer_tap(state, slot->last_x, slot->last_y, time_ms);
             }
             else {
@@ -2177,9 +3132,10 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             }
             slot->scrolling = FALSE;
             slot->chrome_consumed = FALSE;
+            slot->tabs_scroll_candidate = FALSE;
             slot->tracking_id = -1;
         } else if (slot->active && (slot->x != slot->last_x || slot->y != slot->last_y)) {
-            if (!slot->chrome_consumed && !state->touch_scroll_fallback)
+            if (!slot->chrome_consumed && (state->game_input_active || !state->touch_scroll_fallback))
                 send_touch_event(state, WPE_EVENT_TOUCH_MOVE, i, slot->x, slot->y, time_ms);
             double from_down_x = slot->x - slot->down_x;
             double from_down_y = slot->y - slot->down_y;
@@ -2187,7 +3143,20 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             if (move_sq > slot->max_move_sq)
                 slot->max_move_sq = move_sq;
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
-            if (!slot->chrome_consumed) {
+            if (slot->chrome_consumed && slot->tabs_scroll_candidate) {
+                double panel_drag_threshold = env_double("WPE_CHROME_PANEL_DRAG_PX", 8);
+                if (slot->scrolling || slot->max_move_sq > panel_drag_threshold * panel_drag_threshold) {
+                    slot->scrolling = TRUE;
+                    state->chrome.tabs_scroll_offset -= slot->y - slot->last_y;
+                    chrome_clamp_tabs_scroll(state);
+                    gint64 now_us = g_get_monotonic_time();
+                    if (now_us - state->chrome.tabs_scroll_last_publish_us >= 16000) {
+                        state->chrome.tabs_scroll_last_publish_us = now_us;
+                        chrome_update_render_state(state);
+                        chrome_request_frame(state);
+                    }
+                }
+            } else if (!slot->chrome_consumed && !state->game_input_active) {
                 if (slot->scrolling) {
                     queue_scroll_event(state, slot->x, slot->y, slot->x - slot->last_x, slot->y - slot->last_y, time_ms);
                 } else if (slot->max_move_sq > tap_limit * tap_limit) {
@@ -2384,6 +3353,160 @@ static void setup_raw_touch(AppState *state)
 }
 
 
+static gboolean profile_runtime_initialize(GError **error)
+{
+    const char *var_dir = g_getenv("WPE_VAR_DIR");
+    if (!var_dir || !var_dir[0])
+        var_dir = "/tmp/wpe-drm2-var";
+    char *database_path = g_strdup(g_getenv("WPE_BROWSER_DB"));
+    if (!database_path || !database_path[0]) {
+        g_free(database_path);
+        database_path = g_build_filename(var_dir, "browser.sqlite3", NULL);
+    }
+    char *profiles_directory = g_strdup(g_getenv("WPE_PROFILES_DIR"));
+    if (!profiles_directory || !profiles_directory[0]) {
+        g_free(profiles_directory);
+        profiles_directory = g_build_filename(var_dir, "profiles", NULL);
+    }
+    const char *legacy_state = g_getenv("WPE_CHROME_STATE");
+    char *legacy_state_default = NULL;
+    if (!legacy_state || !legacy_state[0]) {
+        legacy_state_default = g_build_filename(var_dir, "browser-state.ini", NULL);
+        legacy_state = legacy_state_default;
+    }
+    const char *legacy_runtime = g_getenv("WPE_DRM_RUNTIME_DIR");
+    char *legacy_runtime_default = NULL;
+    if (!legacy_runtime || !legacy_runtime[0]) {
+        legacy_runtime_default = g_build_filename(var_dir, "runtime-tmp", NULL);
+        legacy_runtime = legacy_runtime_default;
+    }
+
+    profile_runtime.store = browser_profile_store_open(database_path, profiles_directory,
+                                                       legacy_state, legacy_runtime, error);
+    g_free(database_path);
+    g_free(profiles_directory);
+    g_free(legacy_state_default);
+    g_free(legacy_runtime_default);
+    if (!profile_runtime.store)
+        return FALSE;
+
+    const char *override = g_getenv("WPE_PROFILE_OVERRIDE");
+    if (override && !g_ascii_strcasecmp(override, "guest")) {
+        profile_runtime.guest = TRUE;
+        profile_runtime.profile.id = 0;
+        profile_runtime.profile.name = g_strdup("GUEST");
+        profile_runtime.profile.home_url = g_strdup(default_home_url());
+        profile_runtime.profile.site_profile = g_strdup("mobile");
+        profile_runtime.profile.cookie_policy = BROWSER_COOKIE_ACCEPT_NEVER;
+    } else {
+        gboolean loaded = FALSE;
+        if (override && override[0]) {
+            char *end = NULL;
+            int64_t profile_id = g_ascii_strtoll(override, &end, 10);
+            if (end && !*end && profile_id > 0) {
+                if (!browser_profile_store_get_profile(profile_runtime.store, profile_id,
+                                                       &profile_runtime.profile, error))
+                    return FALSE;
+                loaded = TRUE;
+            }
+            if (loaded && !browser_profile_store_set_active_profile(profile_runtime.store,
+                                                                    profile_id, error)) {
+                browser_profile_clear(&profile_runtime.profile);
+                return FALSE;
+            }
+        }
+        if (!loaded && !browser_profile_store_get_active_profile(profile_runtime.store,
+                                                                 &profile_runtime.profile, error))
+            return FALSE;
+        if (!browser_profile_store_set_active_profile(profile_runtime.store,
+                                                      profile_runtime.profile.id, error))
+            return FALSE;
+    }
+
+    if (profile_runtime.guest) {
+        profile_runtime.root = g_dir_make_tmp("wpe-drm-guest-XXXXXX", error);
+        if (!profile_runtime.root)
+            return FALSE;
+    } else
+        profile_runtime.root = browser_profile_store_profile_root(profile_runtime.store,
+                                                                  profile_runtime.profile.id);
+    profile_runtime.runtime = g_build_filename(profile_runtime.root, "runtime", NULL);
+    profile_runtime.data = g_build_filename(profile_runtime.runtime, "data", NULL);
+    profile_runtime.cache = g_build_filename(profile_runtime.runtime, "cache", NULL);
+    if (!profile_runtime.guest)
+        profile_runtime.cookie_jar = g_build_filename(profile_runtime.root, "cookies.sqlite", NULL);
+    g_mkdir_with_parents(profile_runtime.root, 0700);
+    chmod(profile_runtime.root, 0700);
+    g_setenv("WPE_DRM_RUNTIME_DIR", profile_runtime.runtime, TRUE);
+    g_print("Browser profile: id=%" G_GINT64_FORMAT " name=%s guest=%d root=%s site_profile=%s cookie_policy=%s\n",
+            profile_runtime.profile.id,
+            profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+            profile_runtime.guest, profile_runtime.root,
+            profile_runtime.profile.site_profile ? profile_runtime.profile.site_profile : "mobile",
+            browser_cookie_policy_name(profile_runtime.profile.cookie_policy));
+    return TRUE;
+}
+
+static WebKitCookieAcceptPolicy webkit_cookie_policy(BrowserCookiePolicy policy)
+{
+    switch (policy) {
+    case BROWSER_COOKIE_NO_THIRD_PARTY:
+        return WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY;
+    case BROWSER_COOKIE_ACCEPT_NEVER:
+        return WEBKIT_COOKIE_POLICY_ACCEPT_NEVER;
+    case BROWSER_COOKIE_ACCEPT_ALL:
+    default:
+        return WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS;
+    }
+}
+
+static WebKitNetworkSession *profile_network_session_new(void)
+{
+    WebKitNetworkSession *session = NULL;
+    if (profile_runtime.guest)
+        session = webkit_network_session_new_ephemeral();
+    else
+        session = webkit_network_session_new(profile_runtime.data, profile_runtime.cache);
+    if (!session)
+        return NULL;
+
+    WebKitCookieManager *cookie_manager = webkit_network_session_get_cookie_manager(session);
+    if (!profile_runtime.guest) {
+        webkit_cookie_manager_set_persistent_storage(cookie_manager, profile_runtime.cookie_jar,
+                                                     WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+        chmod(profile_runtime.cookie_jar, 0600);
+    }
+    webkit_cookie_manager_set_accept_policy(cookie_manager,
+                                            webkit_cookie_policy(profile_runtime.profile.cookie_policy));
+    g_print("Network session: ephemeral=%d data=%s cache=%s cookie_jar=%s policy=%s\n",
+            profile_runtime.guest,
+            profile_runtime.guest ? "(memory)" : profile_runtime.data,
+            profile_runtime.guest ? "(memory)" : profile_runtime.cache,
+            profile_runtime.guest ? "(memory)" : profile_runtime.cookie_jar,
+            browser_cookie_policy_name(profile_runtime.profile.cookie_policy));
+    return session;
+}
+
+static void profile_runtime_destroy(void)
+{
+    gboolean guest = profile_runtime.guest;
+    char *guest_root = guest ? g_strdup(profile_runtime.root) : NULL;
+    browser_profile_clear(&profile_runtime.profile);
+    browser_profile_store_close(profile_runtime.store);
+    g_free(profile_runtime.root);
+    g_free(profile_runtime.runtime);
+    g_free(profile_runtime.data);
+    g_free(profile_runtime.cache);
+    g_free(profile_runtime.cookie_jar);
+    memset(&profile_runtime, 0, sizeof(profile_runtime));
+    if (guest_root) {
+        remove_dir_contents(guest_root);
+        g_rmdir(guest_root);
+        g_print("Guest profile removed: %s\n", guest_root);
+        g_free(guest_root);
+    }
+}
+
 static void prepare_runtime_dirs(void) {
     const char *base = g_getenv("WPE_DRM_RUNTIME_DIR");
     if (!base || !base[0])
@@ -2465,6 +3588,82 @@ static const char *load_event_name(WebKitLoadEvent event) {
     return "unknown";
 }
 
+static const char *normalize_input_profile(const char *profile)
+{
+    if (profile && !g_ascii_strcasecmp(profile, "game"))
+        return "game";
+    if (profile && !g_ascii_strcasecmp(profile, "browser"))
+        return "browser";
+    return "auto";
+}
+
+static gboolean host_matches_game_allowlist(const char *host)
+{
+    if (!host || !host[0])
+        return FALSE;
+    const char *configured = g_getenv("WPE_GAME_HOSTS");
+    if (!configured || !configured[0])
+        configured = "ys.mihoyo.com,cloudgame.mihoyo.com";
+
+    gchar **entries = g_strsplit(configured, ",", -1);
+    gboolean matched = FALSE;
+    for (guint i = 0; entries[i] && !matched; ++i) {
+        char *candidate = g_strstrip(entries[i]);
+        gsize host_len = strlen(host);
+        gsize candidate_len = strlen(candidate);
+        if (!candidate_len)
+            continue;
+        matched = !g_ascii_strcasecmp(host, candidate)
+            || (host_len > candidate_len
+                && host[host_len - candidate_len - 1] == '.'
+                && !g_ascii_strcasecmp(host + host_len - candidate_len, candidate));
+    }
+    g_strfreev(entries);
+    return matched;
+}
+
+static gboolean uri_uses_game_input(const char *uri)
+{
+    if (!uri || !uri[0])
+        return FALSE;
+    GError *error = NULL;
+    GUri *parsed = g_uri_parse(uri, G_URI_FLAGS_NONE, &error);
+    if (!parsed) {
+        g_clear_error(&error);
+        return FALSE;
+    }
+    gboolean matched = host_matches_game_allowlist(g_uri_get_host(parsed));
+    g_uri_unref(parsed);
+    return matched;
+}
+
+static void update_input_profile_for_uri(AppState *state, const char *uri)
+{
+    if (!state)
+        return;
+    const char *profile = normalize_input_profile(state->input_profile);
+    gboolean game_active = !g_strcmp0(profile, "game")
+        || (!g_strcmp0(profile, "auto") && uri_uses_game_input(uri));
+    if (state->game_input_active == game_active)
+        return;
+
+    if (state->native_scroll_source_id) {
+        g_source_remove(state->native_scroll_source_id);
+        state->native_scroll_source_id = 0;
+        state->native_scroll_scheduled = FALSE;
+    }
+    if (state->scroll_stop_source_id) {
+        g_source_remove(state->scroll_stop_source_id);
+        state->scroll_stop_source_id = 0;
+    }
+    state->pending_native_scroll_x = 0;
+    state->pending_native_scroll_y = 0;
+    state->scroll_active = FALSE;
+    state->game_input_active = game_active;
+    g_print("Input profile: configured=%s active=%s uri=%s\n",
+            profile, game_active ? "game" : "browser", uri ? uri : "(null)");
+}
+
 static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer user_data) {
     AppState *state = (AppState *)user_data;
     g_print("Load changed: %s uri=%s progress=%.2f\n",
@@ -2476,6 +3675,8 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
     BrowserChrome *chrome = &state->chrome;
     BrowserTab *tab = chrome_active_tab(chrome);
     const char *uri = webkit_web_view_get_uri(web_view);
+    if (load_event == WEBKIT_LOAD_STARTED || load_event == WEBKIT_LOAD_REDIRECTED || load_event == WEBKIT_LOAD_COMMITTED)
+        update_input_profile_for_uri(state, uri);
     if (tab && uri && uri[0] && g_strcmp0(tab->url, uri)) {
         if (!chrome->suppress_history && tab->url[0]) {
             history_push(tab->back, &tab->back_count, tab->url);
@@ -2485,6 +3686,23 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
     }
     chrome->loading = load_event != WEBKIT_LOAD_FINISHED;
     chrome->load_progress = chrome->loading ? webkit_web_view_get_estimated_load_progress(web_view) : 1.0;
+    if (load_event == WEBKIT_LOAD_COMMITTED && !profile_runtime.guest && uri) {
+        char *scheme = uri_scheme_dup(uri);
+        gboolean record = scheme && (!g_ascii_strcasecmp(scheme, "http")
+            || !g_ascii_strcasecmp(scheme, "https"));
+        g_free(scheme);
+        if (record) {
+            GError *error = NULL;
+            chrome->current_visit_id = browser_profile_store_record_visit(profile_runtime.store,
+                profile_runtime.profile.id, uri,
+                webkit_web_view_get_title(web_view) ? webkit_web_view_get_title(web_view) : "",
+                &error);
+            if (!chrome->current_visit_id)
+                g_warning("History record failed: %s", error ? error->message : "unknown");
+            g_clear_error(&error);
+        } else
+            chrome->current_visit_id = 0;
+    }
     if (load_event == WEBKIT_LOAD_FINISHED) {
         chrome->suppress_history = FALSE;
         const char *title = webkit_web_view_get_title(web_view);
@@ -2522,6 +3740,13 @@ static void on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointe
     const char *title = webkit_web_view_get_title(web_view);
     if (tab && title) {
         g_strlcpy(tab->title, title, sizeof(tab->title));
+        if (!profile_runtime.guest && state->chrome.current_visit_id) {
+            GError *error = NULL;
+            if (!browser_profile_store_update_visit_title(profile_runtime.store,
+                    state->chrome.current_visit_id, title, &error))
+                g_warning("History title update failed: %s", error ? error->message : "unknown");
+            g_clear_error(&error);
+        }
         chrome_save_state(state);
     }
 }
@@ -2556,6 +3781,38 @@ static void on_signal(int sig) {
     (void)sig;
     if (main_loop)
         g_main_loop_quit(main_loop);
+}
+
+static gboolean gpu_first_frame_timeout(gpointer user_data)
+{
+    (void)user_data;
+    gpu_first_frame_timeout_source_id = 0;
+    if (!gpu_render_profile || frame_count > 0)
+        return G_SOURCE_REMOVE;
+    g_warning("GPU first-frame timeout; requesting CPU fallback");
+    runtime_exit_code = 91;
+    if (main_loop)
+        g_main_loop_quit(main_loop);
+    return G_SOURCE_REMOVE;
+}
+
+static void mark_gpu_first_frame_ready(void)
+{
+    const char *path = g_getenv("WPE_GPU_READY_FILE");
+    if (!gpu_render_profile || !path || !path[0])
+        return;
+
+    int fd = g_open(path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        g_warning("GPU ready marker open failed: path=%s errno=%d", path, errno);
+        return;
+    }
+    static const char ready[] = "ready\n";
+    if (write(fd, ready, sizeof(ready) - 1) != (ssize_t)(sizeof(ready) - 1))
+        g_warning("GPU ready marker write failed: path=%s errno=%d", path, errno);
+    fsync(fd);
+    close(fd);
+    g_print("GPU first frame ready: marker=%s\n", path);
 }
 
 /* DRM display disconnected - exit */
@@ -2637,6 +3894,22 @@ static gboolean on_decide_policy(WebKitWebView *web_view,
     webkit_policy_decision_ignore(decision);
     g_free(scheme);
     return TRUE;
+}
+
+static gboolean on_permission_request(WebKitWebView *web_view, WebKitPermissionRequest *request, gpointer user_data)
+{
+    (void)web_view;
+    (void)user_data;
+    const char *capture_policy = g_getenv("WPE_WEBRTC_CAPTURE");
+    gboolean deny_capture = !capture_policy || g_ascii_strcasecmp(capture_policy, "allow");
+    if (deny_capture && (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)
+        || WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST(request))) {
+        g_warning("Denied local media capture permission: type=%s policy=deny",
+                  G_OBJECT_TYPE_NAME(request));
+        webkit_permission_request_deny(request);
+        return TRUE;
+    }
+    return FALSE;
 }
 
 typedef struct {
@@ -2803,6 +4076,14 @@ static void on_web_process_terminated(WebKitWebView *web_view,
               uri ? uri : "(null)",
               webkit_web_view_get_title(web_view) ? webkit_web_view_get_title(web_view) : "(null)");
 
+    if (gpu_render_profile && frame_count == 0) {
+        g_warning("GPU WebProcess terminated before first frame; requesting CPU fallback");
+        runtime_exit_code = 91;
+        if (main_loop)
+            g_main_loop_quit(main_loop);
+        return;
+    }
+
     gint64 now_us = g_get_monotonic_time();
     if (uri && last_crash_uri && !strcmp(uri, last_crash_uri) &&
         now_us - crash_window_start_us < 120 * G_USEC_PER_SEC) {
@@ -2832,19 +4113,30 @@ static void on_web_process_terminated(WebKitWebView *web_view,
 static void on_buffer_rendered(WPEView *view, WPEBuffer *buffer, gpointer user_data) {
     (void)view; (void)user_data;
     frame_count++;
-    if (!frame_stats_start_us)
-        frame_stats_start_us = g_get_monotonic_time();
+    if (frame_count == 1) {
+        if (gpu_first_frame_timeout_source_id) {
+            g_source_remove(gpu_first_frame_timeout_source_id);
+            gpu_first_frame_timeout_source_id = 0;
+        }
+        mark_gpu_first_frame_ready();
+    }
+    gint64 now_us = g_get_monotonic_time();
+    if (!frame_stats_window_start_us) {
+        frame_stats_window_start_us = now_us;
+        frame_stats_window_start_count = frame_count;
+        g_print("Frame rendered: %dx%d frame=%" G_GUINT64_FORMAT " wpe_receive_fps=first\n",
+                wpe_buffer_get_width(buffer), wpe_buffer_get_height(buffer), frame_count);
+        return;
+    }
 
-    if (frame_count == 1 || !(frame_count % 600)) {
-        gint64 elapsed_us = g_get_monotonic_time() - frame_stats_start_us;
-        if (elapsed_us <= 0)
-            elapsed_us = 1;
-        double fps = (double)frame_count * G_USEC_PER_SEC / elapsed_us;
-        g_print("Frame rendered: %dx%d frame=%" G_GUINT64_FORMAT " fps=%.1f\n",
-                wpe_buffer_get_width(buffer),
-                wpe_buffer_get_height(buffer),
-                frame_count,
-                fps);
+    gint64 elapsed_us = now_us - frame_stats_window_start_us;
+    if (elapsed_us >= 2 * G_USEC_PER_SEC) {
+        guint64 frame_delta = frame_count - frame_stats_window_start_count;
+        double fps = (double)frame_delta * G_USEC_PER_SEC / elapsed_us;
+        g_print("Frame window: %dx%d wpe_receive_fps=%.1f frames=%" G_GUINT64_FORMAT " total=%" G_GUINT64_FORMAT "\n",
+                wpe_buffer_get_width(buffer), wpe_buffer_get_height(buffer), fps, frame_delta, frame_count);
+        frame_stats_window_start_us = now_us;
+        frame_stats_window_start_count = frame_count;
     }
 }
 
@@ -2879,6 +4171,7 @@ int main(int argc, char **argv) {
         g_setenv("WPE_DRM_FIT", "panel-native", TRUE);
     if (!g_getenv("WPE_PANEL_ROTATION") || !g_getenv("WPE_PANEL_ROTATION")[0])
         g_setenv("WPE_PANEL_ROTATION", g_getenv("WPE_DRM_ROTATION") ? g_getenv("WPE_DRM_ROTATION") : "0", TRUE);
+    gpu_render_profile = g_strcmp0(g_getenv("WPE_RENDER_PROFILE"), "gpu") == 0;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -2891,7 +4184,16 @@ int main(int argc, char **argv) {
     g_print("Viewport: %s\n", g_getenv("WPE_VIEWPORT") ? g_getenv("WPE_VIEWPORT") : "(screen)");
     g_print("Rotation: %s\n", g_getenv("WPE_DRM_ROTATION") ? g_getenv("WPE_DRM_ROTATION") : "0");
     g_print("Panel rotation: %s\n", g_getenv("WPE_PANEL_ROTATION") ? g_getenv("WPE_PANEL_ROTATION") : "0");
+    g_print("Render profile: %s\n", gpu_render_profile ? "gpu" : "cpu");
 
+    GError *profile_error = NULL;
+    if (!profile_runtime_initialize(&profile_error)) {
+        g_printerr("Browser profile initialization failed: %s\n",
+                   profile_error ? profile_error->message : "unknown error");
+        g_clear_error(&profile_error);
+        profile_runtime_destroy();
+        return 2;
+    }
     prepare_runtime_dirs();
     configure_tls_database();
 
@@ -2970,11 +4272,14 @@ int main(int argc, char **argv) {
     webkit_settings_set_enable_javascript(settings, TRUE);
     webkit_settings_set_enable_javascript_markup(settings, TRUE);
     webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
-    webkit_settings_set_enable_webgl(settings, FALSE);
-    webkit_settings_set_enable_2d_canvas_acceleration(settings, FALSE);
+    webkit_settings_set_enable_webgl(settings, gpu_render_profile);
+    webkit_settings_set_enable_2d_canvas_acceleration(settings, gpu_render_profile);
     webkit_settings_set_enable_media(settings, TRUE);
     webkit_settings_set_enable_webaudio(settings, TRUE);
     webkit_settings_set_enable_mediasource(settings, TRUE);
+    gboolean webrtc_enabled = env_enabled("WPE_WEBRTC", TRUE);
+    webkit_settings_set_enable_media_stream(settings, webrtc_enabled);
+    webkit_settings_set_enable_webrtc(settings, webrtc_enabled);
     webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
     webkit_settings_set_media_playback_allows_inline(settings, TRUE);
     /* 移动 UA：不设时 WPE 默认桌面 UA，抖音/百度会喂桌面版页面，
@@ -2985,7 +4290,7 @@ int main(int argc, char **argv) {
      * （DNS 预取 setter 自 2.48 起是 no-op，不再调用。） */
     webkit_settings_set_enable_page_cache(settings, FALSE);
     g_object_set(settings, "enable-write-console-messages-to-stdout", TRUE, NULL);
-    g_print("Settings: javascript=%d javascript_markup=%d file_access=%d webgl=%d canvas_accel=%d media=%d webaudio=%d mediasource=%d site_profile=mobile user_agent=%s\n",
+    g_print("Settings: javascript=%d javascript_markup=%d file_access=%d webgl=%d canvas_accel=%d media=%d webaudio=%d mediasource=%d media_stream=%d webrtc=%d capture=%s site_profile=mobile user_agent=%s\n",
             webkit_settings_get_enable_javascript(settings),
             webkit_settings_get_enable_javascript_markup(settings),
             webkit_settings_get_allow_file_access_from_file_urls(settings),
@@ -2994,6 +4299,9 @@ int main(int argc, char **argv) {
             webkit_settings_get_enable_media(settings),
             webkit_settings_get_enable_webaudio(settings),
             webkit_settings_get_enable_mediasource(settings),
+            webkit_settings_get_enable_media_stream(settings),
+            webkit_settings_get_enable_webrtc(settings),
+            g_getenv("WPE_WEBRTC_CAPTURE") ? g_getenv("WPE_WEBRTC_CAPTURE") : "deny",
             webkit_settings_get_user_agent(settings));
     WebKitUserContentManager *user_content_manager = webkit_user_content_manager_new();
     WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
@@ -3001,7 +4309,17 @@ int main(int argc, char **argv) {
         NULL);
     webkit_network_session_set_memory_pressure_settings(memory_pressure);
     webkit_memory_pressure_settings_free(memory_pressure);
-    WebKitNetworkSession *network_session = webkit_network_session_get_default();
+    WebKitNetworkSession *network_session = profile_network_session_new();
+    if (!network_session) {
+        g_printerr("Failed to create isolated WebKit network session\n");
+        g_object_unref(user_content_manager);
+        g_object_unref(settings);
+        g_object_unref(policies);
+        g_object_unref(context);
+        g_object_unref(display);
+        profile_runtime_destroy();
+        return 2;
+    }
     WebKitWebView *web_view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "web-context", context,
         "network-session", network_session,
@@ -3025,6 +4343,8 @@ int main(int argc, char **argv) {
                      G_CALLBACK(on_web_process_terminated), NULL);
     g_signal_connect(web_view, "decide-policy",
                      G_CALLBACK(on_decide_policy), NULL);
+    g_signal_connect(web_view, "permission-request",
+                     G_CALLBACK(on_permission_request), NULL);
 
     /* 3. Access the underlying WPEView for frame callbacks */
     AppState *state = NULL;
@@ -3049,10 +4369,19 @@ int main(int argc, char **argv) {
         state->view = wpe_view;
         state->toplevel = toplevel;
         state->web_view = web_view;
+        state->network_session = network_session;
         state->touch_fd = -1;
         state->viewport_width = width;
         state->viewport_height = height;
         chrome_load_state(state, url);
+        g_strlcpy(state->input_profile, normalize_input_profile(g_getenv("WPE_INPUT_PROFILE")), sizeof(state->input_profile));
+        const char *initial_input_uri = chrome_active_tab(&state->chrome) && chrome_active_tab(&state->chrome)->url[0]
+            ? chrome_active_tab(&state->chrome)->url : url;
+        state->game_input_active = !g_strcmp0(state->input_profile, "game")
+            || (!g_strcmp0(state->input_profile, "auto") && uri_uses_game_input(initial_input_uri));
+        g_print("Input profile: configured=%s active=%s uri=%s\n",
+                state->input_profile, state->game_input_active ? "game" : "browser",
+                initial_input_uri ? initial_input_uri : "(null)");
         chrome_apply_site_profile(state);
         setup_keyboard_bridge(state);
         setup_keyboard_user_script(user_content_manager, state);
@@ -3101,10 +4430,18 @@ int main(int argc, char **argv) {
 
     /* 5. Run GLib main loop — WPEViewDRM handles everything internally */
     main_loop = g_main_loop_new(NULL, FALSE);
+    if (gpu_render_profile)
+        gpu_first_frame_timeout_source_id = g_timeout_add_seconds(12, gpu_first_frame_timeout, NULL);
     g_main_loop_run(main_loop);
 
     /* Cleanup */
-    g_main_loop_unref(main_loop);
+    if (gpu_first_frame_timeout_source_id) {
+        g_source_remove(gpu_first_frame_timeout_source_id);
+        gpu_first_frame_timeout_source_id = 0;
+    }
+    GMainLoop *finished_loop = main_loop;
+    main_loop = NULL;
+    g_main_loop_unref(finished_loop);
     if (state) {
         if (state->scroll_stop_source_id)
             g_source_remove(state->scroll_stop_source_id);
@@ -3118,12 +4455,14 @@ int main(int argc, char **argv) {
         g_free(state);
     }
     g_object_unref(web_view);
+    g_object_unref(network_session);
     g_object_unref(context);
     g_object_unref(display);
     if (tls_exception_hosts) {
         g_hash_table_destroy(tls_exception_hosts);
         tls_exception_hosts = NULL;
     }
+    profile_runtime_destroy();
 
-    return 0;
+    return runtime_exit_code;
 }

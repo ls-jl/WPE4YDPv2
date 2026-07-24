@@ -34,6 +34,8 @@
 #include "WPEViewDRMPrivate.h"
 #include <drm_fourcc.h>
 #include <drm_mode.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
 #include <glib-unix.h>
 #include <glib/gstdio.h>
 #include <linux/dma-buf.h>
@@ -45,6 +47,9 @@
 #include <cstring>
 #include <cctype>
 #include <optional>
+#include <unordered_map>
+#include <vector>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -71,6 +76,90 @@ enum class OutputRotation : uint16_t {
     Rotate90 = 90,
     Rotate180 = 180,
     Rotate270 = 270
+};
+
+struct ChromeGlyph {
+    int width { 0 };
+    int height { 0 };
+    int left { 0 };
+    int top { 0 };
+    int advance { 0 };
+    std::vector<uint8_t> pixels;
+};
+
+class ChromeFontCache {
+public:
+    static ChromeFontCache& singleton()
+    {
+        static ChromeFontCache cache;
+        return cache;
+    }
+
+    const ChromeGlyph* glyph(gunichar character)
+    {
+        if (!m_face)
+            return nullptr;
+        auto found = m_glyphs.find(character);
+        if (found != m_glyphs.end())
+            return &found->second;
+        if (FT_Load_Char(m_face, character, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT))
+            return nullptr;
+        auto& bitmap = m_face->glyph->bitmap;
+        ChromeGlyph glyph;
+        glyph.width = bitmap.width;
+        glyph.height = bitmap.rows;
+        glyph.left = m_face->glyph->bitmap_left;
+        glyph.top = m_face->glyph->bitmap_top;
+        glyph.advance = std::max<int>(1, m_face->glyph->advance.x >> 6);
+        glyph.pixels.resize(static_cast<size_t>(glyph.width) * glyph.height);
+        for (int row = 0; row < glyph.height; ++row) {
+            const uint8_t* source = bitmap.buffer + static_cast<ptrdiff_t>(row) * bitmap.pitch;
+            if (bitmap.pixel_mode == FT_PIXEL_MODE_GRAY)
+                memcpy(glyph.pixels.data() + static_cast<size_t>(row) * glyph.width, source, glyph.width);
+            else if (bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
+                for (int column = 0; column < glyph.width; ++column)
+                    glyph.pixels[static_cast<size_t>(row) * glyph.width + column] =
+                        source[column / 8] & (0x80 >> (column % 8)) ? 255 : 0;
+            }
+        }
+        if (m_glyphs.size() >= 512)
+            m_glyphs.clear();
+        return &m_glyphs.emplace(character, std::move(glyph)).first->second;
+    }
+
+    bool available() const { return m_face; }
+
+private:
+    ChromeFontCache()
+    {
+        const char* path = g_getenv("WPE_CHROME_FONT");
+        if (!path || !*path || FT_Init_FreeType(&m_library)
+            || FT_New_Face(m_library, path, 0, &m_face)
+            || FT_Set_Pixel_Sizes(m_face, 0, 13)) {
+            if (m_face)
+                FT_Done_Face(m_face);
+            if (m_library)
+                FT_Done_FreeType(m_library);
+            m_face = nullptr;
+            m_library = nullptr;
+            g_warning("WPEViewDRM chrome_font=ascii-fallback path=%s", path ? path : "(unset)");
+            return;
+        }
+        g_message("WPEViewDRM chrome_font=freetype path=%s family=%s",
+            path, m_face->family_name ? m_face->family_name : "unknown");
+    }
+
+    ~ChromeFontCache()
+    {
+        if (m_face)
+            FT_Done_Face(m_face);
+        if (m_library)
+            FT_Done_FreeType(m_library);
+    }
+
+    FT_Library m_library { nullptr };
+    FT_Face m_face { nullptr };
+    std::unordered_map<gunichar, ChromeGlyph> m_glyphs;
 };
 
 struct PanelSize {
@@ -128,6 +217,28 @@ static bool chromeLayoutResizeEnabled()
         return strcmp(value, "0") && g_ascii_strcasecmp(value, "false") && g_ascii_strcasecmp(value, "off") && g_ascii_strcasecmp(value, "no");
     }();
     return enabled;
+}
+
+static bool partialCopyEnabled()
+{
+    static bool enabled = []() {
+        const char* value = getenv("WPE_DRM_PARTIAL_COPY");
+        return value && (!strcmp(value, "1") || !g_ascii_strcasecmp(value, "true") || !g_ascii_strcasecmp(value, "yes"));
+    }();
+    return enabled;
+}
+
+static int renderingFenceTimeoutMS()
+{
+    static int timeout = []() {
+        const char* value = getenv("WPE_DRM_FENCE_TIMEOUT_MS");
+        if (!value || !*value)
+            return 2000;
+        char* end = nullptr;
+        long parsed = strtol(value, &end, 10);
+        return end != value && !*end ? static_cast<int>(std::clamp<long>(parsed, 1, 30000)) : 2000;
+    }();
+    return timeout;
 }
 
 static PanelSize scanoutPanelForSource(uint32_t sourceWidth, uint32_t sourceHeight)
@@ -432,6 +543,15 @@ struct ChromeRenderState {
     char title[128] { };
     char lines[10][96] { };
     unsigned lineCount { 0 };
+    int panelX { 0 };
+    int panelY { 44 };
+    int panelWidth { 0 };
+    int panelHeight { 0 };
+    int panelHeaderHeight { 28 };
+    int panelFooterHeight { 40 };
+    int panelRowHeight { 34 };
+    double panelScrollOffset { 0 };
+    bool panelCanAdd { true };
 };
 
 static bool chromeEnabled()
@@ -537,6 +657,24 @@ static ChromeRenderState readChromeRenderState()
             snprintf(key, sizeof(key), "line%d", i);
             copyKeyString(keyFile, "panel", key, state.lines[i], sizeof(state.lines[i]));
         }
+        if (g_key_file_has_key(keyFile, "panel", "x", nullptr))
+            state.panelX = g_key_file_get_integer(keyFile, "panel", "x", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "y", nullptr))
+            state.panelY = g_key_file_get_integer(keyFile, "panel", "y", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "width", nullptr))
+            state.panelWidth = g_key_file_get_integer(keyFile, "panel", "width", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "height", nullptr))
+            state.panelHeight = g_key_file_get_integer(keyFile, "panel", "height", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "header_height", nullptr))
+            state.panelHeaderHeight = g_key_file_get_integer(keyFile, "panel", "header_height", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "footer_height", nullptr))
+            state.panelFooterHeight = g_key_file_get_integer(keyFile, "panel", "footer_height", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "row_height", nullptr))
+            state.panelRowHeight = g_key_file_get_integer(keyFile, "panel", "row_height", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "scroll_offset", nullptr))
+            state.panelScrollOffset = std::max(0.0, g_key_file_get_double(keyFile, "panel", "scroll_offset", nullptr));
+        if (g_key_file_has_key(keyFile, "panel", "can_add", nullptr))
+            state.panelCanAdd = g_key_file_get_boolean(keyFile, "panel", "can_add", nullptr);
     }
 
     g_key_file_unref(keyFile);
@@ -707,11 +845,28 @@ public:
         , m_panelHeight(panelHeight)
         , m_rotation(rotation)
     {
+        resetClip();
+    }
+
+    void setClipRect(int x, int y, int width, int height)
+    {
+        m_clipX = std::clamp(x, 0, static_cast<int>(m_panelWidth));
+        m_clipY = std::clamp(y, 0, static_cast<int>(m_panelHeight));
+        m_clipRight = std::clamp(x + std::max(0, width), m_clipX, static_cast<int>(m_panelWidth));
+        m_clipBottom = std::clamp(y + std::max(0, height), m_clipY, static_cast<int>(m_panelHeight));
+    }
+
+    void resetClip()
+    {
+        m_clipX = 0;
+        m_clipY = 0;
+        m_clipRight = static_cast<int>(m_panelWidth);
+        m_clipBottom = static_cast<int>(m_panelHeight);
     }
 
     void setPixel(int x, int y, uint32_t color)
     {
-        if (x < 0 || y < 0 || x >= static_cast<int>(m_panelWidth) || y >= static_cast<int>(m_panelHeight))
+        if (x < m_clipX || y < m_clipY || x >= m_clipRight || y >= m_clipBottom)
             return;
 
         int dx = x;
@@ -739,14 +894,50 @@ public:
         row[dx] = color;
     }
 
+    void blendPixel(int x, int y, uint32_t color, uint8_t coverage)
+    {
+        if (!coverage || x < m_clipX || y < m_clipY || x >= m_clipRight || y >= m_clipBottom)
+            return;
+        int dx = x;
+        int dy = y;
+        switch (m_rotation) {
+        case OutputRotation::Rotate0:
+            break;
+        case OutputRotation::Rotate90:
+            dx = static_cast<int>(m_panelHeight) - 1 - y;
+            dy = x;
+            break;
+        case OutputRotation::Rotate180:
+            dx = static_cast<int>(m_panelWidth) - 1 - x;
+            dy = static_cast<int>(m_panelHeight) - 1 - y;
+            break;
+        case OutputRotation::Rotate270:
+            dx = y;
+            dy = static_cast<int>(m_panelWidth) - 1 - x;
+            break;
+        }
+        if (dx < 0 || dy < 0 || dx >= static_cast<int>(m_destinationWidth) || dy >= static_cast<int>(m_destinationHeight))
+            return;
+        auto* row = reinterpret_cast<uint32_t*>(m_destination + static_cast<size_t>(dy) * m_destinationPitch);
+        uint32_t destination = row[dx];
+        auto blend = [coverage](uint8_t source, uint8_t target) {
+            return static_cast<uint8_t>((source * coverage + target * (255 - coverage) + 127) / 255);
+        };
+        uint8_t red = blend((color >> 16) & 0xff, (destination >> 16) & 0xff);
+        uint8_t green = blend((color >> 8) & 0xff, (destination >> 8) & 0xff);
+        uint8_t blue = blend(color & 0xff, destination & 0xff);
+        row[dx] = 0xff000000 | (static_cast<uint32_t>(red) << 16)
+            | (static_cast<uint32_t>(green) << 8) | blue;
+    }
+
     // 大块填充（工具栏底色、按钮、面板背景）按目标行序整段 std::fill；
     // 旧实现逐像素 setPixel，90/270 度下等于每 4 字节打断一次 WC 缓冲。
     void fillRect(int x, int y, int width, int height, uint32_t color)
     {
-        int x1 = std::max(x, 0);
-        int y1 = std::max(y, 0);
-        int x2 = std::min(x + width, static_cast<int>(m_panelWidth));
-        int y2 = std::min(y + height, static_cast<int>(m_panelHeight));
+        int x1 = std::max(x, m_clipX);
+        int y1 = std::max(y, m_clipY);
+        int x2 = std::min(x + width, m_clipRight);
+        int y2 = std::min(y + height, m_clipBottom);
         if (x2 <= x1 || y2 <= y1)
             return;
         auto rect = rotatedDestRect(x1, y1, x2, y2, m_panelWidth, m_panelHeight, m_rotation, 0);
@@ -768,6 +959,167 @@ public:
         fillRect(x + width - 1, y, 1, height, color);
     }
 
+    static double roundedRectCoverage(double pixelX, double pixelY,
+                                      double left, double top, double right, double bottom,
+                                      double radius)
+    {
+        if (right <= left || bottom <= top)
+            return 0;
+        double halfWidth = (right - left) * 0.5;
+        double halfHeight = (bottom - top) * 0.5;
+        radius = std::clamp(radius, 0.0, std::min(halfWidth, halfHeight));
+        double centerX = (left + right) * 0.5;
+        double centerY = (top + bottom) * 0.5;
+        double qx = std::abs(pixelX - centerX) - (halfWidth - radius);
+        double qy = std::abs(pixelY - centerY) - (halfHeight - radius);
+        double outside = std::hypot(std::max(qx, 0.0), std::max(qy, 0.0));
+        double inside = std::min(std::max(qx, qy), 0.0);
+        double signedDistance = outside + inside - radius;
+        return std::clamp(0.5 - signedDistance, 0.0, 1.0);
+    }
+
+    void drawRoundedRect(int x, int y, int width, int height, int radius,
+                         uint32_t fillColor, uint32_t borderColor, int borderWidth)
+    {
+        if (width <= 0 || height <= 0)
+            return;
+        radius = std::clamp(radius, 0, std::min(width, height) / 2);
+        borderWidth = std::clamp(borderWidth, 0, std::min(width, height) / 2);
+        if (!radius) {
+            fillRect(x, y, width, height, borderColor);
+            if (width > borderWidth * 2 && height > borderWidth * 2)
+                fillRect(x + borderWidth, y + borderWidth,
+                         width - borderWidth * 2, height - borderWidth * 2, fillColor);
+            return;
+        }
+
+        // Keep the large body writes contiguous. Only the four radius-sized corner
+        // regions need coverage blending, which matters on 90/270 degree outputs.
+        fillRect(x + radius, y, width - radius * 2, height, fillColor);
+        if (height > radius * 2)
+            fillRect(x, y + radius, width, height - radius * 2, fillColor);
+
+        if (borderWidth > 0) {
+            fillRect(x + radius, y, width - radius * 2, borderWidth, borderColor);
+            fillRect(x + radius, y + height - borderWidth,
+                     width - radius * 2, borderWidth, borderColor);
+            fillRect(x, y + radius, borderWidth, height - radius * 2, borderColor);
+            fillRect(x + width - borderWidth, y + radius,
+                     borderWidth, height - radius * 2, borderColor);
+        }
+
+        double innerLeft = x + borderWidth;
+        double innerTop = y + borderWidth;
+        double innerRight = x + width - borderWidth;
+        double innerBottom = y + height - borderWidth;
+        double innerRadius = std::max(0, radius - borderWidth);
+        for (int localY = 0; localY < height; ++localY) {
+            bool cornerY = localY < radius || localY >= height - radius;
+            if (!cornerY)
+                continue;
+            for (int localX = 0; localX < width; ++localX) {
+                if (localX >= radius && localX < width - radius)
+                    continue;
+                double pixelX = x + localX + 0.5;
+                double pixelY = y + localY + 0.5;
+                double outerCoverage = roundedRectCoverage(pixelX, pixelY,
+                    x, y, x + width, y + height, radius);
+                if (outerCoverage <= 0)
+                    continue;
+                if (borderWidth <= 0) {
+                    blendPixel(x + localX, y + localY, fillColor,
+                               static_cast<uint8_t>(std::lround(outerCoverage * 255.0)));
+                    continue;
+                }
+                blendPixel(x + localX, y + localY, borderColor,
+                           static_cast<uint8_t>(std::lround(outerCoverage * 255.0)));
+                double innerCoverage = roundedRectCoverage(pixelX, pixelY,
+                    innerLeft, innerTop, innerRight, innerBottom, innerRadius);
+                if (innerCoverage > 0)
+                    blendPixel(x + localX, y + localY, fillColor,
+                               static_cast<uint8_t>(std::lround(innerCoverage * 255.0)));
+            }
+        }
+    }
+
+    void fillCircle(int centerX, int centerY, int radius, uint32_t color)
+    {
+        for (int y = -radius; y <= radius; ++y) {
+            int span = static_cast<int>(std::floor(std::sqrt(static_cast<double>(radius * radius - y * y))));
+            fillRect(centerX - span, centerY + y, span * 2 + 1, 1, color);
+        }
+    }
+
+    void drawLine(int x1, int y1, int x2, int y2, int thickness, uint32_t color, bool roundCaps = true)
+    {
+        int startX = x1;
+        int startY = y1;
+        int dx = std::abs(x2 - x1);
+        int sx = x1 < x2 ? 1 : -1;
+        int dy = -std::abs(y2 - y1);
+        int sy = y1 < y2 ? 1 : -1;
+        int error = dx + dy;
+        int radius = std::max(0, thickness / 2);
+        for (;;) {
+            fillCircle(x1, y1, radius, color);
+            if (x1 == x2 && y1 == y2)
+                break;
+            int twiceError = error * 2;
+            if (twiceError >= dy) {
+                error += dy;
+                x1 += sx;
+            }
+            if (twiceError <= dx) {
+                error += dx;
+                y1 += sy;
+            }
+        }
+        if (roundCaps) {
+            fillCircle(startX, startY, radius, color);
+            fillCircle(x2, y2, radius, color);
+        }
+    }
+
+    void drawArc(int centerX, int centerY, int radius, int startDegrees, int endDegrees, int thickness, uint32_t color)
+    {
+        constexpr double pi = 3.14159265358979323846;
+        int previousX = 0;
+        int previousY = 0;
+        bool hasPrevious = false;
+        for (int degrees = startDegrees; degrees <= endDegrees; degrees += 5) {
+            double radians = static_cast<double>(degrees) * pi / 180.0;
+            int x = centerX + static_cast<int>(std::lround(std::cos(radians) * radius));
+            int y = centerY + static_cast<int>(std::lround(std::sin(radians) * radius));
+            if (hasPrevious)
+                drawLine(previousX, previousY, x, y, thickness, color, false);
+            previousX = x;
+            previousY = y;
+            hasPrevious = true;
+        }
+    }
+
+    void fillTriangle(int x1, int y1, int x2, int y2, int x3, int y3, uint32_t color)
+    {
+        int minX = std::min({ x1, x2, x3 });
+        int maxX = std::max({ x1, x2, x3 });
+        int minY = std::min({ y1, y2, y3 });
+        int maxY = std::max({ y1, y2, y3 });
+        auto edge = [](int ax, int ay, int bx, int by, int px, int py) {
+            return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+        };
+        int orientation = edge(x1, y1, x2, y2, x3, y3);
+        for (int y = minY; y <= maxY; ++y) {
+            for (int x = minX; x <= maxX; ++x) {
+                int e1 = edge(x1, y1, x2, y2, x, y);
+                int e2 = edge(x2, y2, x3, y3, x, y);
+                int e3 = edge(x3, y3, x1, y1, x, y);
+                if ((orientation >= 0 && e1 >= 0 && e2 >= 0 && e3 >= 0)
+                    || (orientation < 0 && e1 <= 0 && e2 <= 0 && e3 <= 0))
+                    fillRect(x, y, 1, 1, color);
+            }
+        }
+    }
+
     void drawChar(int x, int y, char c, uint32_t color, int scale)
     {
         if (c == ' ')
@@ -787,12 +1139,64 @@ public:
     {
         if (!text)
             return;
+        auto& font = ChromeFontCache::singleton();
+        if (font.available()) {
+            int cursor = x;
+            const char* position = text;
+            while (*position) {
+                gunichar character = g_utf8_get_char_validated(position, -1);
+                if (character == static_cast<gunichar>(-1) || character == static_cast<gunichar>(-2)) {
+                    character = '?';
+                    position++;
+                } else
+                    position = g_utf8_next_char(position);
+                const ChromeGlyph* glyph = font.glyph(character);
+                int advance = glyph ? glyph->advance : 7;
+                if (cursor + advance > x + maxWidth)
+                    break;
+                if (glyph) {
+                    int glyphX = cursor + glyph->left;
+                    int glyphY = y + 12 - glyph->top;
+                    for (int row = 0; row < glyph->height; ++row) {
+                        for (int column = 0; column < glyph->width; ++column) {
+                            uint8_t coverage = glyph->pixels[static_cast<size_t>(row) * glyph->width + column];
+                            blendPixel(glyphX + column, glyphY + row, color, coverage);
+                        }
+                    }
+                }
+                cursor += advance;
+            }
+            return;
+        }
         int cursor = x;
         int advance = 6 * scale;
         for (const char* p = text; *p && cursor + advance <= x + maxWidth; ++p) {
             drawChar(cursor, y, *p, color, scale);
             cursor += advance;
         }
+    }
+
+    int measureText(const char* text, int scale)
+    {
+        if (!text)
+            return 0;
+        auto& font = ChromeFontCache::singleton();
+        if (!font.available())
+            return static_cast<int>(strlen(text)) * 6 * scale;
+
+        int width = 0;
+        const char* position = text;
+        while (*position) {
+            gunichar character = g_utf8_get_char_validated(position, -1);
+            if (character == static_cast<gunichar>(-1) || character == static_cast<gunichar>(-2)) {
+                character = '?';
+                position++;
+            } else
+                position = g_utf8_next_char(position);
+            const ChromeGlyph* glyph = font.glyph(character);
+            width += glyph ? glyph->advance : 7;
+        }
+        return width;
     }
 
 private:
@@ -803,6 +1207,10 @@ private:
     uint32_t m_panelWidth { 0 };
     uint32_t m_panelHeight { 0 };
     OutputRotation m_rotation { OutputRotation::Rotate0 };
+    int m_clipX { 0 };
+    int m_clipY { 0 };
+    int m_clipRight { 0 };
+    int m_clipBottom { 0 };
 };
 
 static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
@@ -847,27 +1255,131 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
         return;
 
     painter.fillRect(0, toolbarY, panelWidth, chromeHeight, dark);
-    painter.fillRect(8, toolbarY + 6, std::max<int>(1, panelWidth / 2 - 16), chromeHeight - 12, white);
-    painter.strokeRect(8, toolbarY + 6, std::max<int>(1, panelWidth / 2 - 16), chromeHeight - 12, mid);
-    painter.drawText(18, toolbarY + 17, chrome.url[0] ? chrome.url : "HOME", text, 1, std::max<int>(1, panelWidth / 2 - 36));
+    int legacyButtonX = panelWidth / 2 + 8;
+    int buttonW = std::max<int>(36, (static_cast<int>(panelWidth) - legacyButtonX - 8) / 6);
+    int buttonX = legacyButtonX + buttonW;
+    int addressRight = buttonX - 8;
+    int addressWidth = std::max<int>(1, addressRight - 8);
+    int controlHeight = chromeHeight - 12;
+    painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8, white, mid, 1);
+    painter.drawText(18, toolbarY + 17, chrome.url[0] ? chrome.url : "HOME", text, 1, std::max(1, addressWidth - 20));
 
-    int buttonX = panelWidth / 2 + 8;
-    int buttonW = std::max<int>(36, (static_cast<int>(panelWidth) - buttonX - 8) / 6);
-    const char* labels[6] = { "<", ">", "TAB", "+", chrome.loading ? "X" : "R", "SET" };
-    bool enabled[6] = { chrome.canBack, chrome.canForward, true, true, true, true };
-    for (int i = 0; i < 6; ++i) {
+    bool enabled[5] = { chrome.canBack, chrome.canForward, true, true, true };
+    for (int i = 0; i < 5; ++i) {
         int x = buttonX + i * buttonW;
-        painter.fillRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, black);
-        painter.strokeRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, enabled[i] ? accent : mid);
-        painter.drawText(x + 10, toolbarY + 17, labels[i], enabled[i] ? white : disabled, 1, buttonW - 16);
-    }
+        painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4, controlHeight, 6,
+                                black, enabled[i] ? accent : mid, 1);
 
-    char tabLabel[32];
-    snprintf(tabLabel, sizeof(tabLabel), "%u/%u", chrome.activeTab + 1, std::max<unsigned>(1, chrome.tabCount));
-    painter.drawText(buttonX + buttonW * 2 + 8, toolbarY + chromeHeight - 12, tabLabel, white, 1, buttonW - 12);
+        int centerX = x + buttonW / 2;
+        int centerY = toolbarY + chromeHeight / 2;
+        uint32_t iconColor = enabled[i] ? white : disabled;
+        switch (i) {
+        case 0:
+            painter.drawLine(centerX + 4, centerY - 7, centerX - 4, centerY, 2, iconColor);
+            painter.drawLine(centerX - 4, centerY, centerX + 4, centerY + 7, 2, iconColor);
+            break;
+        case 1:
+            painter.drawLine(centerX - 4, centerY - 7, centerX + 4, centerY, 2, iconColor);
+            painter.drawLine(centerX + 4, centerY, centerX - 4, centerY + 7, 2, iconColor);
+            break;
+        case 2:
+        {
+            char tabCount[12];
+            snprintf(tabCount, sizeof(tabCount), "%u", std::max<unsigned>(1, chrome.tabCount));
+            painter.drawRoundedRect(centerX - 10, centerY - 10, 20, 20, 5,
+                                    black, iconColor, 2);
+            int labelWidth = painter.measureText(tabCount, 1);
+            int labelY = ChromeFontCache::singleton().available() ? centerY - 7 : centerY - 3;
+            painter.drawText(centerX - labelWidth / 2, labelY, tabCount, iconColor, 1, 18);
+            break;
+        }
+        case 3:
+            if (chrome.loading) {
+                painter.drawLine(centerX - 5, centerY - 5, centerX + 5, centerY + 5, 2, iconColor);
+                painter.drawLine(centerX + 5, centerY - 5, centerX - 5, centerY + 5, 2, iconColor);
+            } else {
+                painter.drawArc(centerX, centerY, 7, 35, 315, 2, iconColor);
+                painter.fillTriangle(centerX + 8, centerY, centerX + 2, centerY - 1,
+                                     centerX + 7, centerY - 6, iconColor);
+            }
+            break;
+        case 4:
+            painter.fillCircle(centerX, centerY - 6, 2, iconColor);
+            painter.fillCircle(centerX, centerY, 2, iconColor);
+            painter.fillCircle(centerX, centerY + 6, 2, iconColor);
+            break;
+        }
+    }
 
     if (!hasPanel)
         return;
+
+    if (!strcmp(chrome.panel, "tabs")) {
+        int tabsX = std::clamp(chrome.panelX, 0, std::max(0, static_cast<int>(panelWidth) - 1));
+        int tabsY = std::clamp(chrome.panelY, toolbarY + chromeHeight, std::max(toolbarY + chromeHeight, static_cast<int>(panelHeight) - 1));
+        int tabsWidth = chrome.panelWidth > 0 ? chrome.panelWidth : static_cast<int>(panelWidth) - tabsX;
+        int tabsHeight = chrome.panelHeight > 0 ? chrome.panelHeight : static_cast<int>(panelHeight) - tabsY;
+        tabsWidth = std::clamp(tabsWidth, 1, static_cast<int>(panelWidth) - tabsX);
+        tabsHeight = std::clamp(tabsHeight, 1, static_cast<int>(panelHeight) - tabsY);
+        int headerHeight = std::clamp(chrome.panelHeaderHeight, 24, std::min(48, tabsHeight));
+        int footerHeight = std::clamp(chrome.panelFooterHeight, 32, std::min(56, tabsHeight));
+        int rowHeight = std::clamp(chrome.panelRowHeight, 26, 48);
+        int listTop = tabsY + headerHeight;
+        int footerTop = tabsY + tabsHeight - footerHeight;
+        if (footerTop < listTop)
+            footerTop = listTop;
+
+        painter.drawRoundedRect(tabsX, tabsY, tabsWidth, tabsHeight, 10, panel, mid, 1);
+        int backCenterX = tabsX + 17;
+        int headerCenterY = tabsY + headerHeight / 2;
+        painter.drawLine(backCenterX + 3, headerCenterY - 6, backCenterX - 3, headerCenterY, 2, accent);
+        painter.drawLine(backCenterX - 3, headerCenterY, backCenterX + 3, headerCenterY + 6, 2, accent);
+        char panelTitle[64];
+        snprintf(panelTitle, sizeof(panelTitle), "TABS %u", std::max<unsigned>(1, chrome.tabCount));
+        painter.drawText(tabsX + 34, tabsY + std::max(5, (headerHeight - 14) / 2),
+                         panelTitle, accent, 1, tabsWidth - 48);
+        painter.fillRect(tabsX + 1, listTop - 1, tabsWidth - 2, 1, 0xffd4dbe2);
+
+        painter.setClipRect(tabsX + 1, listTop, tabsWidth - 2, std::max(0, footerTop - listTop));
+        int scrollOffset = static_cast<int>(std::lround(chrome.panelScrollOffset));
+        for (unsigned i = 0; i < chrome.lineCount; ++i) {
+            int rowY = listTop + static_cast<int>(i) * rowHeight - scrollOffset;
+            if (rowY + rowHeight <= listTop || rowY >= footerTop)
+                continue;
+            bool active = i == chrome.activeTab;
+            uint32_t rowFill = active ? 0xffdcecf7 : ((i % 2) ? 0xffedf1f5 : 0xffffffff);
+            uint32_t rowBorder = active ? accent : 0xffd4dbe2;
+            painter.drawRoundedRect(tabsX + 7, rowY + 2, tabsWidth - 14, rowHeight - 4,
+                                    6, rowFill, rowBorder, 1);
+            int closeWidth = 42;
+            painter.drawText(tabsX + 16, rowY + std::max(5, (rowHeight - 14) / 2),
+                             chrome.lines[i], text, 1, tabsWidth - closeWidth - 24);
+            int closeCenterX = tabsX + tabsWidth - closeWidth / 2;
+            int closeCenterY = rowY + rowHeight / 2;
+            painter.drawLine(closeCenterX - 4, closeCenterY - 4,
+                             closeCenterX + 4, closeCenterY + 4, 2, mid);
+            painter.drawLine(closeCenterX + 4, closeCenterY - 4,
+                             closeCenterX - 4, closeCenterY + 4, 2, mid);
+        }
+        painter.resetClip();
+
+        painter.fillRect(tabsX + 1, footerTop, tabsWidth - 2, 1, 0xffd4dbe2);
+        int addWidth = 48;
+        int addHeight = std::min(28, std::max(22, footerHeight - 10));
+        int addX = tabsX + (tabsWidth - addWidth) / 2;
+        int addY = footerTop + (footerHeight - addHeight) / 2;
+        uint32_t addColor = chrome.panelCanAdd ? accent : mid;
+        painter.drawRoundedRect(addX, addY, addWidth, addHeight, 8, addColor, addColor, 1);
+        int addCenterX = addX + addWidth / 2;
+        int addCenterY = addY + addHeight / 2;
+        uint32_t addIconColor = chrome.panelCanAdd ? white : disabled;
+        painter.drawLine(addCenterX - 6, addCenterY, addCenterX + 6, addCenterY, 2, addIconColor);
+        painter.drawLine(addCenterX, addCenterY - 6, addCenterX, addCenterY + 6, 2, addIconColor);
+
+        if (chrome.touchDebug)
+            painter.drawText(tabsX + tabsWidth - 112, tabsY + 6, "TOUCH DEBUG", accent, 1, 104);
+        return;
+    }
 
     int panelY = toolbarY + chromeHeight;
     int panelHeightPixels = std::min<int>(static_cast<int>(panelHeight) - panelY, 214);
@@ -875,19 +1387,25 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
         return;
     painter.fillRect(0, panelY, panelWidth, panelHeightPixels, panel);
     painter.strokeRect(0, panelY, panelWidth, panelHeightPixels, mid);
-    painter.drawText(14, panelY + 10, chrome.panel, accent, 1, panelWidth - 28);
+    painter.drawText(14, panelY + 5, "<", accent, 1, 16);
+    char panelTitle[64];
+    if (!strcmp(chrome.panel, "tabs"))
+        snprintf(panelTitle, sizeof(panelTitle), "TABS %u", std::max<unsigned>(1, chrome.tabCount));
+    else
+        snprintf(panelTitle, sizeof(panelTitle), "%s", chrome.panel);
+    painter.drawText(34, panelY + 5, panelTitle, accent, 1, panelWidth - 48);
 
-    int rowY = panelY + 30;
-    for (unsigned i = 0; i < chrome.lineCount && rowY + 24 <= panelY + panelHeightPixels; ++i) {
+    int rowY = panelY + 22;
+    for (unsigned i = 0; i < chrome.lineCount && rowY + 21 <= panelY + panelHeightPixels; ++i) {
         uint32_t rowColor = (i % 2) ? 0xffedf1f5 : 0xffffffff;
-        painter.fillRect(8, rowY, panelWidth - 16, 24, rowColor);
-        painter.strokeRect(8, rowY, panelWidth - 16, 24, 0xffd4dbe2);
-        painter.drawText(18, rowY + 8, chrome.lines[i], text, 1, panelWidth - 36);
-        rowY += 28;
+        painter.fillRect(8, rowY, panelWidth - 16, 21, rowColor);
+        painter.strokeRect(8, rowY, panelWidth - 16, 21, 0xffd4dbe2);
+        painter.drawText(18, rowY + 4, chrome.lines[i], text, 1, panelWidth - 36);
+        rowY += 24;
     }
 
     if (chrome.touchDebug)
-        painter.drawText(panelWidth - 140, panelY + 10, "TOUCH DEBUG", accent, 1, 130);
+        painter.drawText(panelWidth - 140, panelY + 5, "TOUCH DEBUG", accent, 1, 130);
 }
 
 class DRMScanoutBuffer;
@@ -899,6 +1417,8 @@ struct WPEBufferDRMUserData {
     DRMScanoutBuffer* scanoutBuffer { nullptr }; // owned
     void* sourceMapping { nullptr };
     size_t sourceMappingSize { 0 };
+    uint32_t sourceMappingStride { 0 };
+    void resetSourceMapping();
     ~WPEBufferDRMUserData();
 };
 
@@ -974,15 +1494,16 @@ public:
         return scanoutBuffer;
     }
 
-    static std::unique_ptr<DRMScanoutBuffer> createRotatedDMABufDumb(int fd, WPEBuffer* buffer, OutputRotation rotation, GError** error)
+    static std::unique_ptr<DRMScanoutBuffer> createRotatedDMABufDumb(struct gbm_device* device, int fd, WPEBuffer* buffer, OutputRotation rotation, GError** error)
     {
         auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
         if (wpe_buffer_dma_buf_get_n_planes(dmaBuffer) != 1) {
             g_set_error_literal(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render rotated buffer: dmabuf requires one plane");
             return nullptr;
         }
-        if (wpe_buffer_dma_buf_get_format(dmaBuffer) != DRM_FORMAT_ARGB8888) {
-            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render rotated buffer: expected ARGB8888, got 0x%x", wpe_buffer_dma_buf_get_format(dmaBuffer));
+        auto sourceFormat = wpe_buffer_dma_buf_get_format(dmaBuffer);
+        if (sourceFormat != DRM_FORMAT_ARGB8888 && sourceFormat != DRM_FORMAT_XRGB8888) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to render rotated buffer: expected ARGB8888 or XRGB8888, got 0x%x", sourceFormat);
             return nullptr;
         }
 
@@ -995,7 +1516,7 @@ public:
         scanoutBuffer->m_rotation = rotation;
         if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(panel.width, panel.height, rotation), rotatedHeight(panel.width, panel.height, rotation), error))
             return nullptr;
-        if (!scanoutBuffer->copyRotatedFromDMABuf(buffer, rotation, error))
+        if (!scanoutBuffer->copyRotatedFromDMABuf(device, buffer, rotation, error))
             return nullptr;
         return scanoutBuffer;
     }
@@ -1243,9 +1764,14 @@ public:
         return true;
     }
 
-    bool copyRotatedFromDMABuf(WPEBuffer* buffer, OutputRotation rotation, GError** error)
+    bool copyRotatedFromDMABuf(struct gbm_device* device, WPEBuffer* buffer, OutputRotation rotation, GError** error)
     {
         auto* dmaBuffer = WPE_BUFFER_DMA_BUF(buffer);
+        auto sourceFormat = wpe_buffer_dma_buf_get_format(dmaBuffer);
+        if (sourceFormat != DRM_FORMAT_ARGB8888 && sourceFormat != DRM_FORMAT_XRGB8888) {
+            g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: expected ARGB8888 or XRGB8888, got 0x%x", sourceFormat);
+            return false;
+        }
         auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
         auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
         auto sourceStride = wpe_buffer_dma_buf_get_stride(dmaBuffer, 0);
@@ -1259,26 +1785,86 @@ public:
         size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
         int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
         auto* userData = ensureBufferUserData(buffer);
-        if (userData->sourceMapping && userData->sourceMappingSize != mapSize) {
-            munmap(userData->sourceMapping, userData->sourceMappingSize);
-            userData->sourceMapping = nullptr;
-            userData->sourceMappingSize = 0;
-        }
+        if (userData->sourceMapping && userData->sourceMappingSize != mapSize)
+            userData->resetSourceMapping();
         if (!userData->sourceMapping) {
             void* mappedSource = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, sourceFD, 0);
             if (mappedSource == MAP_FAILED) {
-                g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap source failed: %s", strerror(errno));
-                return false;
+                int mmapError = errno;
+                if (sourceOffset) {
+                    g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap failed (%s) and GBM map does not support source offset %u", strerror(mmapError), sourceOffset);
+                    return false;
+                }
+
+                struct gbm_import_fd_data importData = {
+                    sourceFD,
+                    sourceWidth,
+                    sourceHeight,
+                    sourceStride,
+                    sourceFormat
+                };
+                struct gbm_bo* sourceBO = gbm_bo_import(device, GBM_BO_IMPORT_FD, &importData, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+                if (!sourceBO) {
+                    g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap failed (%s) and GBM import failed", strerror(mmapError));
+                    return false;
+                }
+
+                uint32_t mapStride = 0;
+                void* mapData = nullptr;
+                void* sourceMapping = gbm_bo_map(sourceBO, 0, 0, sourceWidth, sourceHeight, GBM_BO_TRANSFER_READ, &mapStride, &mapData);
+                if (!sourceMapping || mapStride < rowBytes) {
+                    g_set_error(error, WPE_VIEW_ERROR, WPE_VIEW_ERROR_RENDER_FAILED, "Failed to rotate dmabuf: mmap failed (%s) and gbm_bo_map failed (stride %u)", strerror(mmapError), mapStride);
+                    if (sourceMapping)
+                        gbm_bo_unmap(sourceBO, mapData);
+                    gbm_bo_destroy(sourceBO);
+                    return false;
+                }
+
+                static bool loggedGBMMap = false;
+                if (!loggedGBMMap) {
+                    loggedGBMMap = true;
+                    g_message("WPEViewDRM dmabuf_cpu_map=gbm_bo_map transient=1");
+                }
+
+                struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+                ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncStart);
+                copyRotatedPixels(static_cast<const uint8_t*>(sourceMapping), sourceWidth, sourceHeight, mapStride, rotation);
+                if (sourceFormat == DRM_FORMAT_XRGB8888) {
+                    for (uint32_t y = 0; y < m_height; ++y) {
+                        auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_mapping) + static_cast<size_t>(y) * m_pitch);
+                        for (uint32_t x = 0; x < m_width; ++x)
+                            row[x] |= 0xff000000;
+                    }
+                }
+                struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+                ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
+
+                // The proprietary Mali GBM implementation opens DRM device handles
+                // while importing/mapping. Keeping the BO on every transient WPEBuffer
+                // leaks /dev/dri/card0 descriptors until IPC fd passing fails. The
+                // rotated dumb target owns the copied pixels, so release the import now.
+                gbm_bo_unmap(sourceBO, mapData);
+                gbm_bo_destroy(sourceBO);
+                return true;
+            } else {
+                userData->sourceMapping = mappedSource;
+                userData->sourceMappingSize = mapSize;
+                userData->sourceMappingStride = sourceStride;
             }
-            userData->sourceMapping = mappedSource;
-            userData->sourceMappingSize = mapSize;
         }
 
         struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncStart);
 
         const auto* source = static_cast<const uint8_t*>(userData->sourceMapping) + sourceOffset;
-        copyRotatedPixels(source, sourceWidth, sourceHeight, sourceStride, rotation);
+        copyRotatedPixels(source, sourceWidth, sourceHeight, userData->sourceMappingStride, rotation);
+        if (sourceFormat == DRM_FORMAT_XRGB8888) {
+            for (uint32_t y = 0; y < m_height; ++y) {
+                auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_mapping) + static_cast<size_t>(y) * m_pitch);
+                for (uint32_t x = 0; x < m_width; ++x)
+                    row[x] |= 0xff000000;
+            }
+        }
 
         struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
         ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
@@ -1304,6 +1890,8 @@ public:
     // 内容差异的超集，作 FB_DAMAGE_CLIPS 安全），整帧拷贝时为空（不带 clips）。
     Vector<drm_mode_rect> takeDestDamage() { return WTF::move(m_lastDestDamage); }
 
+    bool lastCopyWasPartial() const { return m_lastCopyWasPartial; }
+
     void copyRotatedPixels(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, OutputRotation rotation)
     {
         auto* destination = static_cast<uint8_t*>(m_mapping);
@@ -1317,7 +1905,7 @@ public:
         // 增量路径条件：本缓冲上帧内容有效且仅差累计脏区；chrome 状态与让位带
         // 未变（resize 布局下工具栏与内容区不相交，无需重画 overlay）；无面板
         // 悬浮在内容上、无显隐动画；源尺寸与内容区精确匹配（稳态）。
-        bool partial = !m_pendingFullRepaint && !m_pendingDamage.isEmpty()
+        bool partial = partialCopyEnabled() && !m_pendingFullRepaint && !m_pendingDamage.isEmpty()
             && chromeLayoutResizeEnabled() && !panelOpen && !chromeAnimationActive()
             && chromeHash == m_lastChromeHash && topInset == m_lastTopInset
             && sourceWidth == panel.width && sourceHeight == availableHeight;
@@ -1338,6 +1926,7 @@ public:
             copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
             drawChromeOverlay(destination, m_pitch, m_width, m_height, panel.width, panel.height, rotation);
         }
+        m_lastCopyWasPartial = partial;
         m_pendingDamage.clear();
         m_pendingFullRepaint = false;
         m_lastTopInset = topInset;
@@ -1384,13 +1973,22 @@ private:
     uint32_t m_lastTopInset { 0 };
     guint m_lastChromeHash { 0 };
     Vector<drm_mode_rect> m_lastDestDamage;
+    bool m_lastCopyWasPartial { false };
 };
+
+void WPEBufferDRMUserData::resetSourceMapping()
+{
+    if (sourceMapping)
+        munmap(sourceMapping, sourceMappingSize);
+    sourceMapping = nullptr;
+    sourceMappingSize = 0;
+    sourceMappingStride = 0;
+}
 
 WPEBufferDRMUserData::~WPEBufferDRMUserData()
 {
     delete scanoutBuffer;
-    if (sourceMapping)
-        munmap(sourceMapping, sourceMappingSize);
+    resetSourceMapping();
 }
 
 /**
@@ -1427,10 +2025,28 @@ struct _WPEViewDRMPrivate {
     bool lastCommitWasSynchronous { false };
     gint64 copyTotalUS { 0 };
     gint64 commitTotalUS { 0 };
-    gint64 statsStartUS { 0 };
+    gint64 fenceWaitTotalUS { 0 };
+    gint64 fenceWaitMaxUS { 0 };
+    guint64 fenceWaitCount { 0 };
+    guint64 fenceTimeoutCount { 0 };
+    guint64 fullCopyCount { 0 };
+    guint64 partialCopyCount { 0 };
+    gint64 statsWindowStartUS { 0 };
+    guint64 statsWindowFrameCount { 0 };
+    gint64 copyWindowTotalUS { 0 };
+    gint64 copyWindowMaxUS { 0 };
+    guint64 copyWindowCount { 0 };
+    gint64 commitWindowTotalUS { 0 };
+    gint64 commitWindowMaxUS { 0 };
+    guint64 commitWindowCount { 0 };
+    guint64 queuedWindowCount { 0 };
+    guint64 replacedQueuedWindowCount { 0 };
+    guint64 droppedWindowCount { 0 };
     gint64 lastFrameCommitUS { 0 };
     gint64 frameThrottleIntervalUS { 0 };
     unsigned chromePollTick { 0 };
+    bool lastUpdateDroppedBuffer { false };
+    bool forceFullDamageNextFrame { false };
     OutputRotation outputRotation { OutputRotation::Rotate0 };
     struct VideoOverlayState* videoOverlay { nullptr };
 };
@@ -1454,27 +2070,56 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
     priv->pendingScanoutBuffer = nullptr;
     wpe_view_buffer_rendered(WPE_VIEW(view), priv->committedBuffer.get());
     priv->frameCount++;
+    priv->statsWindowFrameCount++;
 
-    if (!(priv->frameCount % 60)) {
-        gint64 elapsedUS = g_get_monotonic_time() - priv->statsStartUS;
-        if (elapsedUS <= 0)
-            elapsedUS = 1;
+    gint64 nowUS = g_get_monotonic_time();
+    gint64 elapsedUS = nowUS - priv->statsWindowStartUS;
+    if (elapsedUS < 2 * G_USEC_PER_SEC)
+        return;
 
-        auto fps = static_cast<double>(priv->frameCount) * G_USEC_PER_SEC / elapsedUS;
-        auto copyAverageMS = priv->copyTotalUS / 1000. / priv->frameCount;
-        auto commitAverageMS = priv->commitTotalUS / 1000. / priv->frameCount;
-        g_message("WPEViewDRM fps=%.1f copy_avg_ms=%.2f commit_avg_ms=%.2f frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
-            fps, copyAverageMS, commitAverageMS, priv->frameCount, priv->pageFlipCount);
-    }
+    auto fps = static_cast<double>(priv->statsWindowFrameCount) * G_USEC_PER_SEC / elapsedUS;
+    auto copyAverageMS = priv->copyWindowCount ? priv->copyWindowTotalUS / 1000. / priv->copyWindowCount : 0.;
+    auto commitAverageMS = priv->commitWindowCount ? priv->commitWindowTotalUS / 1000. / priv->commitWindowCount : 0.;
+    g_message("WPEViewDRM window fps=%.1f copy_avg_ms=%.2f copy_max_ms=%.2f commit_avg_ms=%.2f commit_max_ms=%.2f queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+        fps, copyAverageMS, priv->copyWindowMaxUS / 1000., commitAverageMS, priv->commitWindowMaxUS / 1000.,
+        priv->queuedWindowCount, priv->replacedQueuedWindowCount, priv->droppedWindowCount,
+        priv->statsWindowFrameCount, priv->frameCount, priv->pageFlipCount);
+
+    priv->statsWindowStartUS = nowUS;
+    priv->statsWindowFrameCount = 0;
+    priv->copyWindowTotalUS = 0;
+    priv->copyWindowMaxUS = 0;
+    priv->copyWindowCount = 0;
+    priv->commitWindowTotalUS = 0;
+    priv->commitWindowMaxUS = 0;
+    priv->commitWindowCount = 0;
+    priv->queuedWindowCount = 0;
+    priv->replacedQueuedWindowCount = 0;
+    priv->droppedWindowCount = 0;
 }
 
 static void wpeViewDRMQueueBuffer(WPEViewDRM* view, WPEBuffer* buffer, const WPERectangle* damageRects, guint nDamageRects)
 {
     auto* priv = view->priv;
-    if (priv->queuedBuffer && priv->queuedBuffer.get() != buffer)
+    bool replacesQueuedBuffer = priv->queuedBuffer && priv->queuedBuffer.get() != buffer;
+    priv->queuedWindowCount++;
+    if (replacesQueuedBuffer)
+        priv->replacedQueuedWindowCount++;
+    if (replacesQueuedBuffer)
         wpe_view_buffer_released(WPE_VIEW(view), priv->queuedBuffer.get());
     priv->queuedBuffer = buffer;
-    setDamageRects(priv->queuedDamageRects, damageRects, nDamageRects);
+    if (priv->forceFullDamageNextFrame || !nDamageRects || (replacesQueuedBuffer && priv->queuedDamageRects.isEmpty())) {
+        priv->queuedDamageRects.clear();
+        priv->forceFullDamageNextFrame = false;
+    } else if (replacesQueuedBuffer) {
+        if (priv->queuedDamageRects.size() + nDamageRects > 16)
+            priv->queuedDamageRects.clear();
+        else {
+            for (unsigned i = 0; i < nDamageRects; ++i)
+                priv->queuedDamageRects.append({ damageRects[i].x, damageRects[i].y, damageRects[i].x + damageRects[i].width, damageRects[i].y + damageRects[i].height });
+        }
+    } else
+        setDamageRects(priv->queuedDamageRects, damageRects, nDamageRects);
     priv->updateFlags.add(UpdateFlags::BufferUpdatePending);
 }
 
@@ -1501,7 +2146,12 @@ static gboolean wpeViewDRMCommitQueuedBuffer(WPEViewDRM* view, GError** error)
     priv->updateFlags.remove(UpdateFlags::BufferUpdatePending);
     priv->pendingBuffer = WTF::move(priv->queuedBuffer);
     priv->damageRects = WTF::move(priv->queuedDamageRects);
+    priv->lastUpdateDroppedBuffer = false;
     if (wpeViewDRMRequestUpdate(view, error)) {
+        if (priv->lastUpdateDroppedBuffer) {
+            priv->lastUpdateDroppedBuffer = false;
+            return TRUE;
+        }
         priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
         wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
         return TRUE;
@@ -1577,7 +2227,7 @@ static void wpeViewDRMConstructed(GObject* object)
     auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(view));
     auto* priv = WPE_VIEW_DRM(view)->priv;
     priv->refreshDuration = Seconds(1 / (wpe_screen_get_refresh_rate(wpeDisplayDRMGetScreen(display)) / 1000.));
-    priv->statsStartUS = g_get_monotonic_time();
+    priv->statsWindowStartUS = g_get_monotonic_time();
     // 注意：生产 run.sh 设 WPE_DRM_MAX_FPS=0，此节流机制全程不生效，
     // 实际限帧由 WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS 承担。
     if (auto maxFPS = configuredMaxFPS())
@@ -1809,7 +2459,8 @@ static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer, 
 {
     auto* priv = view->priv;
     auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
-    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    auto* device = wpe_display_drm_get_device(display);
+    int fd = gbm_device_get_fd(device);
 
     for (unsigned i = 0; i < priv->shmScanoutBuffers.size(); ++i) {
         auto index = (priv->nextSHMScanoutBufferIndex + i) % priv->shmScanoutBuffers.size();
@@ -1841,7 +2492,8 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
 {
     auto* priv = view->priv;
     auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
-    int fd = gbm_device_get_fd(wpe_display_drm_get_device(display));
+    auto* device = wpe_display_drm_get_device(display);
+    int fd = gbm_device_get_fd(device);
 
     for (unsigned i = 0; i < priv->rotatedScanoutBuffers.size(); ++i) {
         auto index = (priv->nextRotatedScanoutBufferIndex + i) % priv->rotatedScanoutBuffers.size();
@@ -1852,10 +2504,10 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
             continue;
 
         if (!candidate || !candidate->matchesRotatedDMABuf(buffer, rotation)) {
-            candidate = DRMScanoutBuffer::createRotatedDMABufDumb(fd, buffer, rotation, error);
+            candidate = DRMScanoutBuffer::createRotatedDMABufDumb(device, fd, buffer, rotation, error);
             if (!candidate)
                 return nullptr;
-        } else if (!candidate->copyRotatedFromDMABuf(buffer, rotation, error))
+        } else if (!candidate->copyRotatedFromDMABuf(device, buffer, rotation, error))
             return nullptr;
 
         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
@@ -2718,6 +3370,49 @@ static void setDamageRects(Vector<drm_mode_rect>& destination, const WPERectangl
         destination.append({ damageRects[i].x, damageRects[i].y, damageRects[i].x + damageRects[i].width, damageRects[i].y + damageRects[i].height });
 }
 
+static bool bufferNeedsCPURead(WPEBuffer* buffer, OutputRotation rotation)
+{
+    return WPE_IS_BUFFER_SHM(buffer) || (WPE_IS_BUFFER_DMA_BUF(buffer) && rotation != OutputRotation::Rotate0);
+}
+
+static bool waitForRenderingFence(WPEViewDRM* view, const UnixFileDescriptor& fence)
+{
+    if (!fence)
+        return true;
+
+    auto* priv = view->priv;
+    struct pollfd descriptor = { fence.value(), POLLIN, 0 };
+    gint64 startUS = g_get_monotonic_time();
+    int result;
+    do {
+        result = poll(&descriptor, 1, renderingFenceTimeoutMS());
+    } while (result < 0 && errno == EINTR);
+    gint64 elapsedUS = g_get_monotonic_time() - startUS;
+    priv->fenceWaitCount++;
+    priv->fenceWaitTotalUS += elapsedUS;
+    priv->fenceWaitMaxUS = std::max(priv->fenceWaitMaxUS, elapsedUS);
+    if (result > 0)
+        return true;
+
+    priv->fenceTimeoutCount++;
+    g_warning("WPEViewDRM rendering fence %s after %.2fms fd=%d timeout_ms=%d; dropping incomplete frame",
+        result == 0 ? "timed out" : "wait failed", elapsedUS / 1000., fence.value(), renderingFenceTimeoutMS());
+    return false;
+}
+
+static void dropPendingFrame(WPEViewDRM* view)
+{
+    auto* priv = view->priv;
+    if (priv->pendingBuffer)
+        wpe_view_buffer_released(WPE_VIEW(view), priv->pendingBuffer.get());
+    priv->pendingBuffer = nullptr;
+    priv->pendingScanoutBuffer = nullptr;
+    priv->damageRects.clear();
+    priv->lastUpdateDroppedBuffer = true;
+    priv->forceFullDamageNextFrame = true;
+    priv->droppedWindowCount++;
+}
+
 static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
 {
     auto* priv = view->priv;
@@ -2729,6 +3424,15 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
             && (priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb
                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb)));
     if (priv->pendingBuffer || needsScanoutRebuild) {
+        UnixFileDescriptor renderingFence;
+        bool pendingNeedsCPURead = priv->pendingBuffer && bufferNeedsCPURead(buffer, rotation);
+        if (priv->pendingBuffer)
+            renderingFence = UnixFileDescriptor { wpe_buffer_take_rendering_fence(buffer), UnixFileDescriptor::Adopt };
+        if (pendingNeedsCPURead && !waitForRenderingFence(view, renderingFence)) {
+            dropPendingFrame(view);
+            return TRUE;
+        }
+
         gint64 copyStartUS = g_get_monotonic_time();
         if (rotation != OutputRotation::Rotate0 && priv->pendingBuffer) {
             for (auto& candidate : priv->rotatedScanoutBuffers) {
@@ -2742,13 +3446,23 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
 
         if (drmBuffer->kind() == DRMScanoutBuffer::Kind::SHMDumb
             || drmBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb
-            || drmBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb)
-            priv->copyTotalUS += g_get_monotonic_time() - copyStartUS;
+            || drmBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb) {
+            auto copyDurationUS = g_get_monotonic_time() - copyStartUS;
+            priv->copyTotalUS += copyDurationUS;
+            priv->copyWindowTotalUS += copyDurationUS;
+            priv->copyWindowMaxUS = std::max(priv->copyWindowMaxUS, copyDurationUS);
+            priv->copyWindowCount++;
+            if (drmBuffer->lastCopyWasPartial())
+                priv->partialCopyCount++;
+            else
+                priv->fullCopyCount++;
+        }
         if (rotation != OutputRotation::Rotate0)
             priv->damageRects = drmBuffer->takeDestDamage();
 
         if (priv->pendingBuffer) {
-            drmBuffer->setFenceFD(UnixFileDescriptor { wpe_buffer_take_rendering_fence(buffer), UnixFileDescriptor::Adopt });
+            if (!pendingNeedsCPURead)
+                drmBuffer->setFenceFD(WTF::move(renderingFence));
             priv->pendingScanoutBuffer = drmBuffer;
         } else
             priv->committedScanoutBuffer = drmBuffer;
@@ -2766,7 +3480,11 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
         if (damageID)
             destroyDamageBlob(display, damageID.value());
         priv->damageRects.clear();
-        priv->commitTotalUS += g_get_monotonic_time() - commitStartUS;
+        auto commitDurationUS = g_get_monotonic_time() - commitStartUS;
+        priv->commitTotalUS += commitDurationUS;
+        priv->commitWindowTotalUS += commitDurationUS;
+        priv->commitWindowMaxUS = std::max(priv->commitWindowMaxUS, commitDurationUS);
+        priv->commitWindowCount++;
         if (result && drmBuffer)
             priv->lastFrameCommitUS = commitStartUS;
         priv->lastCommitWasSynchronous = result && bufferUsesSynchronousCommit(drmBuffer);
@@ -2779,7 +3497,11 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
     }
 
     auto result = wpeViewDRMCommitLegacy(WPE_VIEW_DRM(view), *drmBuffer, error);
-    priv->commitTotalUS += g_get_monotonic_time() - commitStartUS;
+    auto commitDurationUS = g_get_monotonic_time() - commitStartUS;
+    priv->commitTotalUS += commitDurationUS;
+    priv->commitWindowTotalUS += commitDurationUS;
+    priv->commitWindowMaxUS = std::max(priv->commitWindowMaxUS, commitDurationUS);
+    priv->commitWindowCount++;
     if (result)
         priv->lastFrameCommitUS = commitStartUS;
     return result;
@@ -2814,11 +3536,20 @@ static gboolean wpeViewDRMRenderBuffer(WPEView* view, WPEBuffer* buffer, const W
     }
 
     priv->pendingBuffer = buffer;
-    setDamageRects(priv->damageRects, damageRects, nDamageRects);
+    if (priv->forceFullDamageNextFrame) {
+        priv->damageRects.clear();
+        priv->forceFullDamageNextFrame = false;
+    } else
+        setDamageRects(priv->damageRects, damageRects, nDamageRects);
+    priv->lastUpdateDroppedBuffer = false;
 
     if (priv->cursorUpdateTimer)
         priv->cursorUpdateTimer->stop();
     if (wpeViewDRMRequestUpdate(WPE_VIEW_DRM(view), error)) {
+        if (priv->lastUpdateDroppedBuffer) {
+            priv->lastUpdateDroppedBuffer = false;
+            return TRUE;
+        }
         priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
         wpeViewDRMCompleteSynchronousCommitIfNeeded(WPE_VIEW_DRM(view));
         return TRUE;

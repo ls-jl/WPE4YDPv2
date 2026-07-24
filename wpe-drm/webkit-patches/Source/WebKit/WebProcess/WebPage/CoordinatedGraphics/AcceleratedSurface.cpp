@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -127,6 +128,24 @@ static bool syncDMABufForCPU(int fd, uint64_t flags)
     }
     return true;
 }
+
+static bool waitForReleaseFenceOnCPU(int fd)
+{
+    pollfd descriptor = { fd, POLLIN, 0 };
+    int result;
+    do {
+        result = poll(&descriptor, 1, 2000);
+    } while (result < 0 && errno == EINTR);
+
+    if (result > 0)
+        return true;
+
+    if (!result)
+        WTFLogAlways("Timed out waiting for CPU compositor release fence fd=%d", fd);
+    else
+        WTFLogAlways("Failed waiting for CPU compositor release fence fd=%d: %s", fd, safeStrerror(errno).data());
+    return false;
+}
 #endif
 
 Ref<AcceleratedSurface> AcceleratedSurface::create(WebPage& webPage, Function<void()>&& frameCompleteHandler, RenderingPurpose renderingPurpose, bool useSkia)
@@ -147,10 +166,20 @@ static bool useExplicitSync()
     return extensions.ANDROID_native_fence_sync && (display.eglCheckVersion(1, 5) || extensions.KHR_fence_sync);
 }
 
+static bool useSkiaCPURasterCompositor(bool useSkia)
+{
+    if (!useSkia)
+        return false;
+
+    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
+    return value && *value && value[0] != '0';
+}
+
 AcceleratedSurface::AcceleratedSurface(WebPage& webPage, Function<void()>&& frameCompleteHandler, RenderingPurpose renderingPurpose, bool useSkia)
     : m_webPage(webPage)
     , m_frameCompleteHandler(WTF::move(frameCompleteHandler))
     , m_useSkia(useSkia)
+    , m_useSkiaCPURasterCompositor(useSkiaCPURasterCompositor(useSkia))
     , m_id(generateID())
     , m_renderingPurpose(renderingPurpose)
 #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
@@ -164,6 +193,8 @@ AcceleratedSurface::AcceleratedSurface(WebPage& webPage, Function<void()>&& fram
     , m_damageTracker(m_swapChain)
 #endif
 {
+    if (m_useSkia)
+        WTFLogAlways("AcceleratedSurface purpose=%s compositor_path=%s shm_readback=%s", m_renderingPurpose == RenderingPurpose::Composited ? "composited" : "non_composited", usesGL() ? "skia_gpu" : "skia_raster_shm", usesGL() ? "enabled" : "disabled");
 }
 
 AcceleratedSurface::~AcceleratedSurface() = default;
@@ -247,8 +278,13 @@ void AcceleratedSurface::RenderTargetShareableBuffer::sendFrame(Vector<WebCore::
 void AcceleratedSurface::RenderTargetShareableBuffer::willRenderFrame()
 {
     if (m_releaseFenceFD) {
-        if (auto fence = GLFence::importFD(PlatformDisplay::sharedDisplay().glDisplay(), WTF::move(m_releaseFenceFD)))
-            fence->serverWait();
+        if (m_surface->usesGL()) {
+            if (auto fence = GLFence::importFD(PlatformDisplay::sharedDisplay().glDisplay(), WTF::move(m_releaseFenceFD)))
+                fence->serverWait();
+        } else {
+            waitForReleaseFenceOnCPU(m_releaseFenceFD.value());
+            m_releaseFenceFD = { };
+        }
     }
 
     if (!m_surface->useSkia()) {
@@ -496,13 +532,13 @@ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame()
         if (!m_skiaSurface)
             return;
 
-        SkImageInfo info = SkImageInfo::Make(m_bitmap->size().width(), m_bitmap->size().height(), SkColorType::kBGRA_8888_SkColorType, SkAlphaType::kPremul_SkAlphaType);
+        // Raster Skia writes directly into ShareableBitmap memory.
+        if (!m_surface->usesGL())
+            return;
 
-        if (m_surface->usesGL()) {
-            GLContext::ScopedGLContextCurrent scopedCurrent(*PlatformDisplay::sharedDisplay().skiaGLContext());
-            m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
-        } else
-            m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+        SkImageInfo info = SkImageInfo::Make(m_bitmap->size().width(), m_bitmap->size().height(), SkColorType::kBGRA_8888_SkColorType, SkAlphaType::kPremul_SkAlphaType);
+        GLContext::ScopedGLContextCurrent scopedCurrent(*PlatformDisplay::sharedDisplay().skiaGLContext());
+        m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
         return;
     }
 

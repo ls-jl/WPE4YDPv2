@@ -186,6 +186,10 @@ WPE_MESA_DIR=$runtimePath
 WPE_VAR_DIR=$workdir
 WPE_CHROME_STATE=$workdir/browser-state.ini
 WPE_CHROME_RENDER_STATE=$workdir/chrome-render-state.ini
+WPE_BROWSER_DB=$workdir/browser.sqlite3
+WPE_PROFILES_DIR=$workdir/profiles
+WPE_PROFILE_SWITCH_FILE=$workdir/profile-switch.request
+WPE_CHROME_FONT=$runtimePath/assets/fonts/miniapp/NotoSansSC-Regular.otf
 WPE_KEYBOARD_DIR=$workdir/keyboard
 WPE_DRM_RUNTIME_DIR=$workdir/runtime-tmp
 WPE_DRM_USE_OVERLAY=1
@@ -199,6 +203,13 @@ GST_REGISTRY=$workdir/gst-registry.bin
 WPE_DEFAULT_URL=<url>
 HOME=$workdir
 ```
+
+`WPE_CHROME_STATE` 和初始 `WPE_DRM_RUNTIME_DIR` 只用于首次升级迁移。DEFAULT
+Profile 建立后，主页、标签、历史和收藏写入 `browser.sqlite3`；站点数据与 Cookie
+分别写入 `profiles/p<ID>/runtime` 和 `profiles/p<ID>/cookies.sqlite`。Profile
+切换由子进程退出码 `75` 驱动，`run.sh` 读取 `profile-switch.request` 后仅重启
+`wpe-drm-minimal`，不会结束 MiniApp watchdog 或重载浏览器拥有的 GPU 模块。
+Guest 使用 ephemeral NetworkSession，退出后删除临时目录且不会覆盖下次默认 Profile。
 
 然后执行：
 
@@ -223,9 +234,21 @@ $workdir/keyboard/responses/
 
 `assets/wpe-runtime/run.sh` 是 WPE 运行环境入口。它负责把包内 runtime 变成一个可运行的 Linux 用户态环境。
 
-### 4.1 动态库和 Mesa
+### 4.1 CPU/GPU 渲染档案
 
-脚本设置：
+默认 `WPE_GPU_MODE=auto`。启动脚本先检查 `/dev/mali0`；节点不存在时，仅在
+ARM64 `5.10.160`、模块加载未禁用、KO vermagic 匹配且有 root 权限时，按
+`x7_gpu_dt_enable`、`bifrost_kbase` 顺序尝试加载。预先存在的模块不归浏览器
+所有，退出时不会卸载；本次加载的模块按相反顺序清理。
+
+GPU 启用前，`libexec/wpe-gpu-probe` 必须确认 ARM/Mali renderer、GLES shader
+和 readback、ARGB8888 linear DMA-BUF 导出/映射及 `drmModeAddFB2` 全部成功。
+GPU profile 使用包内 `gpu/mali/lib`，通过 `libwpe-mali-gbm-compat.so` 补齐
+`gbm_bo_create_with_modifiers2` 和 `gbm_bo_get_fd_for_plane`，但继续使用 runtime
+自带的新 `libdrm.so.2`。首帧 12 秒超时或首帧前 WebProcess 崩溃时，`auto`
+只重启一次 CPU profile；Home/SIGTERM 不触发回退。
+
+CPU profile 设置：
 
 ```sh
 LD_LIBRARY_PATH=$MESA/lib:$DIR/lib
@@ -236,7 +259,9 @@ GALLIUM_DRIVER=softpipe
 MESA_LOADER_DRIVER_OVERRIDE=kms_swrast
 ```
 
-当前设备没有可用 GPU，默认走软件渲染/softpipe，但 WPE 的最终出屏仍然走 DRM plane，不经过 MiniApp canvas。
+CPU profile 走 Skia CPU + dma-heap/SHM，Mesa softpipe 仅保留兼容依赖；最终出屏
+仍走 DRM plane，不经过 MiniApp canvas。`WPE_GPU_MODE=off` 强制 CPU，
+`required` 则在任一 GPU 检查失败时退出而不回退。
 
 ### 4.2 证书、字体、GStreamer
 
@@ -680,6 +705,12 @@ $workdir/keyboard/requests/
 $workdir/keyboard/responses/
 ```
 
+终态目录：
+
+```text
+$workdir/keyboard/status/
+```
+
 流程：
 
 1. WPE 发现输入触发点。
@@ -690,7 +721,7 @@ $workdir/keyboard/responses/
    请求 `id` 写在 JSON 内。固定文件名可以让 JSAPI 先 `stat` 再读取，避免每轮 `opendir/readdir`。
 3. MiniApp `frame` 页每 200ms 轮询 `browserPlayer.pollKeyboardRequest()`。
 4. MiniApp 调用 HaasUI `global.startTextEdit()` 拉起系统键盘。
-5. Y07 这类 textarea 输入法会持续把完整当前文本写入：
+5. Y07 这类 textarea 输入法会持续把完整当前文本和单调递增的 `sequence` 原子写入：
    ```text
    $workdir/keyboard/responses/<id>.update
    ```
@@ -701,8 +732,11 @@ $workdir/keyboard/responses/
    $workdir/keyboard/responses/<id>.ok
    $workdir/keyboard/responses/<id>.cancel
    ```
-8. WPE 轮询响应文件。
-9. 地址栏输入在最终 `.ok` 后才跳转；网页输入框对 `.update` 实时写入 active input，最终 `.ok` 再派发 `change`。
+8. WPE 串行处理响应，丢弃旧序号；异步网页写入期间只保留最新 update，最终 `.ok` 等前序写入完成后再提交。
+9. WPE 删除自己创建的 `requests/current.json`，并写入 `status/<id>.json`。JSAPI 不删除请求文件，MiniApp 通过 `pollKeyboardCompletion()` 等待 `confirmed/cancelled/expired/superseded` 终态。
+10. 地址栏输入在最终 `.ok` 后才跳转；网页输入框对 `.update` 实时写入 active input，最终 `.ok` 再派发 `change`。
+
+网页键盘请求只由可信触摸点击触发，不监听 `focusin` 自动弹出。同一 request ID 在 MiniApp 中只允许进入一次 `opening -> active -> responding` 流程，重复的 `input/textChanged`、过期 UUID 和重复终态回调都必须忽略。
 
 ## 11. 常用调试命令
 
@@ -1011,8 +1045,35 @@ adb shell 'sed -n "1,220p" /sys/kernel/debug/dri/0/state'
 
 - MiniApp 不参与网页像素刷新。
 - MiniApp 不绘制浏览器 toolbar。
-- WPE native chrome 负责地址栏、tabs、settings。
+- WPE native chrome 负责地址栏、Profile、tabs、history、bookmarks、settings。
 - WPE 直接处理触摸和滚动。
 - 系统键盘必须通过 MiniApp 桥接。
 - Runtime 本体必须随 AMR 内置，不能依赖 `/userdisk/wpe-drm2`、`/userdisk/mesa`、chroot runtime。
-- `$dataDir/browser` 只用于可写状态、日志、pid、缓存、键盘请求和浏览器状态。
+- Mali 专有库和设备 KO 仅由本地 staging 加入 AMR，不进入公开 Git；缺失时 `auto` 必须仍能正常启动 CPU profile。
+- `$dataDir/browser` 只用于可写状态、日志、pid、Profile 数据库/站点数据、缓存和键盘请求。
+
+## 16. WebRTC 云游戏与完整帧诊断
+
+WebRTC 默认由包内 GStreamer backend 提供，`WPE_WEBRTC=1`，本地采集固定为
+`WPE_WEBRTC_CAPTURE=deny`。远端 H.264 应由 `mppvideodec` 解码；得到 NV12
+DMA-BUF 后，hole-punch sink 通过 unix socket 交给 UI 进程并提交到独立 Esmart
+视频 plane。云原神主机在 `WPE_INPUT_PROFILE=auto` 下使用 `game`，raw touch 的
+down/move/up 按 slot 原样发给 WebKit，不生成浏览器 scroll 或 synthetic tap。
+
+基础链路测试：
+
+```sh
+# 地址栏打开包内 assets/wpe-runtime/tests/webrtc-loopback.html 后
+adb shell 'grep -E "WEBRTC_TEST|PASS ICE|Denied local" \
+  /userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449/data/browser/wpe-drm.log | tail -80'
+
+# 云游戏开始推流后验证硬解和视频 plane
+adb shell 'grep -E "mppvideodec|hole-punch|video overlay" \
+  /userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449/data/browser/wpe-drm.log | tail -80'
+adb shell 'grep -E "plane\[|format=NV12|fb=|crtc-pos=" /sys/kernel/debug/dri/0/state'
+```
+
+旋转或CPU合成路径读取DMA-BUF前会等待WPE rendering fence，并在读取区间执行
+`DMA_BUF_IOCTL_SYNC`。`WPE_DRM_PARTIAL_COPY=0`默认强制完整帧复制；fence超时会
+丢弃未完成帧并保留上一张完整画面。每60帧的日志应检查
+`fence_timeouts=0`、`full_copies`持续增长且`partial_copies=0`。

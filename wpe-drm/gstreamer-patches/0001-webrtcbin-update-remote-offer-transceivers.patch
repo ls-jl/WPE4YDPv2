@@ -1,0 +1,106 @@
+diff --git a/ext/webrtc/gstwebrtcbin.c b/ext/webrtc/gstwebrtcbin.c
+--- a/ext/webrtc/gstwebrtcbin.c
++++ b/ext/webrtc/gstwebrtcbin.c
+@@ -6021,5 +6021,85 @@ _update_transceivers_from_sdp (GstWebRTCBin * webrtc, SDPSource source,
+   guint bundle_idx = 0;
+   TransportStream *bundle_stream = NULL;
++  /*
++   * A remote Offer has no matching local description yet, so the normal
++   * transceiver update below cannot compute a final direction. Associate its
++   * m-lines now so API users receive track events before creating an Answer.
++   * The full transport and direction update still runs when signaling reaches
++   * stable.
++   */
++  if (!webrtc->current_local_description ||
++      !webrtc->current_remote_description) {
++    for (i = 0; i < gst_sdp_message_medias_len (sdp->sdp); i++) {
++      const GstSDPMedia *media = gst_sdp_message_get_media (sdp->sdp, i);
++      GstWebRTCRTPTransceiver *trans;
++      GstWebRTCKind kind;
++      GstWebRTCRTPTransceiverDirection remote_dir, local_dir;
++      GstCaps *remote_caps;
++      guint j;
++
++      if (gst_sdp_media_get_port (media) == 0)
++        continue;
++      if (g_strcmp0 (gst_sdp_media_get_media (media), "audio") == 0)
++        kind = GST_WEBRTC_KIND_AUDIO;
++      else if (g_strcmp0 (gst_sdp_media_get_media (media), "video") == 0)
++        kind = GST_WEBRTC_KIND_VIDEO;
++      else
++        continue;
++
++      trans = _find_transceiver_for_sdp_media (webrtc, sdp->sdp, i);
++      if (!trans)
++        trans = _find_transceiver (webrtc, GINT_TO_POINTER (kind),
++            (FindTransceiverFunc) _find_compatible_unassociated_transceiver);
++
++      remote_dir = _get_direction_from_media (media);
++      switch (remote_dir) {
++        case GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY:
++          local_dir = GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY;
++          break;
++        case GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY:
++          local_dir = GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY;
++          break;
++        default:
++          local_dir = remote_dir;
++          break;
++      }
++
++      if (!trans) {
++        WebRTCTransceiver *created = _create_webrtc_transceiver (webrtc,
++            local_dir, i, kind, NULL);
++        trans = GST_WEBRTC_RTP_TRANSCEIVER (created);
++      } else {
++        trans->mline = i;
++        if (trans->kind == GST_WEBRTC_KIND_UNKNOWN)
++          trans->kind = kind;
++      }
++
++      for (j = 0; j < gst_sdp_media_attributes_len (media); j++) {
++        const GstSDPAttribute *attr =
++            gst_sdp_media_get_attribute (media, j);
++        if (g_strcmp0 (attr->key, "mid") != 0)
++          continue;
++        g_free (trans->mid);
++        trans->mid = g_strdup (attr->value);
++        break;
++      }
++
++      /*
++       * createAnswer() in GStreamer 1.22 finds a transceiver by intersecting
++       * its codec preferences with the remote offer. WebKit may already have
++       * exposed the receive pad by then, whose local payload numbers differ
++       * from the offer. Preserve the offer's codec and payload mapping on the
++       * early transceiver so createAnswer() reuses this exact object instead
++       * of creating a second, disconnected receiver transceiver.
++       */
++      remote_caps = _rtp_caps_from_media (media);
++      _remove_optional_offer_fields (remote_caps);
++      g_object_set (trans, "codec-preferences", remote_caps, NULL);
++      gst_caps_unref (remote_caps);
++    }
++    return TRUE;
++  }
++
+   /* FIXME: With some peers, it's possible we could have
+    * multiple bundles to deal with, although I've never seen one yet */
+   if (webrtc->bundle_policy != GST_WEBRTC_BUNDLE_POLICY_NONE)
+@@ -6486,4 +6566,16 @@ _set_description_task (GstWebRTCBin * webrtc, gpointer user_data)
+     gst_webrtc_ice_set_is_controller (webrtc->priv->ice, ice_controller);
+   }
++  /*
++   * Expose remote Offer transceivers before the application creates its local
++   * Answer. Calling the full updater here takes the early-association branch
++   * above; it runs normally again after signaling reaches stable.
++   */
++  if (new_signaling_state == GST_WEBRTC_SIGNALING_STATE_HAVE_REMOTE_OFFER &&
++      sd->source == SDP_REMOTE &&
++      sd->sdp->type == GST_WEBRTC_SDP_TYPE_OFFER) {
++    if (!_update_transceivers_from_sdp (webrtc, sd->source, sd->sdp, &error))
++      goto out;
++  }
++
+   if (new_signaling_state == GST_WEBRTC_SIGNALING_STATE_STABLE) {
+     GList *tmp;
