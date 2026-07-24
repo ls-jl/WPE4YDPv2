@@ -125,6 +125,12 @@ function appMeta() {
   return {}
 }
 
+export function keyboardBackendOverride() {
+  const props = appMeta().props || {}
+  const value = `${props.keyboard_backend || 'auto'}`.toLowerCase()
+  return value === 'textarea' || value === 'global' ? value : 'auto'
+}
+
 function deviceSkuKey() {
   const env = falconEnv()
   const custom = env && env.custom ? env.custom : {}

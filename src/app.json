@@ -10,7 +10,8 @@
         "drmMode": "480x960",
         "rotation": 270
       }
-    }
+    },
+    "keyboard_backend": "auto"
   },
   "options": {
       "style": {

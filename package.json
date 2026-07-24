@@ -24,6 +24,7 @@
     "build:web": "aiot-cli build-web",
     "build:simulator": "aiot-cli simulator ./",
     "upload": "aiot-cli upload -n",
+    "test:keyboard": "node scripts/test_keyboard_event.mjs",
     "check": "aiot-cli check",
     "check:beta": "aiot-cli check -b"
   },

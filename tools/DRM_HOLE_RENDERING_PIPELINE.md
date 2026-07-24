@@ -720,8 +720,10 @@ $workdir/keyboard/status/
    ```
    请求 `id` 写在 JSON 内。固定文件名可以让 JSAPI 先 `stat` 再读取，避免每轮 `opendir/readdir`。
 3. MiniApp `frame` 页每 200ms 轮询 `browserPlayer.pollKeyboardRequest()`。
-4. MiniApp 调用 HaasUI `global.startTextEdit()` 拉起系统键盘。
-5. Y07 这类 textarea 输入法会持续把完整当前文本和单调递增的 `sequence` 原子写入：
+4. MiniApp 根据 `$workdir/keyboard/backend.json` 选择已验证后端；未知设备先探测
+   `<textarea softInputEnable>`，1.5 秒内没有键盘切前后台、输入或确认事件时，关闭
+   textarea 后再单独调用 `global.startTextEdit()`。两个入口不会同时打开。
+5. textarea 后端会持续把完整当前文本和单调递增的 `sequence` 原子写入：
    ```text
    $workdir/keyboard/responses/<id>.update
    ```
@@ -732,11 +734,19 @@ $workdir/keyboard/status/
    $workdir/keyboard/responses/<id>.ok
    $workdir/keyboard/responses/<id>.cancel
    ```
-8. WPE 串行处理响应，丢弃旧序号；异步网页写入期间只保留最新 update，最终 `.ok` 等前序写入完成后再提交。
-9. WPE 删除自己创建的 `requests/current.json`，并写入 `status/<id>.json`。JSAPI 不删除请求文件，MiniApp 通过 `pollKeyboardCompletion()` 等待 `confirmed/cancelled/expired/superseded` 终态。
-10. 地址栏输入在最终 `.ok` 后才跳转；网页输入框对 `.update` 实时写入 active input，最终 `.ok` 再派发 `change`。
+8. 网页 frame 通过 `script-message-with-reply-received` 保持异步 waiter。WPE 把
+   update/commit 回复到真正发起请求的 frame，iframe 自己写入目标并在下一帧验证，
+   不再从主 frame 调用 `evaluate_javascript()` 查找输入框。
+9. WPE 删除自己创建的 `requests/current.json`，并用临时文件、`fsync`、`rename`
+   原子发布 `status/<id>.json`。`pollKeyboardCompletion()` 是非破坏读取；MiniApp
+   成功解析后调用 `ackKeyboardCompletion()` 删除终态。
+10. 地址栏输入在最终 `.ok` 后才跳转；textarea 网页输入对 `.update` 实时写入，
+    global-only 设备在最终确认时一次写入，最终 commit 再派发 `change`。
 
 网页键盘请求只由可信触摸点击触发，不监听 `focusin` 自动弹出。同一 request ID 在 MiniApp 中只允许进入一次 `opening -> active -> responding` 流程，重复的 `input/textChanged`、过期 UUID 和重复终态回调都必须忽略。
+
+`app.json` 的 `keyboard_backend` 可设为 `auto`、`textarea` 或 `global`。默认
+`auto`；人工值只用于现场调试，不进入浏览器设置 UI。
 
 ## 11. 常用调试命令
 

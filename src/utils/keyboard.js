@@ -1,4 +1,5 @@
 import globalModule from 'global'
+import { parseTextEditResult } from './keyboard-event'
 
 let globalManager = null
 
@@ -7,31 +8,6 @@ export function getGlobalModule() {
     globalManager = new globalModule.Global()
   }
   return globalManager
-}
-
-function normalizeText(value) {
-  if (value && typeof value === 'object') {
-    if (typeof value.value === 'string') return value.value
-    if (typeof value.text === 'string') return value.text
-    if (typeof value.contents === 'string') return value.contents
-    if (value.records && value.records[0] && typeof value.records[0].text === 'string') {
-      return value.records[0].text
-    }
-  }
-  return typeof value === 'string' ? value : ''
-}
-
-function parseTextEditResult(jsonData) {
-  try {
-    const result = JSON.parse(jsonData || '{}')
-    return {
-      confirmed: !!(result && result.editConfirmed),
-      text: normalizeText(result && result.text),
-    }
-  } catch (err) {
-    console.warn(`keyboard parse result failed ${err}`)
-  }
-  return { confirmed: false, text: '' }
 }
 
 function clampMaxlength(value) {
@@ -65,7 +41,7 @@ export class KeyboardSession {
       setTimeout(() => {
         if (!this.activeUuid || uuid !== this.activeUuid) return
         if (result.confirmed) {
-          this.finish(result.text || '')
+          this.finish(result.found ? result.text : '')
         } else {
           this.cancel()
         }

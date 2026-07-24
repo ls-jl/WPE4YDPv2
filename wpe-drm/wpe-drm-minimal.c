@@ -224,7 +224,12 @@ typedef struct {
     char *keyboard_queued_text;
     guint64 keyboard_queued_sequence;
     gboolean keyboard_queued_commit;
+    char *keyboard_sent_text;
+    guint64 keyboard_sent_sequence;
+    gboolean keyboard_sent_commit;
     gboolean keyboard_terminal_pending;
+    WebKitScriptMessageReply *keyboard_frame_reply;
+    JSCContext *keyboard_frame_context;
     gint64 keyboard_active_us;
     gint64 last_pointer_tap_us;
     BrowserChrome chrome;
@@ -1201,14 +1206,6 @@ static guint64 json_payload_sequence(const char *payload)
     return g_ascii_strtoull(position + 1, NULL, 10);
 }
 
-static char *js_quote_string(const char *value)
-{
-    char *escaped = json_escape_string(value);
-    char *quoted = g_strdup_printf("\"%s\"", escaped ? escaped : "");
-    g_free(escaped);
-    return quoted;
-}
-
 static char *uri_scheme_dup(const char *uri)
 {
     if (!uri || !g_ascii_isalpha(uri[0]))
@@ -1351,12 +1348,45 @@ static char *keyboard_path(AppState *state, const char *subdir, const char *file
     return path;
 }
 
-typedef struct {
-    AppState *state;
-    char *request_id;
-    guint64 sequence;
-    gboolean commit;
-} KeyboardApplyContext;
+static gboolean keyboard_write_atomic(const char *path, const char *contents)
+{
+    if (!path || !contents)
+        return FALSE;
+    char *temporary = g_strdup_printf("%s.tmp.XXXXXX", path);
+    int fd = g_mkstemp(temporary);
+    if (fd < 0) {
+        g_free(temporary);
+        return FALSE;
+    }
+    fchmod(fd, 0600);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    const char *cursor = contents;
+    size_t remaining = strlen(contents);
+    gboolean ok = TRUE;
+    while (remaining) {
+        ssize_t written = write(fd, cursor, remaining);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0) {
+            ok = FALSE;
+            break;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    if (ok && fsync(fd) != 0)
+        ok = FALSE;
+    if (close(fd) != 0)
+        ok = FALSE;
+    if (ok && g_rename(temporary, path) != 0)
+        ok = FALSE;
+    if (!ok)
+        g_unlink(temporary);
+    else
+        chmod(path, 0600);
+    g_free(temporary);
+    return ok;
+}
 
 static void keyboard_write_completion(AppState *state, const char *status, const char *detail)
 {
@@ -1369,10 +1399,8 @@ static void keyboard_write_completion(AppState *state, const char *status, const
     char *payload = g_strdup_printf(
         "{\"id\":\"%s\",\"status\":\"%s\",\"detail\":\"%s\"}",
         state->keyboard_active_id, status_json, detail_json);
-    if (!path || !g_file_set_contents(path, payload, -1, NULL))
+    if (!path || !keyboard_write_atomic(path, payload))
         g_warning("Keyboard completion write failed: id=%s", state->keyboard_active_id);
-    else
-        chmod(path, 0600);
     g_free(payload);
     g_free(detail_json);
     g_free(status_json);
@@ -1380,13 +1408,82 @@ static void keyboard_write_completion(AppState *state, const char *status, const
     g_free(filename);
 }
 
-static void keyboard_notify_page_complete(AppState *state)
+static void keyboard_release_frame_waiter(AppState *state)
 {
-    if (!state || !state->web_view)
+    if (!state)
         return;
-    const char *script = "if(window.__haasKeyboardComplete)window.__haasKeyboardComplete();";
-    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL,
-                                        NULL, NULL, NULL, NULL);
+    if (state->keyboard_frame_reply) {
+        webkit_script_message_reply_unref(state->keyboard_frame_reply);
+        state->keyboard_frame_reply = NULL;
+    }
+    g_clear_object(&state->keyboard_frame_context);
+}
+
+static void keyboard_reply_message(JSCValue *message, WebKitScriptMessageReply *reply,
+                                   const char *payload)
+{
+    if (!message || !reply)
+        return;
+    JSCContext *context = jsc_value_get_context(message);
+    JSCValue *value = jsc_value_new_string(context, payload ? payload : "");
+    webkit_script_message_reply_return_value(reply, value);
+    g_object_unref(value);
+}
+
+static gboolean keyboard_send_frame_payload(AppState *state, const char *payload)
+{
+    if (!state || !state->keyboard_frame_reply || !state->keyboard_frame_context)
+        return FALSE;
+    JSCValue *value = jsc_value_new_string(state->keyboard_frame_context,
+                                           payload ? payload : "");
+    webkit_script_message_reply_return_value(state->keyboard_frame_reply, value);
+    g_object_unref(value);
+    keyboard_release_frame_waiter(state);
+    return TRUE;
+}
+
+static void keyboard_store_frame_waiter(AppState *state, JSCValue *message,
+                                        WebKitScriptMessageReply *reply)
+{
+    if (!state || !message || !reply)
+        return;
+    if (state->keyboard_frame_reply)
+        keyboard_send_frame_payload(state, "op=superseded");
+    state->keyboard_frame_reply = webkit_script_message_reply_ref(reply);
+    state->keyboard_frame_context = g_object_ref(jsc_value_get_context(message));
+}
+
+static void keyboard_dispatch_frame_command(AppState *state)
+{
+    if (!state || !state->keyboard_active_id || state->keyboard_apply_in_flight ||
+        !state->keyboard_queued_text || !state->keyboard_frame_reply)
+        return;
+
+    char *text = g_steal_pointer(&state->keyboard_queued_text);
+    guint64 sequence = state->keyboard_queued_sequence;
+    gboolean commit = state->keyboard_queued_commit;
+    state->keyboard_queued_sequence = 0;
+    state->keyboard_queued_commit = FALSE;
+    g_free(state->keyboard_sent_text);
+    state->keyboard_sent_text = g_strdup(text);
+    state->keyboard_sent_sequence = sequence;
+    state->keyboard_sent_commit = commit;
+    state->keyboard_apply_in_flight = TRUE;
+
+    char *escaped = g_uri_escape_string(text, NULL, TRUE);
+    char *payload = g_strdup_printf(
+        "op=%s&id=%s&sequence=%" G_GUINT64_FORMAT "&text=%s",
+        commit ? "commit" : "update",
+        state->keyboard_active_id,
+        sequence,
+        escaped ? escaped : "");
+    g_print("Keyboard frame command: id=%s sequence=%" G_GUINT64_FORMAT
+            " bytes=%zu commit=%d\n",
+            state->keyboard_active_id, sequence, strlen(text), commit);
+    keyboard_send_frame_payload(state, payload);
+    g_free(payload);
+    g_free(escaped);
+    g_free(text);
 }
 
 static void keyboard_clear_active(AppState *state)
@@ -1416,11 +1513,15 @@ static void keyboard_clear_active(AppState *state)
     g_clear_pointer(&state->keyboard_active_kind, g_free);
     g_clear_pointer(&state->keyboard_pending_text, g_free);
     g_clear_pointer(&state->keyboard_queued_text, g_free);
+    g_clear_pointer(&state->keyboard_sent_text, g_free);
+    keyboard_release_frame_waiter(state);
     state->keyboard_pending_text_valid = FALSE;
     state->keyboard_last_sequence = 0;
     state->keyboard_apply_in_flight = FALSE;
     state->keyboard_queued_sequence = 0;
     state->keyboard_queued_commit = FALSE;
+    state->keyboard_sent_sequence = 0;
+    state->keyboard_sent_commit = FALSE;
     state->keyboard_terminal_pending = FALSE;
     state->keyboard_active_us = 0;
 }
@@ -1434,99 +1535,40 @@ static void keyboard_finish_active(AppState *state, const char *status, const ch
             state->keyboard_active_kind ? state->keyboard_active_kind : "",
             status ? status : "unknown", detail ? detail : "");
     keyboard_write_completion(state, status, detail);
-    keyboard_notify_page_complete(state);
+    char *status_escaped = g_uri_escape_string(status ? status : "unknown", NULL, TRUE);
+    char *detail_escaped = g_uri_escape_string(detail ? detail : "", NULL, TRUE);
+    char *payload = g_strdup_printf("op=complete&status=%s&detail=%s",
+                                    status_escaped ? status_escaped : "",
+                                    detail_escaped ? detail_escaped : "");
+    keyboard_send_frame_payload(state, payload);
+    g_free(payload);
+    g_free(detail_escaped);
+    g_free(status_escaped);
     keyboard_clear_active(state);
-}
-
-static void keyboard_start_web_apply(AppState *state, const char *text,
-                                     guint64 sequence, gboolean commit);
-
-static void on_keyboard_apply_finished(GObject *object, GAsyncResult *result, gpointer user_data)
-{
-    KeyboardApplyContext *context = (KeyboardApplyContext *)user_data;
-    AppState *state = context ? context->state : NULL;
-    GError *error = NULL;
-    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
-    char *apply_result = value ? jsc_value_to_string(value) : NULL;
-    if (!value) {
-        g_warning("Keyboard apply failed: %s", error ? error->message : "unknown");
-    } else {
-        g_print("Keyboard apply result: id=%s sequence=%" G_GUINT64_FORMAT " commit=%d %s\n",
-                context->request_id, context->sequence, context->commit,
-                apply_result ? apply_result : "(null)");
-        g_object_unref(value);
-    }
-    g_clear_error(&error);
-
-    if (!state || !state->keyboard_active_id ||
-        g_strcmp0(state->keyboard_active_id, context->request_id)) {
-        g_free(apply_result);
-        g_free(context->request_id);
-        g_free(context);
-        return;
-    }
-
-    state->keyboard_apply_in_flight = FALSE;
-    if (state->keyboard_queued_text) {
-        char *next_text = g_steal_pointer(&state->keyboard_queued_text);
-        guint64 next_sequence = state->keyboard_queued_sequence;
-        gboolean next_commit = state->keyboard_queued_commit;
-        state->keyboard_queued_sequence = 0;
-        state->keyboard_queued_commit = FALSE;
-        keyboard_start_web_apply(state, next_text, next_sequence, next_commit);
-        g_free(next_text);
-    } else if (context->commit && state->keyboard_terminal_pending) {
-        gboolean applied = apply_result && strstr(apply_result, "apply_ok=1");
-        keyboard_finish_active(state, "confirmed", applied ? "applied" : "apply_failed");
-    }
-    g_free(apply_result);
-    g_free(context->request_id);
-    g_free(context);
-}
-
-static void keyboard_start_web_apply(AppState *state, const char *text,
-                                     guint64 sequence, gboolean commit)
-{
-    if (!state || !state->web_view || !state->keyboard_active_id)
-        return;
-    char *quoted = js_quote_string(text ? text : "");
-    char *script = g_strdup_printf(
-        "(function(text,commit){"
-        "if(window.__haasKeyboardSetText)return window.__haasKeyboardSetText(text,commit);"
-        "return 'apply_ok=0 target_alive=0 reason=no_bridge';"
-        "})(%s,%s)",
-        quoted, commit ? "true" : "false");
-    KeyboardApplyContext *context = g_new0(KeyboardApplyContext, 1);
-    context->state = state;
-    context->request_id = g_strdup(state->keyboard_active_id);
-    context->sequence = sequence;
-    context->commit = commit;
-    state->keyboard_apply_in_flight = TRUE;
-    g_print("Keyboard apply queued: id=%s sequence=%" G_GUINT64_FORMAT " bytes=%zu commit=%d\n",
-            state->keyboard_active_id, sequence, strlen(text ? text : ""), commit);
-    webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL,
-                                        on_keyboard_apply_finished, context);
-    g_free(script);
-    g_free(quoted);
 }
 
 static void keyboard_queue_web_apply(AppState *state, const char *text,
                                      guint64 sequence, gboolean commit)
 {
-    if (state->keyboard_apply_in_flight) {
-        g_free(state->keyboard_queued_text);
-        state->keyboard_queued_text = g_strdup(text ? text : "");
-        state->keyboard_queued_sequence = sequence;
-        state->keyboard_queued_commit = commit;
+    if (!state)
         return;
-    }
-    keyboard_start_web_apply(state, text, sequence, commit);
+    g_free(state->keyboard_queued_text);
+    state->keyboard_queued_text = g_strdup(text ? text : "");
+    state->keyboard_queued_sequence = sequence;
+    state->keyboard_queued_commit = commit;
+    keyboard_dispatch_frame_command(state);
 }
 
 static void keyboard_handle_update(AppState *state, const char *text, guint64 sequence)
 {
     if (!state || !state->keyboard_active_id || !state->keyboard_active_kind)
         return;
+    if (state->keyboard_terminal_pending) {
+        g_print("Keyboard update ignored after terminal: id=%s sequence=%"
+                G_GUINT64_FORMAT "\n",
+                state->keyboard_active_id, sequence);
+        return;
+    }
 
     if (!sequence)
         sequence = state->keyboard_last_sequence + 1;
@@ -1682,13 +1724,17 @@ static gboolean keyboard_response_tick(gpointer user_data)
             g_unlink(cancel_path);
             g_free(cancel_path);
         }
-        state->keyboard_response_source_id = 0;
+        gboolean web_input = !g_strcmp0(state->keyboard_active_kind, "web_input");
         gboolean has_text = FALSE;
         guint64 sequence = json_payload_sequence(contents);
         char *text = json_payload_text(contents, &has_text);
+        if (!web_input)
+            state->keyboard_response_source_id = 0;
         keyboard_handle_response(state, TRUE, text, has_text, sequence);
         g_free(text);
         g_free(contents);
+        if (web_input && state->keyboard_active_id)
+            return G_SOURCE_CONTINUE;
         return G_SOURCE_REMOVE;
     }
     g_free(ok_path);
@@ -1748,9 +1794,8 @@ static gboolean keyboard_request(AppState *state, const char *kind, const char *
         maxlength == 0 ? 100 : maxlength,
         multiline ? "true" : "false");
 
-    gboolean ok = path && g_file_set_contents(path, payload, -1, NULL);
+    gboolean ok = path && keyboard_write_atomic(path, payload);
     if (ok) {
-        chmod(path, 0600);
         state->keyboard_active_id = g_strdup(id);
         state->keyboard_active_kind = g_strdup(kind ? kind : "");
         state->keyboard_pending_text = g_strdup(text ? text : "");
@@ -1824,37 +1869,110 @@ static gboolean params_get_bool(GHashTable *params, const char *key, gboolean fa
         !g_ascii_strcasecmp(value, "yes");
 }
 
-static void on_keyboard_script_message(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
+static guint64 params_get_uint64(GHashTable *params, const char *key, guint64 fallback)
+{
+    const char *value = g_hash_table_lookup(params, key);
+    if (!value || !value[0])
+        return fallback;
+    char *end = NULL;
+    guint64 parsed = g_ascii_strtoull(value, &end, 10);
+    return end != value ? parsed : fallback;
+}
+
+static gboolean on_keyboard_script_message_with_reply(
+    WebKitUserContentManager *manager, JSCValue *value,
+    WebKitScriptMessageReply *reply, gpointer user_data)
 {
     (void)manager;
     AppState *state = (AppState *)user_data;
-    if (!state || !value)
-        return;
+    if (!state || !value || !reply)
+        return FALSE;
 
     char *message = jsc_value_to_string(value);
     GHashTable *params = query_parse_params(message);
-    if (g_strcmp0(params_get_string(params, "kind", NULL), "web_input")) {
+    const char *operation = params_get_string(params, "op", "");
+
+    if (!g_strcmp0(operation, "open")) {
+        gint64 pointer_gate_us =
+            (gint64)env_double("WPE_KEYBOARD_POINTER_GATE_MS", 2000) * 1000;
+        gint64 since_pointer_us = state->last_pointer_tap_us > 0
+            ? g_get_monotonic_time() - state->last_pointer_tap_us
+            : G_MAXINT64;
+        gboolean opened = FALSE;
+        if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
+            opened = keyboard_request(state, "web_input",
+                params_get_string(params, "text", ""),
+                params_get_string(params, "placeholder", "请输入内容"),
+                params_get_string(params, "inputType", "ZhCNPreferred"),
+                params_get_int(params, "maxlength", 100),
+                params_get_bool(params, "multiLinesEditVisible", FALSE));
+        } else {
+            g_print("Keyboard web_input ignored: no recent pointer tap since_us=%"
+                    G_GINT64_FORMAT "\n", since_pointer_us);
+        }
+        if (opened && state->keyboard_active_id) {
+            char *payload = g_strdup_printf("op=opened&id=%s",
+                                            state->keyboard_active_id);
+            keyboard_reply_message(value, reply, payload);
+            g_free(payload);
+        } else
+            keyboard_reply_message(value, reply, "op=rejected");
         g_hash_table_unref(params);
         g_free(message);
-        return;
+        return TRUE;
     }
 
-    gint64 pointer_gate_us = (gint64)env_double("WPE_KEYBOARD_POINTER_GATE_MS", 2000) * 1000;
-    gint64 since_pointer_us = state->last_pointer_tap_us > 0 ? g_get_monotonic_time() - state->last_pointer_tap_us : G_MAXINT64;
-    if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
-        if (!keyboard_request(state, "web_input",
-                              params_get_string(params, "text", ""),
-                              params_get_string(params, "placeholder", "请输入内容"),
-                              params_get_string(params, "inputType", "ZhCNPreferred"),
-                              params_get_int(params, "maxlength", 100),
-                              params_get_bool(params, "multiLinesEditVisible", FALSE)))
-            keyboard_notify_page_complete(state);
-    } else {
-        g_print("Keyboard web_input ignored: no recent pointer tap since_us=%" G_GINT64_FORMAT "\n", since_pointer_us);
-        keyboard_notify_page_complete(state);
+    if (!g_strcmp0(operation, "wait")) {
+        const char *request_id = params_get_string(params, "id", "");
+        if (!state->keyboard_active_id ||
+            g_strcmp0(request_id, state->keyboard_active_id) ||
+            g_strcmp0(state->keyboard_active_kind, "web_input")) {
+            keyboard_reply_message(value, reply, "op=expired");
+            g_hash_table_unref(params);
+            g_free(message);
+            return TRUE;
+        }
+
+        guint64 ack_sequence = params_get_uint64(params, "ackSequence", 0);
+        if (state->keyboard_apply_in_flight) {
+            gboolean sequence_matches = ack_sequence == state->keyboard_sent_sequence;
+            gboolean applied = params_get_bool(params, "applied", FALSE);
+            const char *observed = g_hash_table_lookup(params, "observed");
+            gboolean value_matches = observed && state->keyboard_sent_text &&
+                !g_strcmp0(observed, state->keyboard_sent_text);
+            gboolean verified = sequence_matches && applied && value_matches;
+            g_print("Keyboard frame ack: id=%s sequence=%" G_GUINT64_FORMAT
+                    " expected=%" G_GUINT64_FORMAT " applied=%d value_match=%d commit=%d\n",
+                    state->keyboard_active_id, ack_sequence,
+                    state->keyboard_sent_sequence, applied, value_matches,
+                    state->keyboard_sent_commit);
+            gboolean terminal_commit =
+                state->keyboard_sent_commit && state->keyboard_terminal_pending;
+            state->keyboard_apply_in_flight = FALSE;
+            state->keyboard_sent_sequence = 0;
+            state->keyboard_sent_commit = FALSE;
+            g_clear_pointer(&state->keyboard_sent_text, g_free);
+            if (terminal_commit) {
+                keyboard_store_frame_waiter(state, value, reply);
+                keyboard_finish_active(state, "confirmed",
+                                       verified ? "applied" : "apply_failed");
+                g_hash_table_unref(params);
+                g_free(message);
+                return TRUE;
+            }
+        }
+
+        keyboard_store_frame_waiter(state, value, reply);
+        keyboard_dispatch_frame_command(state);
+        g_hash_table_unref(params);
+        g_free(message);
+        return TRUE;
     }
+
+    keyboard_reply_message(value, reply, "op=invalid");
     g_hash_table_unref(params);
     g_free(message);
+    return TRUE;
 }
 
 static void setup_keyboard_bridge(AppState *state)
@@ -1884,9 +2002,10 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
 {
     if (!manager || !state)
         return;
-    g_signal_connect(manager, "script-message-received::haasKeyboard",
-                     G_CALLBACK(on_keyboard_script_message), state);
-    if (!webkit_user_content_manager_register_script_message_handler(manager, "haasKeyboard", NULL))
+    g_signal_connect(manager, "script-message-with-reply-received::haasKeyboard",
+                     G_CALLBACK(on_keyboard_script_message_with_reply), state);
+    if (!webkit_user_content_manager_register_script_message_handler_with_reply(
+            manager, "haasKeyboard", NULL))
         g_warning("Keyboard script message handler already registered");
 
     const char *source =
@@ -1900,17 +2019,23 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "function editable(el){return !!(el&&((el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(el.type||''))||el.tagName==='TEXTAREA'||el.isContentEditable)&&!el.disabled&&!el.readOnly);}"
         "function closestEditable(el){while(el&&el!==document){if(editable(el))return el;el=el.parentElement;}return null;}"
         "function enc(v){return encodeURIComponent(v==null?'':String(v));}"
+        "function dec(v){try{return decodeURIComponent(String(v||'').replace(/\\+/g,' '));}catch(e){return String(v||'');}}"
+        "function parse(v){var out={};String(v||'').split('&').forEach(function(part){var at=part.indexOf('=');var k=at<0?part:part.slice(0,at);var x=at<0?'':part.slice(at+1);if(k)out[k]=dec(x);});return out;}"
+        "function post(v){try{return Promise.resolve(window.webkit.messageHandlers.haasKeyboard.postMessage(v));}catch(e){return Promise.reject(e);}}"
         "function valueOf(el){return el.isContentEditable?(el.innerText||el.textContent||''):(el.value||'');}"
         "function typeOf(el){var t=String(el.getAttribute('type')||'').toLowerCase();if(t==='number'||t==='tel')return 'Number';if(t==='email'||t==='url'||t==='password')return 'EnUSPreferred';return 'ZhCNPreferred';}"
         "function mark(el){var id=el.getAttribute('data-haas-keyboard-id');if(!id){id='hk'+Date.now().toString(36)+(window.__haasKeyboardSeq++).toString(36);try{el.setAttribute('data-haas-keyboard-id',id);}catch(e){}}window.__haasKeyboardTargetId=id||'';return id||'';}"
         "function findTarget(){var el=window.__haasKeyboardTarget;if(editable(el)&&document.documentElement&&document.documentElement.contains(el))return el;var id=window.__haasKeyboardTargetId;if(id&&document.querySelector){try{el=document.querySelector('[data-haas-keyboard-id=\"'+id+'\"]');if(editable(el))return el;}catch(e){}}el=document.activeElement;if(editable(el))return el;return null;}"
-        "function request(el){el=closestEditable(el);if(window.__haasKeyboardInFlight||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||'请输入内容';var msg='kind=web_input&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');window.webkit.messageHandlers.haasKeyboard.postMessage(msg);}"
-        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var el=closestEditable(e.target);if(el)setTimeout(function(){request(el);},0);},true);"
         "function diffType(oldv,newv){oldv=String(oldv==null?'':oldv);newv=String(newv==null?'':newv);if(newv.length<oldv.length){return oldv.indexOf(newv)===0?'deleteContentBackward':'deleteContentForward';}if(newv.length>oldv.length){return newv.indexOf(oldv)===0?'insertText':'insertReplacementText';}return 'insertReplacementText';}"
         "function makeInputEvent(name,typ,data,cancelable){try{return new InputEvent(name,{bubbles:true,cancelable:!!cancelable,inputType:typ,data:data});}catch(e){var ev=document.createEvent('Event');ev.initEvent(name,true,!!cancelable);try{ev.inputType=typ;ev.data=data;}catch(_e){}return ev;}}"
-        "function nativeSet(el,value,oldv){if(el.isContentEditable){el.textContent=value;return;}var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,value);else el.value=value;var tracker=el._valueTracker;if(tracker){try{tracker.setValue(oldv);}catch(e){}}if(el.setSelectionRange){try{el.setSelectionRange(String(value).length,String(value).length);}catch(e){}}}"
-        "window.__haasKeyboardSetText=function(text,commit){var el=findTarget();if(!editable(el))return 'apply_ok=0 target_alive=0 reason=no_target';var value=String(text==null?'':text);var oldv=valueOf(el);var typ=diffType(oldv,value);var data=typ.indexOf('delete')===0?null:value;try{el.focus();}catch(e){}try{el.dispatchEvent(makeInputEvent('beforeinput',typ,data,true));nativeSet(el,value,oldv);el.dispatchEvent(makeInputEvent('input',typ,data,false));if(commit){var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}return 'apply_ok=1 target_alive=1 inputType='+typ+' value='+enc(valueOf(el))+' commit='+(commit?1:0);}catch(e){return 'apply_ok=0 target_alive=1 reason='+enc(e&&e.message?e.message:String(e));}};"
-        "window.__haasKeyboardComplete=function(){window.__haasKeyboardInFlight=false;};"
+        "function nativeSet(el,value,oldv){if(el.isContentEditable){var ok=false;try{var sel=window.getSelection();var range=document.createRange();range.selectNodeContents(el);sel.removeAllRanges();sel.addRange(range);ok=document.execCommand&&document.execCommand('insertText',false,value);}catch(e){}if(!ok||valueOf(el)!==value)el.textContent=value;return;}var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,value);else el.value=value;var tracker=el._valueTracker;if(tracker){try{tracker.setValue(oldv);}catch(e){}}if(el.setSelectionRange){try{el.setSelectionRange(String(value).length,String(value).length);}catch(e){}}}"
+        "function applyCore(el,value){var oldv=valueOf(el);var typ=diffType(oldv,value);var data=typ.indexOf('delete')===0?null:value;try{el.focus();}catch(e){}el.dispatchEvent(makeInputEvent('beforeinput',typ,data,true));nativeSet(el,value,oldv);el.dispatchEvent(makeInputEvent('input',typ,data,false));return typ;}"
+        "function nextFrame(fn){var done=false;var run=function(){if(done)return;done=true;fn();};setTimeout(run,50);if(window.requestAnimationFrame)requestAnimationFrame(run);}"
+        "function applyText(value,commit){return new Promise(function(resolve){var el=findTarget();if(!editable(el)){resolve({applied:false,observed:'',alive:false});return;}value=String(value==null?'':value);try{applyCore(el,value);}catch(e){resolve({applied:false,observed:valueOf(el),alive:true});return;}nextFrame(function(){if(valueOf(el)!==value){try{applyCore(el,value);}catch(e){}}nextFrame(function(){var observed=valueOf(el);var applied=observed===value;if(commit&&applied){try{var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}catch(e){}}resolve({applied:applied,observed:observed,alive:editable(el)});});});});}"
+        "function finish(){window.__haasKeyboardInFlight=false;window.__haasKeyboardTarget=null;window.__haasKeyboardTargetId='';}"
+        "function wait(id,ack){var msg='op=wait&id='+enc(id);if(ack){msg+='&ackSequence='+enc(ack.sequence)+'&applied='+(ack.applied?'1':'0')+'&observed='+enc(ack.observed||'');}return post(msg).then(function(raw){var cmd=parse(raw);if(cmd.op==='update'||cmd.op==='commit'){var sequence=parseInt(cmd.sequence||'0',10)||0;return applyText(cmd.text||'',cmd.op==='commit').then(function(result){return wait(id,{sequence:sequence,applied:result.applied,observed:result.observed});});}if(cmd.op==='complete'||cmd.op==='expired'||cmd.op==='superseded'||cmd.op==='rejected'){finish();return;}return wait(id,null);}).catch(function(){finish();});}"
+        "function request(el){el=closestEditable(el);if(window.__haasKeyboardInFlight||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||'请输入内容';var msg='op=open&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');post(msg).then(function(raw){var opened=parse(raw);if(opened.op!=='opened'||!opened.id){finish();return;}wait(opened.id,null);}).catch(function(){finish();});}"
+        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var path=e.composedPath?e.composedPath():null;var el=closestEditable(path&&path.length?path[0]:e.target);if(el)setTimeout(function(){request(el);},0);},true);"
         "})();";
     WebKitUserScript *script = webkit_user_script_new(source,
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,

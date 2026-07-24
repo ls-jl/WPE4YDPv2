@@ -18,7 +18,7 @@
       @input="onKeyboardTextareaInput"
       @confirm="onKeyboardTextareaConfirm"
       @textChanged="onKeyboardTextareaInput"
-      @textEditFinished="onKeyboardTextareaConfirm"
+      @textEditFinished="onKeyboardTextareaFinished"
       @focus="onKeyboardTextareaFocus"
       @blur="onKeyboardTextareaBlur"
     ></textarea>
@@ -97,6 +97,10 @@ export default {
       this.ensureControllers()
       this.keyboardBridge.onTextareaConfirm(value)
     },
+    onKeyboardTextareaFinished(value) {
+      this.ensureControllers()
+      this.keyboardBridge.onTextareaFinished(value)
+    },
     onKeyboardTextareaFocus() {
       this.ensureControllers()
       this.keyboardBridge.onTextareaFocus()
@@ -117,13 +121,14 @@ export default {
         if (this.pageVisible || this.keyboardBridge.isActive()) return
         console.warn('wpe hidden after keyboard closed; stopping browser')
         this.browserLifecycle.stop()
-      }, 3000)
+      }, 15000)
     },
     onShow() {
       if (this.isStopOnly()) return
       this.ensureControllers()
       this.pageVisible = true
       this.clearKeyboardHideTimer()
+      this.keyboardBridge.onPageShow()
       this.keyboardBridge.reconcileActiveRequest()
       if (!this.browser.leaving) {
         this.browserLifecycle.start()
@@ -133,7 +138,7 @@ export default {
       console.warn('wpe frame onHide')
       this.ensureControllers()
       this.pageVisible = false
-      if (this.keyboardBridge.isActive()) {
+      if (this.keyboardBridge.onPageHide()) {
         console.warn('wpe frame onHide ignored while keyboard active')
         return
       }

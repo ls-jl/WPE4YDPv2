@@ -308,6 +308,11 @@ static bool prepareKeyboardDirs(const std::string& workdir)
         ensureDirRecursive(joinPath(keyboardDir, "status"));
 }
 
+static std::string keyboardBackendPath(const std::string& workdir)
+{
+    return joinPath(keyboardDirForWorkdir(workdir), "backend.json");
+}
+
 static int waitForProcessExit(pid_t pid, int timeoutMs)
 {
     if (pid <= 1) return 0;
@@ -353,6 +358,14 @@ static std::string trimAscii(const std::string& value)
     size_t end = value.size();
     while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
     return value.substr(begin, end - begin);
+}
+
+static std::string normalizeKeyboardBackend(const std::string& value, bool allowAuto = true)
+{
+    const std::string normalized = toLowerAscii(trimAscii(value));
+    if (normalized == "textarea" || normalized == "global") return normalized;
+    if (allowAuto && normalized == "auto") return normalized;
+    return "";
 }
 
 static bool isBrowserProcessName(const std::string& cmdline)
@@ -936,8 +949,32 @@ public:
             return;
         }
         const std::string value = readFile(statusPath);
-        unlink(statusPath.c_str());
         info.GetReturnValue().Set(value);
+    }
+
+    void ackKeyboardCompletion(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        const std::string id = getStringProperty(ctx, options, "id", "");
+        if (workdir.empty()) {
+            throwError(info, "workdir is empty");
+            return;
+        }
+        if (!isSafeKeyboardId(id)) {
+            throwError(info, "invalid keyboard request id");
+            return;
+        }
+        const std::string statusPath = joinPath(
+            joinPath(keyboardDirForWorkdir(workdir), "status"), id + ".json");
+        if (unlink(statusPath.c_str()) != 0 && errno != ENOENT) {
+            throwError(info, std::string("keyboard completion ack failed: ") +
+                statusPath + ": " + std::strerror(errno));
+            return;
+        }
+        publishState("keyboard_completion_ack", id);
+        info.GetReturnValue().Set(true);
     }
 
     void respondKeyboardRequest(JQFunctionInfo& info)
@@ -1014,32 +1051,80 @@ public:
 
     void getKeyboardProfile(JQFunctionInfo& info)
     {
-        const std::string hostname = trimAscii(readFile("/etc/hostname"));
-        const std::string osRelease = readFile("/etc/os-release");
-        const std::string cfg = readFile("/etc/miniapp/resources/cfg.json");
-        const std::string haystack = toLowerAscii(hostname + "\n" + osRelease + "\n" + cfg);
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        std::string overrideMode = normalizeKeyboardBackend(
+            getStringProperty(ctx, options, "override", "auto"));
+        if (overrideMode.empty()) overrideMode = "auto";
 
-        std::string mode = "globalOnly";
-        std::string reason = "default";
-        if (haystack.find("y07") != std::string::npos) {
-            mode = "textareaOnly";
-            reason = "y07";
-        } else if (haystack.find("3.14.") != std::string::npos &&
-            haystack.find("input") != std::string::npos) {
-            // 之前还接受子串 "im",但 time/limit/minimal 等词都含 "im",
-            // 该分支实际恒为真;只保留 "input" 判定。
-            mode = "textareaOnly";
-            reason = "ime_3.14";
+        std::string learned;
+        if (!workdir.empty()) {
+            learned = normalizeKeyboardBackend(
+                parseJsonStringField(readFile(keyboardBackendPath(workdir)), "backend"), false);
         }
+        const std::string mode = overrideMode == "auto"
+            ? (learned.empty() ? "auto" : learned)
+            : overrideMode;
+        const std::string source = overrideMode != "auto"
+            ? "override"
+            : (learned.empty() ? "probe" : "learned");
 
         std::ostringstream ss;
         ss << "{";
         ss << "\"mode\":\"" << mode << "\",";
-        ss << "\"reason\":\"" << reason << "\",";
-        ss << "\"hostname\":\"" << jsonEscape(hostname) << "\",";
-        ss << "\"source\":\"system\"";
+        ss << "\"learned\":\"" << learned << "\",";
+        ss << "\"source\":\"" << source << "\"";
         ss << "}";
         info.GetReturnValue().Set(ss.str());
+    }
+
+    void reportKeyboardBackend(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        const std::string backend = normalizeKeyboardBackend(
+            getStringProperty(ctx, options, "backend", ""), false);
+        const bool successful = getBoolProperty(ctx, options, "successful", false);
+        const std::string evidence = getStringProperty(ctx, options, "evidence", "");
+        if (workdir.empty()) {
+            throwError(info, "workdir is empty");
+            return;
+        }
+        if (backend.empty()) {
+            throwError(info, "invalid keyboard backend");
+            return;
+        }
+        if (!prepareKeyboardDirs(workdir)) {
+            throwError(info, std::string("keyboard dir mkdir failed: ") + keyboardDirForWorkdir(workdir));
+            return;
+        }
+
+        const std::string path = keyboardBackendPath(workdir);
+        if (!successful) {
+            const std::string stored = normalizeKeyboardBackend(
+                parseJsonStringField(readFile(path), "backend"), false);
+            if (stored == backend && unlink(path.c_str()) != 0 && errno != ENOENT) {
+                throwError(info, std::string("keyboard backend clear failed: ") +
+                    path + ": " + std::strerror(errno));
+                return;
+            }
+            publishState("keyboard_backend_failed", backend + ":" + evidence);
+            info.GetReturnValue().Set(true);
+            return;
+        }
+
+        std::ostringstream payload;
+        payload << "{\"backend\":\"" << backend << "\",";
+        payload << "\"evidence\":\"" << jsonEscape(evidence) << "\"}";
+        if (!writeFileAtomic(path, payload.str(), 0600, true)) {
+            throwError(info, std::string("keyboard backend write failed: ") +
+                path + ": " + std::strerror(errno));
+            return;
+        }
+        publishState("keyboard_backend_selected", backend + ":" + evidence);
+        info.GetReturnValue().Set(true);
     }
 
     void getSystemDisplayConfig(JQFunctionInfo& info)
@@ -1187,9 +1272,11 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("isBrowserRunning", &JSBrowserPlayer::isBrowserRunning);
     tpl->SetProtoMethod("pollKeyboardRequest", &JSBrowserPlayer::pollKeyboardRequest);
     tpl->SetProtoMethod("pollKeyboardCompletion", &JSBrowserPlayer::pollKeyboardCompletion);
+    tpl->SetProtoMethod("ackKeyboardCompletion", &JSBrowserPlayer::ackKeyboardCompletion);
     tpl->SetProtoMethod("updateKeyboardRequest", &JSBrowserPlayer::updateKeyboardRequest);
     tpl->SetProtoMethod("respondKeyboardRequest", &JSBrowserPlayer::respondKeyboardRequest);
     tpl->SetProtoMethod("getKeyboardProfile", &JSBrowserPlayer::getKeyboardProfile);
+    tpl->SetProtoMethod("reportKeyboardBackend", &JSBrowserPlayer::reportKeyboardBackend);
     tpl->SetProtoMethod("getSystemDisplayConfig", &JSBrowserPlayer::getSystemDisplayConfig);
     tpl->SetProtoMethod("getDrmScreenSize", &JSBrowserPlayer::getDrmScreenSize);
     return tpl->CallConstructor();
