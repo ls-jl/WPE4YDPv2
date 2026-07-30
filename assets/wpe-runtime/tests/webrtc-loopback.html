@@ -20,6 +20,7 @@
     const status = document.querySelector('#status');
     const left = new RTCPeerConnection();
     const right = new RTCPeerConnection();
+    const forceCandidateExtensions = new URLSearchParams(location.search).get('candidateExtensions') === '1';
     let connected = false;
     let pongReceived = false;
     let captureDenied = false;
@@ -42,8 +43,25 @@
       updateResult();
     }
 
-    left.onicecandidate = ({ candidate }) => candidate && right.addIceCandidate(candidate);
-    right.onicecandidate = ({ candidate }) => candidate && left.addIceCandidate(candidate);
+    function candidateForTest(candidate) {
+      if (!forceCandidateExtensions)
+        return candidate;
+
+      let value = candidate.candidate;
+      if (!/\sgeneration\s/i.test(value))
+        value += ' generation 0';
+      if (candidate.usernameFragment && !/\sufrag\s/i.test(value))
+        value += ` ufrag ${candidate.usernameFragment}`;
+      if (!/\snetwork-id\s/i.test(value))
+        value += ' network-id 1';
+      log(`candidate extensions=${value}`);
+      return new RTCIceCandidate({ ...candidate.toJSON(), candidate: value });
+    }
+
+    left.onicecandidate = ({ candidate }) => candidate && right.addIceCandidate(candidateForTest(candidate))
+      .catch(error => log(`FAIL left candidate ${error}`));
+    right.onicecandidate = ({ candidate }) => candidate && left.addIceCandidate(candidateForTest(candidate))
+      .catch(error => log(`FAIL right candidate ${error}`));
     left.onconnectionstatechange = () => updateConnection('left', left);
     right.onconnectionstatechange = () => updateConnection('right', right);
     left.oniceconnectionstatechange = () => updateConnection('left', left);

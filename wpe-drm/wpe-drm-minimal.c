@@ -15,6 +15,7 @@
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
 #include <wpe/drm/wpe-drm.h>
+#include "ChromeMotionState.h"
 #include "browser-profile-store.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -65,16 +66,28 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 #define CHROME_TOOLBAR_MARGIN 8
 #define CHROME_TOOLBAR_BUTTON_COUNT 5
 #define CHROME_TOOLBAR_LEGACY_BUTTON_COUNT 6
-#define CHROME_TABS_HEADER_HEIGHT 28
-#define CHROME_TABS_FOOTER_HEIGHT 40
-#define CHROME_TABS_ROW_HEIGHT 34
-#define CHROME_TABS_CLOSE_HIT_WIDTH 42
+#define CHROME_TABS_HEADER_HEIGHT 0
+#define CHROME_TABS_FOOTER_HEIGHT 0
+#define CHROME_TABS_ROW_HEIGHT 48
+#define CHROME_TABS_CLOSE_HIT_WIDTH 52
+#define CHROME_MENU_COLUMNS 3
+#define CHROME_MENU_ROWS 2
+#define CHROME_MENU_ITEMS_PER_PAGE (CHROME_MENU_COLUMNS * CHROME_MENU_ROWS)
+#define CHROME_MENU_ITEM_COUNT 6
+#define CHROME_LIST_HEADER_HEIGHT 32
+#define CHROME_LIST_ROW_HEIGHT 48
+#define CHROME_USER_EXIT_CODE 74
 
 typedef enum {
     CHROME_PANEL_NONE = 0,
     CHROME_PANEL_TABS,
     CHROME_PANEL_MENU,
     CHROME_PANEL_SETTINGS,
+    CHROME_PANEL_APPEARANCE,
+    CHROME_PANEL_WEB,
+    CHROME_PANEL_STARTUP,
+    CHROME_PANEL_SETTINGS_PRIVACY,
+    CHROME_PANEL_ABOUT,
     CHROME_PANEL_PRIVACY,
     CHROME_PANEL_CLEAR_SITE_DATA,
     CHROME_PANEL_PROFILES,
@@ -82,8 +95,16 @@ typedef enum {
     CHROME_PANEL_PROFILE_DELETE,
     CHROME_PANEL_HISTORY,
     CHROME_PANEL_BOOKMARKS,
-    CHROME_PANEL_CLEAR_HISTORY
+    CHROME_PANEL_CLEAR_HISTORY,
+    CHROME_PANEL_COUNT
 } ChromePanel;
+
+typedef enum {
+    CHROME_PANEL_GESTURE_NONE = 0,
+    CHROME_PANEL_GESTURE_TABS_VERTICAL,
+    CHROME_PANEL_GESTURE_MENU_HORIZONTAL,
+    CHROME_PANEL_GESTURE_LIST_VERTICAL,
+} ChromePanelGesture;
 
 typedef struct {
     gboolean active;
@@ -101,7 +122,10 @@ typedef struct {
     double max_move_sq;
     gboolean scrolling;
     gboolean chrome_consumed;
-    gboolean tabs_scroll_candidate;
+    ChromePanelGesture panel_gesture;
+    double panel_start_offset;
+    double panel_velocity;
+    guint32 panel_last_time_ms;
 } TouchSlot;
 
 typedef struct {
@@ -132,6 +156,7 @@ typedef struct {
     int active;
     guint next_tab_id;
     ChromePanel panel;
+    ChromePanel dialog_parent;
     double scroll_accum;
     double scroll_velocity_peak;
     guint32 scroll_last_time_ms;
@@ -140,6 +165,16 @@ typedef struct {
     guint layout_timer;
     char site_profile[16];
     BrowserCookiePolicy cookie_policy;
+    char search_engine[16];
+    char *custom_search_template;
+    double page_zoom;
+    guint default_font_size;
+    gboolean javascript_enabled;
+    gboolean autoplay_requires_gesture;
+    gboolean smooth_scrolling;
+    gboolean block_popups;
+    gboolean restore_tabs;
+    BrowserGlobalSettings global_settings;
     guint panel_page;
     gboolean panel_delete_mode;
     gboolean site_data_clearing;
@@ -148,7 +183,17 @@ typedef struct {
     GPtrArray *panel_pages;
     int64_t current_visit_id;
     double tabs_scroll_offset;
-    gint64 tabs_scroll_last_publish_us;
+    guint menu_page;
+    double menu_scroll_offset;
+    guint menu_snap_source_id;
+    double menu_snap_from;
+    double menu_snap_to;
+    gint64 menu_snap_start_us;
+    double panel_scroll_offsets[CHROME_PANEL_COUNT];
+    int pressed_row;
+    int pressed_segment;
+    int pressed_control;
+    WPEChromeMotionState motion;
 } BrowserChrome;
 
 typedef struct {
@@ -190,6 +235,7 @@ typedef struct {
     gboolean touch_scroll_invert_y;
     gboolean send_touch_events;
     gboolean synthesize_pointer_tap;
+    gboolean game_pointer_tap_fallback;
     char input_profile[16];
     gboolean game_input_active;
     gboolean native_scroll_scheduled;
@@ -212,6 +258,12 @@ typedef struct {
     gint64 scroll_stats_last_us;
     guint64 scroll_stats_last_event_count;
     guint64 scroll_stats_last_frame_count;
+    gboolean cloud_autostart;
+    gboolean cloud_launch_requested;
+    gboolean page_fullscreen;
+    gboolean chrome_visible_before_fullscreen;
+    gboolean game_media_immersive;
+    gboolean chrome_visible_before_game_media;
     char *keyboard_dir;
     guint keyboard_response_source_id;
     guint64 keyboard_next_id;
@@ -238,6 +290,8 @@ typedef struct {
 
 static WebKitCookieAcceptPolicy webkit_cookie_policy(BrowserCookiePolicy policy);
 static void chrome_switch_profile(AppState *state, int64_t profile_id, gboolean guest);
+static void update_page_zoom_for_uri(AppState *state, const char *uri);
+static gboolean custom_search_template_is_valid(const char *value);
 
 static gboolean env_enabled(const char *name, gboolean default_value)
 {
@@ -354,6 +408,11 @@ static const char *chrome_panel_name(ChromePanel panel)
     case CHROME_PANEL_TABS: return "tabs";
     case CHROME_PANEL_MENU: return "menu";
     case CHROME_PANEL_SETTINGS: return "settings";
+    case CHROME_PANEL_APPEARANCE: return "appearance";
+    case CHROME_PANEL_WEB: return "web";
+    case CHROME_PANEL_STARTUP: return "startup & search";
+    case CHROME_PANEL_SETTINGS_PRIVACY: return "privacy & data";
+    case CHROME_PANEL_ABOUT: return "about";
     case CHROME_PANEL_PRIVACY: return "privacy & cookies";
     case CHROME_PANEL_CLEAR_SITE_DATA: return "clear site data?";
     case CHROME_PANEL_PROFILES: return "profiles";
@@ -378,6 +437,16 @@ static ChromePanel chrome_panel_from_name(const char *name)
         return CHROME_PANEL_MENU;
     if (!g_ascii_strcasecmp(name, "settings"))
         return CHROME_PANEL_SETTINGS;
+    if (!g_ascii_strcasecmp(name, "appearance"))
+        return CHROME_PANEL_APPEARANCE;
+    if (!g_ascii_strcasecmp(name, "web"))
+        return CHROME_PANEL_WEB;
+    if (!g_ascii_strcasecmp(name, "startup & search"))
+        return CHROME_PANEL_STARTUP;
+    if (!g_ascii_strcasecmp(name, "privacy & data"))
+        return CHROME_PANEL_SETTINGS_PRIVACY;
+    if (!g_ascii_strcasecmp(name, "about"))
+        return CHROME_PANEL_ABOUT;
     if (!g_ascii_strcasecmp(name, "privacy & cookies"))
         return CHROME_PANEL_PRIVACY;
     if (!g_ascii_strcasecmp(name, "profiles"))
@@ -400,6 +469,12 @@ static ChromePanel chrome_panel_parent(ChromePanel panel)
     case CHROME_PANEL_HISTORY:
     case CHROME_PANEL_BOOKMARKS:
         return CHROME_PANEL_MENU;
+    case CHROME_PANEL_APPEARANCE:
+    case CHROME_PANEL_WEB:
+    case CHROME_PANEL_STARTUP:
+    case CHROME_PANEL_SETTINGS_PRIVACY:
+    case CHROME_PANEL_ABOUT:
+        return CHROME_PANEL_SETTINGS;
     case CHROME_PANEL_PROFILE_MANAGE:
         return CHROME_PANEL_PROFILES;
     case CHROME_PANEL_PROFILE_DELETE:
@@ -413,6 +488,53 @@ static ChromePanel chrome_panel_parent(ChromePanel panel)
     case CHROME_PANEL_NONE:
     default:
         return CHROME_PANEL_NONE;
+    }
+}
+
+static gboolean chrome_panel_is_overflow_stack(ChromePanel panel)
+{
+    return panel != CHROME_PANEL_NONE && panel != CHROME_PANEL_TABS;
+}
+
+static gboolean chrome_panel_is_internal_list(ChromePanel panel)
+{
+    return chrome_panel_is_overflow_stack(panel) && panel != CHROME_PANEL_MENU;
+}
+
+static int chrome_panel_line_count(const AppState *state, ChromePanel panel)
+{
+    const BrowserChrome *chrome = state ? &state->chrome : NULL;
+    switch (panel) {
+    case CHROME_PANEL_SETTINGS:
+        return 5;
+    case CHROME_PANEL_APPEARANCE:
+        return 4;
+    case CHROME_PANEL_WEB:
+        return 5;
+    case CHROME_PANEL_STARTUP:
+        return 4;
+    case CHROME_PANEL_SETTINGS_PRIVACY:
+        return 4;
+    case CHROME_PANEL_ABOUT:
+        return 5;
+    case CHROME_PANEL_PRIVACY:
+        return chrome && chrome->site_data_status[0] ? 3 : 2;
+    case CHROME_PANEL_PROFILES:
+        return 6;
+    case CHROME_PANEL_HISTORY:
+    case CHROME_PANEL_BOOKMARKS:
+        return 8;
+    case CHROME_PANEL_CLEAR_SITE_DATA:
+    case CHROME_PANEL_PROFILE_MANAGE:
+    case CHROME_PANEL_PROFILE_DELETE:
+    case CHROME_PANEL_CLEAR_HISTORY:
+        return 2;
+    case CHROME_PANEL_NONE:
+    case CHROME_PANEL_TABS:
+    case CHROME_PANEL_MENU:
+    case CHROME_PANEL_COUNT:
+    default:
+        return 0;
     }
 }
 
@@ -509,8 +631,41 @@ static void chrome_apply_site_profile(AppState *state)
     g_print("Site profile: site_profile=%s user_agent=%s\n", profile, user_agent);
 }
 
+static void chrome_apply_web_preferences(AppState *state, gboolean reload)
+{
+    if (!state || !state->web_view)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    WebKitSettings *settings = webkit_web_view_get_settings(state->web_view);
+    if (settings) {
+        webkit_settings_set_enable_javascript(settings, chrome->javascript_enabled);
+        webkit_settings_set_default_font_size(settings, chrome->default_font_size);
+        webkit_settings_set_media_playback_requires_user_gesture(
+            settings, chrome->autoplay_requires_gesture);
+        webkit_settings_set_enable_smooth_scrolling(settings, chrome->smooth_scrolling);
+        webkit_settings_set_javascript_can_open_windows_automatically(
+            settings, !chrome->block_popups);
+    }
+    chrome_apply_site_profile(state);
+    update_page_zoom_for_uri(state, webkit_web_view_get_uri(state->web_view));
+    g_print("Web preferences applied: js=%d autoplay_gesture=%d smooth=%d "
+            "block_popups=%d font=%u zoom=%.2f reload=%d\n",
+            chrome->javascript_enabled, chrome->autoplay_requires_gesture,
+            chrome->smooth_scrolling, chrome->block_popups,
+            chrome->default_font_size, chrome->page_zoom, reload);
+    if (reload) {
+        chrome->loading = TRUE;
+        chrome->load_progress = 0;
+        webkit_web_view_reload(state->web_view);
+    }
+}
+
 static void chrome_apply_layout(AppState *state, const char *reason);
 static void chrome_set_visible(AppState *state, gboolean visible);
+static void chrome_update_render_state(AppState *state);
+static void chrome_save_state(AppState *state);
+static void chrome_cancel_menu_snap(BrowserChrome *chrome);
+static void chrome_publish_motion(AppState *state, gboolean dragging);
 
 static void chrome_request_frame(AppState *state)
 {
@@ -535,6 +690,31 @@ typedef struct {
     double max_scroll;
 } ChromeTabsGeometry;
 
+typedef struct {
+    int panel_x;
+    int panel_y;
+    int panel_width;
+    int panel_height;
+    int columns;
+    int rows;
+    int item_count;
+    int page_count;
+    double max_scroll;
+} ChromeMenuGeometry;
+
+typedef struct {
+    int panel_x;
+    int panel_y;
+    int panel_width;
+    int panel_height;
+    int header_height;
+    int row_height;
+    int list_top;
+    int list_height;
+    int line_count;
+    double max_scroll;
+} ChromeListGeometry;
+
 static int chrome_toolbar_legacy_button_width(int panel_width)
 {
     int button_x = panel_width / 2 + CHROME_TOOLBAR_MARGIN;
@@ -558,10 +738,11 @@ static ChromeTabsGeometry chrome_tabs_geometry(AppState *state)
     int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
     int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
     int chrome_height = state ? state->chrome.height : 44;
+    int tabs_width = MAX(1, panel_width / 2);
     ChromeTabsGeometry geometry = {
-        .panel_x = chrome_address_right(panel_width),
+        .panel_x = panel_width - tabs_width,
         .panel_y = chrome_height,
-        .panel_width = panel_width - chrome_address_right(panel_width),
+        .panel_width = tabs_width,
         .panel_height = MAX(0, panel_height - chrome_height),
         .row_height = CHROME_TABS_ROW_HEIGHT,
         .header_height = CHROME_TABS_HEADER_HEIGHT,
@@ -573,6 +754,124 @@ static ChromeTabsGeometry chrome_tabs_geometry(AppState *state)
     int content_height = (state ? state->chrome.tab_count : 0) * geometry.row_height;
     geometry.max_scroll = MAX(0, content_height - geometry.list_height);
     return geometry;
+}
+
+static ChromeMenuGeometry chrome_menu_geometry(AppState *state)
+{
+    int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
+    int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
+    int chrome_height = state ? state->chrome.height : 44;
+    int menu_x = panel_width / 3;
+    ChromeMenuGeometry geometry = {
+        .panel_x = menu_x,
+        .panel_y = chrome_height,
+        .panel_width = panel_width - menu_x,
+        .panel_height = MAX(0, panel_height - chrome_height),
+        .columns = CHROME_MENU_COLUMNS,
+        .rows = CHROME_MENU_ROWS,
+        .item_count = CHROME_MENU_ITEM_COUNT,
+        .page_count = (CHROME_MENU_ITEM_COUNT + CHROME_MENU_ITEMS_PER_PAGE - 1)
+            / CHROME_MENU_ITEMS_PER_PAGE,
+    };
+    geometry.max_scroll = MAX(0, geometry.page_count - 1) * geometry.panel_width;
+    return geometry;
+}
+
+static ChromeListGeometry chrome_list_geometry(AppState *state, ChromePanel panel)
+{
+    int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
+    int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
+    int chrome_height = state ? state->chrome.height : 44;
+    ChromeListGeometry geometry = {
+        .panel_x = 0,
+        .panel_y = chrome_height,
+        .panel_width = panel_width,
+        .panel_height = MAX(0, panel_height - chrome_height),
+        .header_height = CHROME_LIST_HEADER_HEIGHT,
+        .row_height = CHROME_LIST_ROW_HEIGHT,
+        .line_count = chrome_panel_line_count(state, panel),
+    };
+    geometry.list_top = geometry.panel_y + geometry.header_height;
+    geometry.list_height = MAX(0, geometry.panel_height - geometry.header_height);
+    geometry.max_scroll = MAX(0, geometry.line_count * geometry.row_height
+                                  - geometry.list_height);
+    return geometry;
+}
+
+static void chrome_clamp_list_scroll(AppState *state, ChromePanel panel)
+{
+    if (!state || !chrome_panel_is_internal_list(panel))
+        return;
+    ChromeListGeometry geometry = chrome_list_geometry(state, panel);
+    state->chrome.panel_scroll_offsets[panel] =
+        CLAMP(state->chrome.panel_scroll_offsets[panel], 0.0, geometry.max_scroll);
+}
+
+static void chrome_open_internal_panel(AppState *state, ChromePanel panel,
+                                       gboolean reset_scroll)
+{
+    if (!state || !chrome_panel_is_internal_list(panel))
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    chrome_cancel_menu_snap(chrome);
+    chrome->panel = panel;
+    if (reset_scroll)
+        chrome->panel_scroll_offsets[panel] = 0;
+    chrome_clamp_list_scroll(state, panel);
+    chrome_publish_motion(state, FALSE);
+}
+
+static void chrome_cancel_menu_snap(BrowserChrome *chrome)
+{
+    if (!chrome || !chrome->menu_snap_source_id)
+        return;
+    g_source_remove(chrome->menu_snap_source_id);
+    chrome->menu_snap_source_id = 0;
+}
+
+static void chrome_clamp_menu_scroll(AppState *state)
+{
+    ChromeMenuGeometry geometry = chrome_menu_geometry(state);
+    state->chrome.menu_scroll_offset = CLAMP(state->chrome.menu_scroll_offset,
+                                              0.0, geometry.max_scroll);
+}
+
+static void chrome_publish_motion(AppState *state, gboolean dragging)
+{
+    if (!state)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    WPEChromeMotionPanel panel = WPE_CHROME_MOTION_PANEL_NONE;
+    double offset = 0;
+    if (chrome->panel == CHROME_PANEL_TABS) {
+        panel = WPE_CHROME_MOTION_PANEL_TABS;
+        offset = chrome->tabs_scroll_offset;
+    } else if (chrome->panel == CHROME_PANEL_MENU) {
+        panel = WPE_CHROME_MOTION_PANEL_MENU;
+        offset = chrome->menu_scroll_offset;
+    } else if (chrome_panel_is_internal_list(chrome->panel)) {
+        panel = WPE_CHROME_MOTION_PANEL_LIST;
+        offset = chrome->panel_scroll_offsets[chrome->panel];
+    }
+    chrome->motion.version = WPE_CHROME_MOTION_VERSION;
+    chrome->motion.panel = panel;
+    chrome->motion.flags = dragging ? WPE_CHROME_MOTION_FLAG_DRAGGING : 0;
+    chrome->motion.offset = offset;
+    chrome->motion.pressed_row = chrome->pressed_row;
+    chrome->motion.pressed_segment = chrome->pressed_segment;
+    chrome->motion.pressed_control = chrome->pressed_control;
+    chrome->motion.sequence++;
+    if (!chrome->motion.sequence)
+        chrome->motion.sequence = 1;
+}
+
+static void chrome_close_panel(AppState *state)
+{
+    if (!state)
+        return;
+    chrome_cancel_menu_snap(&state->chrome);
+    state->chrome.panel = CHROME_PANEL_NONE;
+    chrome_publish_motion(state, FALSE);
 }
 
 static void chrome_clamp_tabs_scroll(AppState *state)
@@ -599,9 +898,24 @@ static void chrome_position_active_tab(AppState *state)
 
 static void chrome_open_tabs_panel(AppState *state)
 {
+    chrome_cancel_menu_snap(&state->chrome);
     state->chrome.panel = CHROME_PANEL_TABS;
     chrome_set_visible(state, TRUE);
     chrome_position_active_tab(state);
+    chrome_publish_motion(state, FALSE);
+}
+
+static void chrome_open_menu_panel(AppState *state)
+{
+    BrowserChrome *chrome = &state->chrome;
+    chrome_cancel_menu_snap(chrome);
+    chrome->panel = CHROME_PANEL_MENU;
+    chrome->panel_page = 0;
+    chrome->panel_delete_mode = FALSE;
+    chrome->menu_page = 0;
+    chrome->menu_scroll_offset = 0;
+    chrome_set_visible(state, TRUE);
+    chrome_publish_motion(state, FALSE);
 }
 
 static void chrome_refresh_profiles(BrowserChrome *chrome)
@@ -647,12 +961,56 @@ static const char *cookie_policy_label(BrowserCookiePolicy policy)
     }
 }
 
+static void chrome_set_line_metadata(GKeyFile *key_file, int line,
+                                     gboolean enabled, gboolean danger)
+{
+    char key[48];
+    snprintf(key, sizeof(key), "line%d_enabled", line);
+    g_key_file_set_boolean(key_file, "panel", key, enabled);
+    snprintf(key, sizeof(key), "line%d_danger", line);
+    g_key_file_set_boolean(key_file, "panel", key, danger);
+}
+
+static void chrome_set_line_style(GKeyFile *key_file, int line,
+                                  const char *kind, const char *value,
+                                  gboolean checked, const char *icon)
+{
+    char key[48];
+    snprintf(key, sizeof(key), "line%d_kind", line);
+    g_key_file_set_string(key_file, "panel", key, kind ? kind : "action");
+    snprintf(key, sizeof(key), "line%d_value", line);
+    g_key_file_set_string(key_file, "panel", key, value ? value : "");
+    snprintf(key, sizeof(key), "line%d_checked", line);
+    g_key_file_set_boolean(key_file, "panel", key, checked);
+    snprintf(key, sizeof(key), "line%d_icon", line);
+    g_key_file_set_string(key_file, "panel", key, icon ? icon : "");
+}
+
+static void chrome_set_segmented_line(GKeyFile *key_file, int line, int count,
+                                      const char *const *labels,
+                                      const gboolean *enabled,
+                                      const gboolean *danger)
+{
+    char key[64];
+    snprintf(key, sizeof(key), "line%d_segment_count", line);
+    g_key_file_set_integer(key_file, "panel", key, count);
+    for (int segment = 0; segment < count; ++segment) {
+        snprintf(key, sizeof(key), "line%d_segment%d_label", line, segment);
+        g_key_file_set_string(key_file, "panel", key, labels[segment]);
+        snprintf(key, sizeof(key), "line%d_segment%d_enabled", line, segment);
+        g_key_file_set_boolean(key_file, "panel", key, enabled[segment]);
+        snprintf(key, sizeof(key), "line%d_segment%d_danger", line, segment);
+        g_key_file_set_boolean(key_file, "panel", key, danger[segment]);
+    }
+}
+
 static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
 {
     BrowserChrome *chrome = &state->chrome;
     BrowserTab *tab = chrome_active_tab(chrome);
     char line[128];
     int line_count = 0;
+    int content_line_count = -1;
 
     g_key_file_remove_group(key_file, "panel", NULL);
     if (chrome->panel == CHROME_PANEL_NONE)
@@ -666,13 +1024,30 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                               bookmarked ? "REMOVE BOOKMARK" : "ADD BOOKMARK");
         g_key_file_set_string(key_file, "panel", "line1", "HISTORY");
         g_key_file_set_string(key_file, "panel", "line2", "BOOKMARKS");
-        snprintf(line, sizeof(line), "PROFILES  %s%s",
-                 profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
-                 profile_runtime.guest ? " (GUEST)" : "");
-        g_key_file_set_string(key_file, "panel", "line3", line);
-        g_key_file_set_string(key_file, "panel", "line4", "PRIVACY & COOKIES");
+        g_key_file_set_string(key_file, "panel", "line3", "PROFILES");
+        g_key_file_set_string(key_file, "panel", "line4", "PRIVACY");
         g_key_file_set_string(key_file, "panel", "line5", "SETTINGS");
         line_count = 6;
+        static const char *item_ids[CHROME_MENU_ITEM_COUNT] = {
+            "bookmark", "history", "bookmarks", "profiles", "privacy", "settings"
+        };
+        ChromeMenuGeometry geometry = chrome_menu_geometry(state);
+        g_key_file_set_integer(key_file, "panel", "x", geometry.panel_x);
+        g_key_file_set_integer(key_file, "panel", "y", geometry.panel_y);
+        g_key_file_set_integer(key_file, "panel", "width", geometry.panel_width);
+        g_key_file_set_integer(key_file, "panel", "height", geometry.panel_height);
+        g_key_file_set_integer(key_file, "panel", "columns", geometry.columns);
+        g_key_file_set_integer(key_file, "panel", "rows", geometry.rows);
+        g_key_file_set_integer(key_file, "panel", "page_count", geometry.page_count);
+        g_key_file_set_double(key_file, "panel", "scroll_offset", chrome->menu_scroll_offset);
+        for (int index = 0; index < CHROME_MENU_ITEM_COUNT; ++index) {
+            char key[32];
+            snprintf(key, sizeof(key), "item%d_id", index);
+            g_key_file_set_string(key_file, "panel", key, item_ids[index]);
+            snprintf(key, sizeof(key), "item%d_enabled", index);
+            g_key_file_set_boolean(key_file, "panel", key,
+                                   index != 0 || !profile_runtime.guest);
+        }
     } else if (chrome->panel == CHROME_PANEL_TABS) {
         for (int i = 0; i < chrome->tab_count && line_count < 8; ++i) {
             BrowserTab *item = &chrome->tabs[i];
@@ -695,16 +1070,98 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         g_key_file_set_boolean(key_file, "panel", "can_add",
                                chrome->tab_count < MAX_BROWSER_TABS);
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
-        const char *home = chrome->home_url && chrome->home_url[0] ? chrome->home_url : default_home_url();
-        snprintf(line, sizeof(line), "SET HOME %.80s", home);
-        g_key_file_set_string(key_file, "panel", "line0", line);
-        snprintf(line, sizeof(line), "SITE MODE %s",
-                 !g_strcmp0(normalize_site_profile(chrome->site_profile), "desktop") ? "DESKTOP" : "MOBILE");
-        g_key_file_set_string(key_file, "panel", "line1", line);
-        g_key_file_set_string(key_file, "panel", "line2", chrome->touch_debug ? "TOUCH DEBUG ON" : "TOUCH DEBUG OFF");
-        g_key_file_set_string(key_file, "panel", "line3", "CLEAR CACHE");
-        g_key_file_set_string(key_file, "panel", "line4", "ABOUT WPE DRM2");
+        g_key_file_set_string(key_file, "panel", "line0", "APPEARANCE");
+        g_key_file_set_string(key_file, "panel", "line1", "WEB PAGE");
+        g_key_file_set_string(key_file, "panel", "line2", "STARTUP & SEARCH");
+        g_key_file_set_string(key_file, "panel", "line3", "PRIVACY & DATA");
+        g_key_file_set_string(key_file, "panel", "line4", "ABOUT");
         line_count = 5;
+    } else if (chrome->panel == CHROME_PANEL_APPEARANCE) {
+        char zoom[16];
+        g_snprintf(zoom, sizeof(zoom), "%d%%", (int)lround(chrome->page_zoom * 100));
+        const char *font = chrome->default_font_size <= 14 ? "SMALL"
+            : chrome->default_font_size >= 20 ? "LARGE" : "STANDARD";
+        g_key_file_set_string(key_file, "panel", "line0", "THEME");
+        g_key_file_set_string(key_file, "panel", "line1", "TOOLBAR AUTO-HIDE");
+        g_key_file_set_string(key_file, "panel", "line2", "PAGE ZOOM");
+        g_key_file_set_string(key_file, "panel", "line3", "DEFAULT FONT");
+        line_count = 4;
+        chrome_set_line_style(key_file, 0, "choice",
+                              !g_ascii_strcasecmp(chrome->global_settings.theme, "dark")
+                                ? "DARK" : "LIGHT", FALSE, "theme");
+        chrome_set_line_style(key_file, 1, "toggle", "",
+                              chrome->global_settings.toolbar_auto_hide, "toolbar");
+        chrome_set_line_style(key_file, 2, "choice", zoom, FALSE, "zoom");
+        chrome_set_line_style(key_file, 3, "choice", font, FALSE, "font");
+    } else if (chrome->panel == CHROME_PANEL_WEB) {
+        g_key_file_set_string(key_file, "panel", "line0", "SITE MODE");
+        g_key_file_set_string(key_file, "panel", "line1", "JAVASCRIPT");
+        g_key_file_set_string(key_file, "panel", "line2", "AUTOPLAY");
+        g_key_file_set_string(key_file, "panel", "line3", "SMOOTH SCROLL");
+        g_key_file_set_string(key_file, "panel", "line4", "BLOCK POPUPS");
+        line_count = 5;
+        chrome_set_line_style(key_file, 0, "choice",
+                              !g_strcmp0(normalize_site_profile(chrome->site_profile), "desktop")
+                                ? "DESKTOP" : "MOBILE", FALSE, "desktop");
+        chrome_set_line_style(key_file, 1, "toggle", "",
+                              chrome->javascript_enabled, "javascript");
+        chrome_set_line_style(key_file, 2, "choice",
+                              chrome->autoplay_requires_gesture ? "USER ACTION" : "ALLOW",
+                              FALSE, "autoplay");
+        chrome_set_line_style(key_file, 3, "toggle", "",
+                              chrome->smooth_scrolling, "scroll");
+        chrome_set_line_style(key_file, 4, "toggle", "",
+                              chrome->block_popups, "popup");
+    } else if (chrome->panel == CHROME_PANEL_STARTUP) {
+        const char *engine = !g_strcmp0(chrome->search_engine, "bing") ? "BING"
+            : !g_strcmp0(chrome->search_engine, "google") ? "GOOGLE"
+            : !g_strcmp0(chrome->search_engine, "custom") ? "CUSTOM" : "BAIDU";
+        g_key_file_set_string(key_file, "panel", "line0", "SEARCH ENGINE");
+        g_key_file_set_string(key_file, "panel", "line1", "CUSTOM SEARCH TEMPLATE");
+        g_key_file_set_string(key_file, "panel", "line2", "HOME PAGE");
+        g_key_file_set_string(key_file, "panel", "line3", "RESTORE TABS");
+        line_count = 4;
+        chrome_set_line_style(key_file, 0, "choice", engine, FALSE, "search");
+        chrome_set_line_style(key_file, 1, "navigation",
+                              custom_search_template_is_valid(chrome->custom_search_template)
+                                ? "SET" : "NOT SET", FALSE, "custom");
+        chrome_set_line_style(key_file, 2, "navigation",
+                              chrome->home_url ? chrome->home_url : default_home_url(),
+                              FALSE, "home");
+        chrome_set_line_style(key_file, 3, "toggle", "",
+                              chrome->restore_tabs, "tabs");
+    } else if (chrome->panel == CHROME_PANEL_SETTINGS_PRIVACY) {
+        g_key_file_set_string(key_file, "panel", "line0", "COOKIE POLICY");
+        g_key_file_set_string(key_file, "panel", "line1", "CLEAR COOKIES & SITE DATA");
+        g_key_file_set_string(key_file, "panel", "line2", "CLEAR CACHE");
+        g_key_file_set_string(key_file, "panel", "line3", "CLEAR HISTORY");
+        line_count = 4;
+        chrome_set_line_style(key_file, 0, "choice",
+                              cookie_policy_label(chrome->cookie_policy),
+                              FALSE, "privacy");
+        chrome_set_line_style(key_file, 1, "action", "", FALSE, "clear");
+        chrome_set_line_style(key_file, 2, "action", "", FALSE, "cache");
+        chrome_set_line_style(key_file, 3, "action", "", FALSE, "history");
+    } else if (chrome->panel == CHROME_PANEL_ABOUT) {
+        char display[64];
+        g_snprintf(display, sizeof(display), "%dx%d  R%d",
+                   state->panel_width, state->panel_height, state->panel_rotation);
+        g_key_file_set_string(key_file, "panel", "line0", "DIRECT WPE DRM BROWSER");
+        g_key_file_set_string(key_file, "panel", "line1", "WEBKIT RUNTIME");
+        g_key_file_set_string(key_file, "panel", "line2", "CURRENT PROFILE");
+        g_key_file_set_string(key_file, "panel", "line3", "RENDERER");
+        g_key_file_set_string(key_file, "panel", "line4", "DISPLAY");
+        line_count = 5;
+        chrome_set_line_style(key_file, 0, "info", "1.0", FALSE, "about");
+        chrome_set_line_style(key_file, 1, "info", "2.53.3", FALSE, "webkit");
+        chrome_set_line_style(key_file, 2, "info",
+                              profile_runtime.profile.name
+                                ? profile_runtime.profile.name : "DEFAULT",
+                              FALSE, "profiles");
+        chrome_set_line_style(key_file, 3, "info",
+                              gpu_render_profile ? "MALI GPU" : "SKIA CPU",
+                              FALSE, "renderer");
+        chrome_set_line_style(key_file, 4, "info", display, FALSE, "display");
     } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
         snprintf(line, sizeof(line), "COOKIE POLICY %s", cookie_policy_label(chrome->cookie_policy));
         g_key_file_set_string(key_file, "panel", "line0", line);
@@ -764,6 +1221,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
             g_key_file_set_string(key_file, "panel", line, value);
             line_count++;
         }
+        content_line_count = line_count;
         while (line_count < 6) {
             snprintf(line, sizeof(line), "line%d", line_count++);
             g_key_file_set_string(key_file, "panel", line, "-");
@@ -778,6 +1236,91 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
         g_key_file_set_string(key_file, "panel", "line1", "CONFIRM CLEAR HISTORY");
         line_count = 2;
+    }
+
+    if (chrome_panel_is_internal_list(chrome->panel)) {
+        ChromeListGeometry geometry = chrome_list_geometry(state, chrome->panel);
+        chrome_clamp_list_scroll(state, chrome->panel);
+        g_key_file_set_integer(key_file, "panel", "x", geometry.panel_x);
+        g_key_file_set_integer(key_file, "panel", "y", geometry.panel_y);
+        g_key_file_set_integer(key_file, "panel", "width", geometry.panel_width);
+        g_key_file_set_integer(key_file, "panel", "height", geometry.panel_height);
+        g_key_file_set_integer(key_file, "panel", "header_height", geometry.header_height);
+        g_key_file_set_integer(key_file, "panel", "row_height", geometry.row_height);
+        g_key_file_set_double(key_file, "panel", "scroll_offset",
+                              chrome->panel_scroll_offsets[chrome->panel]);
+        g_key_file_set_double(key_file, "panel", "max_scroll", geometry.max_scroll);
+        for (int index = 0; index < line_count; ++index)
+            chrome_set_line_metadata(key_file, index, TRUE, FALSE);
+
+        if (chrome->panel == CHROME_PANEL_SETTINGS) {
+            static const char *icons[] = {
+                "theme", "web", "search", "privacy", "about"
+            };
+            for (int index = 0; index < line_count; ++index)
+                chrome_set_line_style(key_file, index, "navigation", "",
+                                      FALSE, icons[index]);
+        } else if (chrome->panel == CHROME_PANEL_SETTINGS_PRIVACY) {
+            chrome_set_line_metadata(key_file, 1, TRUE, TRUE);
+            chrome_set_line_metadata(key_file, 3, !profile_runtime.guest, TRUE);
+        } else if (chrome->panel == CHROME_PANEL_ABOUT) {
+            for (int index = 0; index < line_count; ++index)
+                chrome_set_line_metadata(key_file, index, TRUE, FALSE);
+        } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
+            chrome_set_line_metadata(key_file, 1, !chrome->site_data_clearing, TRUE);
+        } else if (chrome->panel == CHROME_PANEL_CLEAR_SITE_DATA
+                   || chrome->panel == CHROME_PANEL_PROFILE_DELETE
+                   || chrome->panel == CHROME_PANEL_CLEAR_HISTORY) {
+            chrome_set_line_metadata(key_file, 1, TRUE, TRUE);
+        } else if (chrome->panel == CHROME_PANEL_PROFILE_MANAGE) {
+            chrome_set_line_metadata(key_file, 1,
+                                     !profile_runtime.guest
+                                         && !profile_runtime.profile.is_default,
+                                     TRUE);
+        } else if (chrome->panel == CHROME_PANEL_PROFILES) {
+            const char *row4_labels[] = { "GUEST", "NEW PROFILE" };
+            const gboolean row4_enabled[] = { TRUE, TRUE };
+            const gboolean row4_danger[] = { FALSE, FALSE };
+            chrome_set_segmented_line(key_file, 4, 2, row4_labels,
+                                      row4_enabled, row4_danger);
+            gboolean has_previous = chrome->panel_page > 0;
+            gboolean has_next = chrome->panel_profiles
+                && (chrome->panel_page + 1) * 4 < chrome->panel_profiles->len;
+            const char *row5_labels[] = { "PREV", "NEXT", "MANAGE ACTIVE" };
+            const gboolean row5_enabled[] = {
+                has_previous, has_next, !profile_runtime.guest
+            };
+            const gboolean row5_danger[] = { FALSE, FALSE, FALSE };
+            chrome_set_segmented_line(key_file, 5, 3, row5_labels,
+                                      row5_enabled, row5_danger);
+        } else if (chrome->panel == CHROME_PANEL_HISTORY
+                   || chrome->panel == CHROME_PANEL_BOOKMARKS) {
+            for (int index = 0; index < 6; ++index)
+                chrome_set_line_metadata(key_file, index,
+                                         index < content_line_count,
+                                         index < content_line_count
+                                             && chrome->panel_delete_mode);
+            gboolean has_previous = chrome->panel_page > 0;
+            gboolean has_next = chrome->panel_pages
+                && chrome->panel_pages->len == 6;
+            const char *row6_labels[] = { "PREV PAGE", "NEXT PAGE" };
+            const gboolean row6_enabled[] = { has_previous, has_next };
+            const gboolean row6_danger[] = { FALSE, FALSE };
+            chrome_set_segmented_line(key_file, 6, 2, row6_labels,
+                                      row6_enabled, row6_danger);
+            if (chrome->panel == CHROME_PANEL_HISTORY) {
+                const char *row7_labels[] = {
+                    chrome->panel_delete_mode ? "DONE DELETING" : "DELETE MODE",
+                    "CLEAR HISTORY"
+                };
+                const gboolean row7_enabled[] = { TRUE, !profile_runtime.guest };
+                const gboolean row7_danger[] = { chrome->panel_delete_mode, TRUE };
+                chrome_set_segmented_line(key_file, 7, 2, row7_labels,
+                                          row7_enabled, row7_danger);
+            } else
+                chrome_set_line_metadata(key_file, 7, TRUE,
+                                         chrome->panel_delete_mode);
+        }
     }
 
     g_key_file_set_integer(key_file, "panel", "line_count", line_count);
@@ -818,6 +1361,7 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_boolean(key_file, "chrome", "can_back", tab && tab->back_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "can_forward", tab && tab->forward_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "touch_debug", chrome->touch_debug);
+    g_key_file_set_boolean(key_file, "chrome", "page_fullscreen", state->page_fullscreen);
     g_key_file_set_integer(key_file, "chrome", "height", chrome->height);
     g_key_file_set_integer(key_file, "chrome", "tab_count", chrome->tab_count);
     g_key_file_set_integer(key_file, "chrome", "active_tab", chrome->active);
@@ -825,6 +1369,11 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_string(key_file, "chrome", "profile",
                           profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT");
     g_key_file_set_boolean(key_file, "chrome", "guest_profile", profile_runtime.guest);
+    g_key_file_set_string(key_file, "chrome", "theme",
+                          !g_ascii_strcasecmp(chrome->global_settings.theme, "dark")
+                            ? "dark" : "light");
+    g_key_file_set_boolean(key_file, "chrome", "toolbar_auto_hide",
+                           chrome->global_settings.toolbar_auto_hide);
     char *transition_us = g_strdup_printf("%" G_GINT64_FORMAT, chrome->transition_us);
     g_key_file_set_string(key_file, "chrome", "transition_us", transition_us);
     g_free(transition_us);
@@ -843,6 +1392,74 @@ static void chrome_update_render_state(AppState *state)
     }
     g_free(data);
     g_key_file_unref(key_file);
+}
+
+static gboolean chrome_menu_snap_tick(gpointer user_data)
+{
+    AppState *state = user_data;
+    if (!state)
+        return G_SOURCE_REMOVE;
+    BrowserChrome *chrome = &state->chrome;
+    if (chrome->panel != CHROME_PANEL_MENU) {
+        chrome->menu_snap_source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    double elapsed = (double)(g_get_monotonic_time() - chrome->menu_snap_start_us)
+        / (120.0 * 1000.0);
+    double t = CLAMP(elapsed, 0.0, 1.0);
+    double eased = 1.0 - pow(1.0 - t, 3.0);
+    chrome->menu_scroll_offset = chrome->menu_snap_from
+        + (chrome->menu_snap_to - chrome->menu_snap_from) * eased;
+    chrome_clamp_menu_scroll(state);
+    chrome_publish_motion(state, t < 1.0);
+
+    if (t < 1.0)
+        return G_SOURCE_CONTINUE;
+
+    ChromeMenuGeometry geometry = chrome_menu_geometry(state);
+    chrome->menu_page = geometry.panel_width > 0
+        ? (guint)llround(chrome->menu_scroll_offset / geometry.panel_width) : 0;
+    chrome->menu_scroll_offset = chrome->menu_page * geometry.panel_width;
+    chrome_publish_motion(state, FALSE);
+    chrome->menu_snap_source_id = 0;
+    chrome_update_render_state(state);
+    return G_SOURCE_REMOVE;
+}
+
+static void chrome_snap_menu(AppState *state, double start_offset,
+                             double drag_distance, double velocity)
+{
+    if (!state || state->chrome.panel != CHROME_PANEL_MENU)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    ChromeMenuGeometry geometry = chrome_menu_geometry(state);
+    chrome_clamp_menu_scroll(state);
+    if (geometry.page_count <= 1 || geometry.panel_width <= 0) {
+        chrome->menu_page = 0;
+        chrome->menu_scroll_offset = 0;
+        chrome_publish_motion(state, FALSE);
+        chrome_update_render_state(state);
+        return;
+    }
+
+    int current_page = CLAMP((int)llround(start_offset / geometry.panel_width),
+                             0, geometry.page_count - 1);
+    int target_page = current_page;
+    double distance_threshold = MAX(48.0, geometry.panel_width * 0.2);
+    if (drag_distance > distance_threshold || velocity > 600.0)
+        target_page++;
+    else if (drag_distance < -distance_threshold || velocity < -600.0)
+        target_page--;
+    target_page = CLAMP(target_page, 0, geometry.page_count - 1);
+
+    chrome_cancel_menu_snap(chrome);
+    chrome->menu_page = target_page;
+    chrome->menu_snap_from = chrome->menu_scroll_offset;
+    chrome->menu_snap_to = target_page * geometry.panel_width;
+    chrome->menu_snap_start_us = g_get_monotonic_time();
+    chrome->menu_snap_source_id = g_timeout_add_full(G_PRIORITY_DEFAULT, 16,
+                                                      chrome_menu_snap_tick, state, NULL);
 }
 
 static void chrome_save_state(AppState *state)
@@ -878,12 +1495,33 @@ static void chrome_save_state(AppState *state)
                 profile_runtime.profile.id, normalize_site_profile(chrome->site_profile), &error)
             && browser_profile_store_set_cookie_policy(profile_runtime.store,
                 profile_runtime.profile.id, chrome->cookie_policy, &error)
+            && browser_profile_store_save_preferences(profile_runtime.store,
+                &(BrowserProfile) {
+                    .id = profile_runtime.profile.id,
+                    .search_engine = chrome->search_engine,
+                    .custom_search_template = chrome->custom_search_template,
+                    .page_zoom = chrome->page_zoom,
+                    .default_font_size = chrome->default_font_size,
+                    .javascript_enabled = chrome->javascript_enabled,
+                    .autoplay_requires_gesture = chrome->autoplay_requires_gesture,
+                    .smooth_scrolling = chrome->smooth_scrolling,
+                    .block_popups = chrome->block_popups,
+                    .restore_tabs = chrome->restore_tabs,
+                }, &error)
             && browser_profile_store_save_tabs(profile_runtime.store,
                 profile_runtime.profile.id, tabs, chrome->next_tab_id, &error);
         if (!success)
             g_warning("Profile state save failed: %s", error ? error->message : "unknown");
         g_clear_error(&error);
         g_ptr_array_unref(tabs);
+    }
+    if (profile_runtime.store) {
+        GError *error = NULL;
+        if (!browser_profile_store_save_global_settings(profile_runtime.store,
+                &chrome->global_settings, &error))
+            g_warning("Global UI settings save failed: %s",
+                      error ? error->message : "unknown");
+        g_clear_error(&error);
     }
     chrome_update_render_state(state);
     chrome_apply_layout(state, "chrome_state");
@@ -963,6 +1601,8 @@ static int chrome_page_top_inset(AppState *state)
 {
     if (!state || !state->chrome.enabled)
         return 0;
+    if (state->page_fullscreen)
+        return 0;
     BrowserChrome *chrome = &state->chrome;
     if (chrome->panel != CHROME_PANEL_NONE)
         return chrome->height;
@@ -1004,7 +1644,7 @@ static void chrome_load_url(AppState *state, const char *url, gboolean push_hist
     chrome->suppress_history = TRUE;
     chrome->loading = TRUE;
     chrome->load_progress = 0.0;
-    chrome->panel = CHROME_PANEL_NONE;
+    chrome_close_panel(state);
     chrome_set_visible(state, TRUE);
     chrome_save_state(state);
     chrome_request_frame(state);
@@ -1050,8 +1690,7 @@ static void chrome_close_tab(AppState *state, int index)
     chrome_clamp_tabs_scroll(state);
     if (closed_active) {
         chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
-        chrome->panel = CHROME_PANEL_TABS;
-        chrome_clamp_tabs_scroll(state);
+        chrome_open_tabs_panel(state);
         chrome_save_state(state);
         chrome_request_frame(state);
     } else {
@@ -1282,7 +1921,54 @@ static char *bilibili_web_url_from_uri(const char *uri)
     return NULL;
 }
 
-static char *normalize_user_url(const char *raw)
+static gboolean custom_search_template_is_valid(const char *value)
+{
+    if (!value || !g_str_has_prefix(value, "https://"))
+        return FALSE;
+    const char *placeholder = strstr(value, "%s");
+    if (!placeholder || strstr(placeholder + 2, "%s"))
+        return FALSE;
+    if (strpbrk(value, "\r\n\t"))
+        return FALSE;
+
+    char *candidate = g_strdup_printf("%.*squery%s",
+        (int)(placeholder - value), value, placeholder + 2);
+    GError *error = NULL;
+    GUri *uri = g_uri_parse(candidate, G_URI_FLAGS_NONE, &error);
+    gboolean valid = uri && g_uri_get_scheme(uri)
+        && !g_ascii_strcasecmp(g_uri_get_scheme(uri), "https")
+        && g_uri_get_host(uri) && g_uri_get_host(uri)[0];
+    if (uri)
+        g_uri_unref(uri);
+    g_clear_error(&error);
+    g_free(candidate);
+    return valid;
+}
+
+static const char *search_template_for_chrome(const BrowserChrome *chrome)
+{
+    if (chrome && !g_strcmp0(chrome->search_engine, "bing"))
+        return "https://www.bing.com/search?q=%s";
+    if (chrome && !g_strcmp0(chrome->search_engine, "google"))
+        return "https://www.google.com/search?q=%s";
+    if (chrome && !g_strcmp0(chrome->search_engine, "custom")
+            && custom_search_template_is_valid(chrome->custom_search_template))
+        return chrome->custom_search_template;
+    return "https://m.baidu.com/s?word=%s";
+}
+
+static char *search_url_for_query(const BrowserChrome *chrome, const char *query)
+{
+    const char *format = search_template_for_chrome(chrome);
+    const char *placeholder = strstr(format, "%s");
+    char *escaped = g_uri_escape_string(query ? query : "", NULL, TRUE);
+    char *url = g_strdup_printf("%.*s%s%s",
+        (int)(placeholder - format), format, escaped ? escaped : "", placeholder + 2);
+    g_free(escaped);
+    return url;
+}
+
+static char *normalize_user_url(AppState *state, const char *raw)
 {
     char *value = g_strdup(raw ? raw : "");
     g_strstrip(value);
@@ -1326,9 +2012,7 @@ static char *normalize_user_url(const char *raw)
     }
 
     if (strchr(value, ' ') || strchr(value, '\t') || !strchr(value, '.')) {
-        char *escaped = g_uri_escape_string(value, NULL, TRUE);
-        char *url = g_strdup_printf("https://m.baidu.com/s?word=%s", escaped ? escaped : "");
-        g_free(escaped);
+        char *url = search_url_for_query(state ? &state->chrome : NULL, value);
         g_free(value);
         return url;
     }
@@ -1610,22 +2294,39 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
 
     if (confirmed) {
         if (!g_strcmp0(state->keyboard_active_kind, "address")) {
-            char *url = normalize_user_url(final_text);
+            char *url = normalize_user_url(state, final_text);
             if (url)
                 chrome_load_url(state, url, TRUE);
             else
                 g_warning("Ignoring blocked address input: bytes=%zu", strlen(final_text));
             g_free(url);
         } else if (!g_strcmp0(state->keyboard_active_kind, "home_url")) {
-            char *url = normalize_user_url(final_text);
+            char *url = normalize_user_url(state, final_text);
             if (url) {
                 g_free(state->chrome.home_url);
                 state->chrome.home_url = url;
-                state->chrome.panel = CHROME_PANEL_NONE;
+                chrome_open_internal_panel(state, CHROME_PANEL_STARTUP, FALSE);
                 chrome_save_state(state);
                 chrome_request_frame(state);
             } else
                 g_warning("Ignoring blocked home URL input: bytes=%zu", strlen(final_text));
+        } else if (!g_strcmp0(state->keyboard_active_kind, "custom_search")) {
+            char *candidate = g_strdup(final_text);
+            g_strstrip(candidate);
+            if (custom_search_template_is_valid(candidate)) {
+                g_free(state->chrome.custom_search_template);
+                state->chrome.custom_search_template = candidate;
+                g_strlcpy(state->chrome.search_engine, "custom",
+                          sizeof(state->chrome.search_engine));
+                chrome_open_internal_panel(state, CHROME_PANEL_STARTUP, FALSE);
+                chrome_save_state(state);
+                chrome_request_frame(state);
+                g_print("Custom search template saved: %s\n",
+                        state->chrome.custom_search_template);
+            } else {
+                g_warning("Rejected custom search template: HTTPS and exactly one %%s required");
+                g_free(candidate);
+            }
         } else if (!g_strcmp0(state->keyboard_active_kind, "profile_new")) {
             BrowserProfile profile = { 0 };
             GError *error = NULL;
@@ -1650,7 +2351,8 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
                     g_free(profile_runtime.profile.name);
                     profile_runtime.profile.name = normalized;
                 }
-                state->chrome.panel = CHROME_PANEL_PROFILE_MANAGE;
+                chrome_open_internal_panel(state, CHROME_PANEL_PROFILE_MANAGE,
+                                           FALSE);
                 chrome_update_render_state(state);
                 g_print("Profile renamed: id=%" G_GINT64_FORMAT " name=%s\n",
                         profile_runtime.profile.id, profile_runtime.profile.name);
@@ -2081,13 +2783,11 @@ static void chrome_toggle_site_profile(AppState *state)
     const char *current = normalize_site_profile(chrome->site_profile);
     const char *next = !g_strcmp0(current, "desktop") ? "mobile" : "desktop";
     g_strlcpy(chrome->site_profile, next, sizeof(chrome->site_profile));
-    chrome_apply_site_profile(state);
-    BrowserTab *tab = chrome_active_tab(chrome);
-    const char *reload_url = tab && tab->url[0] ? tab->url : (chrome->home_url ? chrome->home_url : default_home_url());
-    g_print("Site profile changed: %s reload=%s\n", next, reload_url);
-    chrome->panel = CHROME_PANEL_NONE;
+    g_print("Site profile changed: %s\n", next);
     chrome_save_state(state);
-    chrome_load_url(state, reload_url, FALSE);
+    chrome_apply_web_preferences(state, TRUE);
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
 }
 
 static void chrome_apply_cookie_policy(AppState *state, BrowserCookiePolicy policy)
@@ -2115,6 +2815,69 @@ static void chrome_cycle_cookie_policy(AppState *state)
         : policy == BROWSER_COOKIE_NO_THIRD_PARTY ? BROWSER_COOKIE_ACCEPT_NEVER
         : BROWSER_COOKIE_ACCEPT_ALL;
     chrome_apply_cookie_policy(state, policy);
+}
+
+static void chrome_toggle_theme(AppState *state)
+{
+    BrowserChrome *chrome = &state->chrome;
+    g_strlcpy(chrome->global_settings.theme,
+              !g_ascii_strcasecmp(chrome->global_settings.theme, "dark")
+                ? "light" : "dark",
+              sizeof(chrome->global_settings.theme));
+    chrome_save_state(state);
+    chrome_request_frame(state);
+}
+
+static void chrome_cycle_page_zoom(AppState *state)
+{
+    static const double values[] = { 0.75, 0.90, 1.00, 1.10, 1.25 };
+    BrowserChrome *chrome = &state->chrome;
+    guint closest = 0;
+    double distance = G_MAXDOUBLE;
+    for (guint index = 0; index < G_N_ELEMENTS(values); ++index) {
+        double current = fabs(chrome->page_zoom - values[index]);
+        if (current < distance) {
+            closest = index;
+            distance = current;
+        }
+    }
+    chrome->page_zoom = values[(closest + 1) % G_N_ELEMENTS(values)];
+    chrome_save_state(state);
+    update_page_zoom_for_uri(state, webkit_web_view_get_uri(state->web_view));
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
+}
+
+static void chrome_cycle_font_size(AppState *state)
+{
+    BrowserChrome *chrome = &state->chrome;
+    chrome->default_font_size = chrome->default_font_size <= 14 ? 16
+        : chrome->default_font_size <= 16 ? 20 : 14;
+    chrome_save_state(state);
+    chrome_apply_web_preferences(state, TRUE);
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
+}
+
+static void chrome_cycle_search_engine(AppState *state)
+{
+    BrowserChrome *chrome = &state->chrome;
+    if (!g_strcmp0(chrome->search_engine, "baidu"))
+        g_strlcpy(chrome->search_engine, "bing", sizeof(chrome->search_engine));
+    else if (!g_strcmp0(chrome->search_engine, "bing"))
+        g_strlcpy(chrome->search_engine, "google", sizeof(chrome->search_engine));
+    else if (!g_strcmp0(chrome->search_engine, "google")) {
+        if (!custom_search_template_is_valid(chrome->custom_search_template)) {
+            keyboard_request(state, "custom_search", "",
+                             "HTTPS 搜索模板，使用一个 %s", "EnUSPreferred", 512, FALSE);
+            return;
+        }
+        g_strlcpy(chrome->search_engine, "custom", sizeof(chrome->search_engine));
+    } else
+        g_strlcpy(chrome->search_engine, "baidu", sizeof(chrome->search_engine));
+    chrome_save_state(state);
+    chrome_update_render_state(state);
+    chrome_request_frame(state);
 }
 
 static gboolean chrome_write_profile_switch(const char *value)
@@ -2199,7 +2962,10 @@ static void chrome_clear_site_data(AppState *state)
     WebKitWebsiteDataManager *manager = webkit_network_session_get_website_data_manager(state->network_session);
     state->chrome.site_data_clearing = TRUE;
     state->chrome.site_data_status[0] = '\0';
-    state->chrome.panel = CHROME_PANEL_PRIVACY;
+    chrome_open_internal_panel(state,
+        state->chrome.dialog_parent == CHROME_PANEL_SETTINGS_PRIVACY
+            ? CHROME_PANEL_SETTINGS_PRIVACY : CHROME_PANEL_PRIVACY,
+        FALSE);
     webkit_website_data_manager_clear(manager, WEBKIT_WEBSITE_DATA_ALL, 0, NULL,
                                       on_clear_site_data_finished, state);
     g_print("Profile site data clear requested: profile=%s guest=%d\n",
@@ -2212,7 +2978,10 @@ static void chrome_clear_site_data(AppState *state)
 static void chrome_open_history(AppState *state, gboolean bookmarks)
 {
     BrowserChrome *chrome = &state->chrome;
-    chrome->panel = bookmarks ? CHROME_PANEL_BOOKMARKS : CHROME_PANEL_HISTORY;
+    chrome_open_internal_panel(state,
+                               bookmarks ? CHROME_PANEL_BOOKMARKS
+                                         : CHROME_PANEL_HISTORY,
+                               TRUE);
     chrome->panel_page = 0;
     chrome->panel_delete_mode = FALSE;
     chrome_refresh_pages(chrome, bookmarks);
@@ -2222,10 +2991,18 @@ static void chrome_open_history(AppState *state, gboolean bookmarks)
 static void chrome_go_panel_back(AppState *state)
 {
     BrowserChrome *chrome = &state->chrome;
-    ChromePanel parent = chrome_panel_parent(chrome->panel);
-    chrome->panel = parent;
-    chrome->panel_page = 0;
-    chrome->panel_delete_mode = FALSE;
+    ChromePanel parent = (chrome->panel == CHROME_PANEL_CLEAR_SITE_DATA
+            || chrome->panel == CHROME_PANEL_CLEAR_HISTORY)
+        && chrome->dialog_parent != CHROME_PANEL_NONE
+        ? chrome->dialog_parent : chrome_panel_parent(chrome->panel);
+    if (parent == CHROME_PANEL_MENU) {
+        chrome->panel_page = 0;
+        chrome->panel_delete_mode = FALSE;
+        chrome_open_menu_panel(state);
+    } else if (chrome_panel_is_internal_list(parent))
+        chrome_open_internal_panel(state, parent, FALSE);
+    else
+        chrome_close_panel(state);
     if (parent == CHROME_PANEL_PROFILES)
         chrome_refresh_profiles(chrome);
     chrome_update_render_state(state);
@@ -2254,44 +3031,107 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
         else if (row == 2)
             chrome_open_history(state, TRUE);
         else if (row == 3) {
-            chrome->panel = CHROME_PANEL_PROFILES;
+            chrome_open_internal_panel(state, CHROME_PANEL_PROFILES, TRUE);
             chrome->panel_page = 0;
             chrome_refresh_profiles(chrome);
         } else if (row == 4) {
-            chrome->panel = CHROME_PANEL_PRIVACY;
+            chrome_open_internal_panel(state, CHROME_PANEL_PRIVACY, TRUE);
             chrome->site_data_status[0] = '\0';
         } else if (row == 5)
-            chrome->panel = CHROME_PANEL_SETTINGS;
+            chrome_open_internal_panel(state, CHROME_PANEL_SETTINGS, TRUE);
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
-        if (row == 0) {
-            chrome->panel = CHROME_PANEL_NONE;
+        static const ChromePanel panels[] = {
+            CHROME_PANEL_APPEARANCE,
+            CHROME_PANEL_WEB,
+            CHROME_PANEL_STARTUP,
+            CHROME_PANEL_SETTINGS_PRIVACY,
+            CHROME_PANEL_ABOUT,
+        };
+        if (row >= 0 && row < (int)G_N_ELEMENTS(panels))
+            chrome_open_internal_panel(state, panels[row], TRUE);
+    } else if (chrome->panel == CHROME_PANEL_APPEARANCE) {
+        if (row == 0)
+            chrome_toggle_theme(state);
+        else if (row == 1) {
+            chrome->global_settings.toolbar_auto_hide =
+                !chrome->global_settings.toolbar_auto_hide;
+            if (!chrome->global_settings.toolbar_auto_hide)
+                chrome_set_visible(state, TRUE);
             chrome_save_state(state);
-            keyboard_request(state, "home_url", chrome->home_url ? chrome->home_url : default_home_url(),
-                             "设置主页 URL", "EnUSPreferred", 512, FALSE);
-        } else if (row == 1) {
+        } else if (row == 2)
+            chrome_cycle_page_zoom(state);
+        else if (row == 3)
+            chrome_cycle_font_size(state);
+    } else if (chrome->panel == CHROME_PANEL_WEB) {
+        if (row == 0)
             chrome_toggle_site_profile(state);
+        else if (row == 1) {
+            chrome->javascript_enabled = !chrome->javascript_enabled;
+            chrome_save_state(state);
+            chrome_apply_web_preferences(state, TRUE);
         } else if (row == 2) {
-            chrome->touch_debug = !chrome->touch_debug;
+            chrome->autoplay_requires_gesture = !chrome->autoplay_requires_gesture;
             chrome_save_state(state);
+            chrome_apply_web_preferences(state, TRUE);
         } else if (row == 3) {
-            chrome_clear_cache();
-            chrome->panel = CHROME_PANEL_MENU;
+            chrome->smooth_scrolling = !chrome->smooth_scrolling;
             chrome_save_state(state);
+            chrome_apply_web_preferences(state, TRUE);
         } else if (row == 4) {
-            g_print("About: Direct WPE DRM browser profile=%s guest=%d\n",
-                    profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
-                    profile_runtime.guest);
+            chrome->block_popups = !chrome->block_popups;
+            chrome_save_state(state);
+            chrome_apply_web_preferences(state, TRUE);
         }
+    } else if (chrome->panel == CHROME_PANEL_STARTUP) {
+        if (row == 0)
+            chrome_cycle_search_engine(state);
+        else if (row == 1)
+            keyboard_request(state, "custom_search",
+                             chrome->custom_search_template,
+                             "HTTPS 搜索模板，使用一个 %s",
+                             "EnUSPreferred", 512, FALSE);
+        else if (row == 2)
+            keyboard_request(state, "home_url",
+                             chrome->home_url ? chrome->home_url : default_home_url(),
+                             "设置主页 URL", "EnUSPreferred", 512, FALSE);
+        else if (row == 3) {
+            chrome->restore_tabs = !chrome->restore_tabs;
+            chrome_save_state(state);
+        }
+    } else if (chrome->panel == CHROME_PANEL_SETTINGS_PRIVACY) {
+        if (row == 0)
+            chrome_cycle_cookie_policy(state);
+        else if (row == 1 && !chrome->site_data_clearing) {
+            chrome->dialog_parent = CHROME_PANEL_SETTINGS_PRIVACY;
+            chrome_open_internal_panel(state, CHROME_PANEL_CLEAR_SITE_DATA, TRUE);
+        } else if (row == 2) {
+            chrome_clear_cache();
+            g_strlcpy(chrome->site_data_status, "CACHE CLEARED",
+                      sizeof(chrome->site_data_status));
+            chrome_save_state(state);
+        } else if (row == 3 && !profile_runtime.guest) {
+            chrome->dialog_parent = CHROME_PANEL_SETTINGS_PRIVACY;
+            chrome_open_internal_panel(state, CHROME_PANEL_CLEAR_HISTORY, TRUE);
+        }
+    } else if (chrome->panel == CHROME_PANEL_ABOUT) {
+        g_print("About: Direct WPE DRM browser profile=%s guest=%d renderer=%s display=%dx%d rotation=%d\n",
+                profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
+                profile_runtime.guest, gpu_render_profile ? "mali-gpu" : "skia-cpu",
+                state->panel_width, state->panel_height, state->panel_rotation);
     } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
         if (row == 0)
             chrome_cycle_cookie_policy(state);
         else if (row == 1 && !chrome->site_data_clearing) {
-            chrome->panel = CHROME_PANEL_CLEAR_SITE_DATA;
+            chrome->dialog_parent = CHROME_PANEL_PRIVACY;
+            chrome_open_internal_panel(state, CHROME_PANEL_CLEAR_SITE_DATA, TRUE);
             chrome_update_render_state(state);
         }
     } else if (chrome->panel == CHROME_PANEL_CLEAR_SITE_DATA) {
         if (row == 0)
-            chrome->panel = CHROME_PANEL_PRIVACY;
+            chrome_open_internal_panel(state,
+                chrome->dialog_parent == CHROME_PANEL_SETTINGS_PRIVACY
+                    ? CHROME_PANEL_SETTINGS_PRIVACY : CHROME_PANEL_PRIVACY,
+                FALSE);
         else if (row == 1)
             chrome_clear_site_data(state);
     } else if (chrome->panel == CHROME_PANEL_PROFILES) {
@@ -2300,7 +3140,7 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
                 && offset + row < chrome->panel_profiles->len) {
             BrowserProfile *profile = g_ptr_array_index(chrome->panel_profiles, offset + row);
             if (!profile_runtime.guest && profile->id == profile_runtime.profile.id) {
-                chrome->panel = CHROME_PANEL_PROFILE_MANAGE;
+                chrome_open_internal_panel(state, CHROME_PANEL_PROFILE_MANAGE, TRUE);
                 chrome_update_render_state(state);
             } else
                 chrome_switch_profile(state, profile->id, FALSE);
@@ -2311,6 +3151,7 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
                 keyboard_request(state, "profile_new", "", "新建 Profile 名称",
                                  "ZhCNPreferred", 20, FALSE);
         } else if (row == 5) {
+            guint previous_page = chrome->panel_page;
             if (x < panel_width / 3) {
                 if (chrome->panel_page > 0)
                     chrome->panel_page--;
@@ -2321,8 +3162,13 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
                     chrome->panel_page++;
                 chrome_refresh_profiles(chrome);
             } else {
-                chrome->panel = CHROME_PANEL_PROFILE_MANAGE;
+                chrome_open_internal_panel(state, CHROME_PANEL_PROFILE_MANAGE, TRUE);
                 chrome_update_render_state(state);
+            }
+            if (chrome->panel == CHROME_PANEL_PROFILES
+                    && chrome->panel_page != previous_page) {
+                chrome->panel_scroll_offsets[CHROME_PANEL_PROFILES] = 0;
+                chrome_publish_motion(state, FALSE);
             }
         }
     } else if (chrome->panel == CHROME_PANEL_PROFILE_MANAGE) {
@@ -2330,12 +3176,12 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             keyboard_request(state, "profile_rename", profile_runtime.profile.name,
                              "重命名 Profile", "ZhCNPreferred", 20, FALSE);
         else if (row == 1 && !profile_runtime.guest && !profile_runtime.profile.is_default) {
-            chrome->panel = CHROME_PANEL_PROFILE_DELETE;
+            chrome_open_internal_panel(state, CHROME_PANEL_PROFILE_DELETE, TRUE);
             chrome_update_render_state(state);
         }
     } else if (chrome->panel == CHROME_PANEL_PROFILE_DELETE) {
         if (row == 0) {
-            chrome->panel = CHROME_PANEL_PROFILE_MANAGE;
+            chrome_open_internal_panel(state, CHROME_PANEL_PROFILE_MANAGE, FALSE);
         } else if (row == 1) {
             GError *error = NULL;
             int64_t fallback = 0;
@@ -2372,7 +3218,7 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
                 chrome_refresh_pages(chrome, bookmarks);
             } else {
                 char *url = g_strdup(page->url);
-                chrome->panel = CHROME_PANEL_NONE;
+                chrome_close_panel(state);
                 chrome_load_url(state, url, TRUE);
                 g_free(url);
             }
@@ -2382,28 +3228,38 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
                     chrome->panel_page--;
             } else if (chrome->panel_pages && chrome->panel_pages->len == 6)
                 chrome->panel_page++;
+            chrome->panel_scroll_offsets[chrome->panel] = 0;
+            chrome_publish_motion(state, FALSE);
             chrome_refresh_pages(chrome, bookmarks);
         } else if (row == 7) {
             if (bookmarks || x < panel_width / 2)
                 chrome->panel_delete_mode = !chrome->panel_delete_mode;
             else {
-                chrome->panel = CHROME_PANEL_CLEAR_HISTORY;
+                chrome_open_internal_panel(state, CHROME_PANEL_CLEAR_HISTORY, TRUE);
                 chrome_update_render_state(state);
             }
         }
     } else if (chrome->panel == CHROME_PANEL_CLEAR_HISTORY) {
         if (row == 0) {
-            chrome->panel = CHROME_PANEL_HISTORY;
-            chrome_refresh_pages(chrome, FALSE);
+            ChromePanel parent = chrome->dialog_parent == CHROME_PANEL_SETTINGS_PRIVACY
+                ? CHROME_PANEL_SETTINGS_PRIVACY : CHROME_PANEL_HISTORY;
+            chrome_open_internal_panel(state, parent, FALSE);
+            if (parent == CHROME_PANEL_HISTORY)
+                chrome_refresh_pages(chrome, FALSE);
         } else if (row == 1 && !profile_runtime.guest) {
             GError *error = NULL;
             if (!browser_profile_store_clear_visits(profile_runtime.store,
                     profile_runtime.profile.id, &error))
                 g_warning("History clear failed: %s", error ? error->message : "unknown");
             g_clear_error(&error);
-            chrome->panel = CHROME_PANEL_HISTORY;
+            ChromePanel parent = chrome->dialog_parent == CHROME_PANEL_SETTINGS_PRIVACY
+                ? CHROME_PANEL_SETTINGS_PRIVACY : CHROME_PANEL_HISTORY;
+            chrome_open_internal_panel(state, parent, FALSE);
             chrome->panel_page = 0;
-            chrome_refresh_pages(chrome, FALSE);
+            chrome->panel_scroll_offsets[parent] = 0;
+            chrome_publish_motion(state, FALSE);
+            if (parent == CHROME_PANEL_HISTORY)
+                chrome_refresh_pages(chrome, FALSE);
         }
     }
     chrome_update_render_state(state);
@@ -2420,24 +3276,10 @@ static gboolean chrome_handle_tabs_panel_tap(AppState *state, double x, double y
         return FALSE;
 
     if (x < geometry.panel_x || x >= geometry.panel_x + geometry.panel_width) {
-        chrome->panel = CHROME_PANEL_NONE;
+        chrome_close_panel(state);
         chrome_save_state(state);
         chrome_request_frame(state);
         g_print("Chrome tabs: outside dismiss x=%.1f y=%.1f\n", x, y);
-        return TRUE;
-    }
-    if (y < geometry.list_top) {
-        chrome_go_panel_back(state);
-        return TRUE;
-    }
-    if (y >= geometry.footer_top) {
-        if (chrome->tab_count >= MAX_BROWSER_TABS) {
-            g_print("Chrome tabs: new tab disabled count=%d max=%d\n",
-                    chrome->tab_count, MAX_BROWSER_TABS);
-            return TRUE;
-        }
-        g_print("Chrome tabs: new tab x=%.1f y=%.1f\n", x, y);
-        chrome_new_tab(state, chrome->home_url);
         return TRUE;
     }
     if (geometry.list_height <= 0)
@@ -2456,7 +3298,7 @@ static gboolean chrome_handle_tabs_panel_tap(AppState *state, double x, double y
     }
 
     g_print("Chrome tabs: select row=%d active=%d\n", row, chrome->active);
-    chrome->panel = CHROME_PANEL_NONE;
+    chrome_close_panel(state);
     if (row == chrome->active) {
         chrome_save_state(state);
         chrome_request_frame(state);
@@ -2465,10 +3307,96 @@ static gboolean chrome_handle_tabs_panel_tap(AppState *state, double x, double y
     return TRUE;
 }
 
+static gboolean chrome_handle_menu_panel_tap(AppState *state, double x, double y)
+{
+    BrowserChrome *chrome = &state->chrome;
+    if (chrome->panel != CHROME_PANEL_MENU)
+        return FALSE;
+    ChromeMenuGeometry geometry = chrome_menu_geometry(state);
+    if (y < geometry.panel_y)
+        return FALSE;
+
+    if (x < geometry.panel_x || x >= geometry.panel_x + geometry.panel_width
+            || y >= geometry.panel_y + geometry.panel_height) {
+        chrome_close_panel(state);
+        chrome_save_state(state);
+        chrome_request_frame(state);
+        g_print("Chrome menu: outside dismiss x=%.1f y=%.1f\n", x, y);
+        return TRUE;
+    }
+
+    int dots_height = geometry.page_count > 1 ? 14 : 0;
+    int grid_height = MAX(1, geometry.panel_height - dots_height);
+    if (y >= geometry.panel_y + grid_height)
+        return TRUE;
+    double content_x = x - geometry.panel_x + chrome->menu_scroll_offset;
+    int page = CLAMP((int)floor(content_x / geometry.panel_width),
+                     0, geometry.page_count - 1);
+    double page_x = content_x - page * geometry.panel_width;
+    int column = CLAMP((int)floor(page_x * geometry.columns / geometry.panel_width),
+                       0, geometry.columns - 1);
+    int row = CLAMP((int)floor((y - geometry.panel_y) * geometry.rows / grid_height),
+                    0, geometry.rows - 1);
+    int item = page * CHROME_MENU_ITEMS_PER_PAGE + row * geometry.columns + column;
+    if (item < 0 || item >= geometry.item_count)
+        return TRUE;
+
+    g_print("Chrome menu: select item=%d page=%d row=%d column=%d x=%.1f y=%.1f\n",
+            item, page, row, column, x, y);
+    chrome_select_panel_row(state, x, item);
+    return TRUE;
+}
+
+static gboolean chrome_handle_list_panel_tap(AppState *state, double x, double y)
+{
+    BrowserChrome *chrome = &state->chrome;
+    if (!chrome_panel_is_internal_list(chrome->panel))
+        return FALSE;
+
+    ChromeListGeometry geometry = chrome_list_geometry(state, chrome->panel);
+    if (y < geometry.panel_y)
+        return FALSE;
+    if (x < geometry.panel_x || x >= geometry.panel_x + geometry.panel_width
+            || y >= geometry.panel_y + geometry.panel_height)
+        return TRUE;
+
+    if (y < geometry.list_top) {
+        if (x < geometry.panel_x + 72) {
+            g_print("Chrome tap: panel back from=%s x=%.1f y=%.1f\n",
+                    chrome_panel_name(chrome->panel), x, y);
+            chrome_go_panel_back(state);
+        }
+        return TRUE;
+    }
+
+    double content_y = y - geometry.list_top
+        + chrome->panel_scroll_offsets[chrome->panel];
+    int row = (int)floor(content_y / geometry.row_height);
+    if (row >= 0 && row < geometry.line_count) {
+        g_print("Chrome tap: panel=%s row=%d x=%.1f y=%.1f offset=%.1f\n",
+                chrome_panel_name(chrome->panel), row, x, y,
+                chrome->panel_scroll_offsets[chrome->panel]);
+        chrome_select_panel_row(state, x, row);
+    }
+    return TRUE;
+}
+
+static void chrome_request_user_exit(AppState *state)
+{
+    if (!state)
+        return;
+    chrome_save_state(state);
+    chrome_update_render_state(state);
+    runtime_exit_code = CHROME_USER_EXIT_CODE;
+    g_print("Chrome user shutdown requested: exit_code=%d\n", runtime_exit_code);
+    if (main_loop)
+        g_main_loop_quit(main_loop);
+}
+
 static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
 {
     BrowserChrome *chrome = &state->chrome;
-    if (!chrome->enabled)
+    if (!chrome->enabled || state->page_fullscreen)
         return;
     int hidden_hot_zone = chrome_reveal_height();
     if (!chrome->visible && chrome->panel == CHROME_PANEL_NONE && y <= hidden_hot_zone) {
@@ -2481,23 +3409,12 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
     }
 
     int toolbar_y = chrome_toolbar_y(chrome);
-    int panel_y = toolbar_y + chrome->height;
     if (chrome_handle_tabs_panel_tap(state, x, y))
         return;
-    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y && y < panel_y + 22) {
-        g_print("Chrome tap: panel back from=%s x=%.1f y=%.1f\n",
-                chrome_panel_name(chrome->panel), x, y);
-        chrome_go_panel_back(state);
+    if (chrome_handle_menu_panel_tap(state, x, y))
         return;
-    }
-    if (chrome->panel != CHROME_PANEL_NONE && y >= panel_y + 22) {
-        int row = (int)((y - panel_y - 22) / 24);
-        if (row >= 0) {
-            g_print("Chrome tap: panel=%s row=%d x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), row, x, y);
-            chrome_select_panel_row(state, x, row);
-        }
+    if (chrome_handle_list_panel_tap(state, x, y))
         return;
-    }
 
     int hit_height = chrome->height + chrome_toolbar_hit_slop();
     int hit_top = toolbar_y < 0 ? 0 : toolbar_y;
@@ -2514,7 +3431,7 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
         const char *current = tab && tab->url[0]
             ? tab->url
             : (chrome->home_url ? chrome->home_url : default_home_url());
-        chrome->panel = CHROME_PANEL_NONE;
+        chrome_close_panel(state);
         chrome_set_visible(state, TRUE);
         chrome_save_state(state);
         chrome_request_frame(state);
@@ -2545,21 +3462,36 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
         chrome_go_forward(state);
     } else if (index == 2) {
         if (chrome->panel == CHROME_PANEL_TABS)
-            chrome->panel = CHROME_PANEL_NONE;
+            chrome_close_panel(state);
         else
             chrome_open_tabs_panel(state);
         g_print("Chrome tap: tabs panel=%s x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), x, y);
         chrome_save_state(state);
     } else if (index == 3) {
-        g_print("Chrome tap: %s x=%.1f y=%.1f\n", chrome->loading ? "stop" : "reload", x, y);
-        if (chrome->loading)
+        if (chrome_panel_is_overflow_stack(chrome->panel)) {
+            chrome_request_user_exit(state);
+            return;
+        } else if (chrome->panel == CHROME_PANEL_TABS) {
+            if (chrome->tab_count >= MAX_BROWSER_TABS)
+                g_print("Chrome tap: new tab disabled count=%d max=%d x=%.1f y=%.1f\n",
+                        chrome->tab_count, MAX_BROWSER_TABS, x, y);
+            else {
+                g_print("Chrome tap: new tab count=%d x=%.1f y=%.1f\n",
+                        chrome->tab_count, x, y);
+                chrome_new_tab(state, chrome->home_url);
+            }
+        } else if (chrome->loading) {
+            g_print("Chrome tap: stop x=%.1f y=%.1f\n", x, y);
             webkit_web_view_stop_loading(state->web_view);
-        else if (chrome_active_tab(chrome))
+        } else if (chrome_active_tab(chrome)) {
+            g_print("Chrome tap: reload x=%.1f y=%.1f\n", x, y);
             chrome_load_url(state, chrome_active_tab(chrome)->url, FALSE);
+        }
     } else if (index == 4) {
-        chrome->panel = chrome->panel == CHROME_PANEL_MENU ? CHROME_PANEL_NONE : CHROME_PANEL_MENU;
-        chrome->panel_page = 0;
-        chrome->panel_delete_mode = FALSE;
+        if (chrome_panel_is_overflow_stack(chrome->panel))
+            chrome_close_panel(state);
+        else
+            chrome_open_menu_panel(state);
         g_print("Chrome tap: menu panel=%s x=%.1f y=%.1f\n", chrome_panel_name(chrome->panel), x, y);
         chrome_save_state(state);
     }
@@ -2570,7 +3502,7 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
 static gboolean chrome_touch_down_consumes(AppState *state, double x, double y)
 {
     BrowserChrome *chrome = &state->chrome;
-    if (!chrome->enabled)
+    if (!chrome->enabled || state->page_fullscreen)
         return FALSE;
     int hidden_hot_zone = chrome_reveal_height();
     if (!chrome->visible && chrome->panel == CHROME_PANEL_NONE && y <= hidden_hot_zone)
@@ -2590,8 +3522,15 @@ static gboolean chrome_touch_down_consumes(AppState *state, double x, double y)
 static void chrome_note_scroll(AppState *state, double finger_delta_y, guint32 time_ms)
 {
     BrowserChrome *chrome = &state->chrome;
-    if (!chrome->enabled)
+    if (!chrome->enabled || state->page_fullscreen)
         return;
+    if (!chrome->global_settings.toolbar_auto_hide) {
+        if (!chrome->visible && chrome->panel == CHROME_PANEL_NONE) {
+            chrome_set_visible(state, TRUE);
+            chrome_request_frame(state);
+        }
+        return;
+    }
 
     int direction = 0;
     double distance = 0;
@@ -2669,16 +3608,46 @@ static void chrome_load_state(AppState *state, const char *initial_url)
               normalize_site_profile(profile_runtime.profile.site_profile),
               sizeof(chrome->site_profile));
     chrome->cookie_policy = profile_runtime.profile.cookie_policy;
+    g_strlcpy(chrome->search_engine,
+              profile_runtime.profile.search_engine
+                ? profile_runtime.profile.search_engine : "baidu",
+              sizeof(chrome->search_engine));
+    chrome->custom_search_template = g_strdup(
+        profile_runtime.profile.custom_search_template
+            ? profile_runtime.profile.custom_search_template : "");
+    chrome->page_zoom = CLAMP(profile_runtime.profile.page_zoom, 0.75, 1.25);
+    chrome->default_font_size = CLAMP(profile_runtime.profile.default_font_size, 14, 20);
+    chrome->javascript_enabled = profile_runtime.profile.javascript_enabled;
+    chrome->autoplay_requires_gesture = profile_runtime.profile.autoplay_requires_gesture;
+    chrome->smooth_scrolling = profile_runtime.profile.smooth_scrolling;
+    chrome->block_popups = profile_runtime.profile.block_popups;
+    chrome->restore_tabs = profile_runtime.profile.restore_tabs;
+    browser_profile_store_get_global_settings(profile_runtime.store,
+                                              &chrome->global_settings);
     chrome->tab_count = 1;
     chrome->active = 0;
     chrome->next_tab_id = 2;
     chrome->tabs[0].id = 1;
     chrome_set_tab_url(&chrome->tabs[0], initial_url && initial_url[0] ? initial_url : chrome->home_url);
+    chrome->motion.version = WPE_CHROME_MOTION_VERSION;
+    chrome->motion.sequence = 1;
+    chrome->motion.panel = WPE_CHROME_MOTION_PANEL_NONE;
+    chrome->motion.flags = 0;
+    chrome->motion.offset = 0;
+    chrome->pressed_row = -1;
+    chrome->pressed_segment = -1;
+    chrome->pressed_control = -1;
+    chrome->motion.pressed_row = -1;
+    chrome->motion.pressed_segment = -1;
+    chrome->motion.pressed_control = -1;
+    if (state->view)
+        g_object_set_data(G_OBJECT(state->view), WPE_CHROME_MOTION_DATA_KEY,
+                          &chrome->motion);
     g_print("Chrome config: enabled=%d height=%d hide_down=%.1f show_up=%.1f show_min_velocity=%.1f\n",
             chrome->enabled, chrome->height,
             chrome->hide_down_px, chrome->show_up_px, chrome->show_up_min_velocity_px_s);
 
-    if (!profile_runtime.guest && profile_runtime.store) {
+    if (!profile_runtime.guest && profile_runtime.store && chrome->restore_tabs) {
         GError *error = NULL;
         guint next_tab_id = 2;
         GPtrArray *stored_tabs = browser_profile_store_load_tabs(profile_runtime.store,
@@ -2710,10 +3679,16 @@ static void chrome_load_state(AppState *state, const char *initial_url)
         g_clear_error(&error);
         g_clear_pointer(&stored_tabs, g_ptr_array_unref);
     }
-    g_print("Chrome profile state: name=%s guest=%d home=%s site_profile=%s cookie_policy=%s tabs=%d active=%d\n",
+    g_print("Chrome profile state: name=%s guest=%d home=%s site_profile=%s cookie_policy=%s "
+            "search=%s zoom=%.2f font=%u js=%d autoplay_gesture=%d smooth=%d popups_blocked=%d "
+            "restore_tabs=%d theme=%s toolbar_auto_hide=%d tabs=%d active=%d\n",
             profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
             profile_runtime.guest, chrome->home_url,
             chrome->site_profile, browser_cookie_policy_name(chrome->cookie_policy),
+            chrome->search_engine, chrome->page_zoom, chrome->default_font_size,
+            chrome->javascript_enabled, chrome->autoplay_requires_gesture,
+            chrome->smooth_scrolling, chrome->block_popups, chrome->restore_tabs,
+            chrome->global_settings.theme, chrome->global_settings.toolbar_auto_hide,
             chrome->tab_count, chrome->active);
     chrome_update_render_state(state);
 }
@@ -2723,6 +3698,9 @@ static void chrome_destroy(AppState *state)
     if (!state)
         return;
     BrowserChrome *chrome = &state->chrome;
+    chrome_cancel_menu_snap(chrome);
+    if (state->view)
+        g_object_set_data(G_OBJECT(state->view), WPE_CHROME_MOTION_DATA_KEY, NULL);
     if (runtime_exit_code != 75)
         chrome_save_state(state);
     else
@@ -2737,6 +3715,7 @@ static void chrome_destroy(AppState *state)
     g_clear_pointer(&chrome->panel_pages, g_ptr_array_unref);
     g_free(chrome->render_state_path);
     g_free(chrome->home_url);
+    g_free(chrome->custom_search_template);
 }
 
 static void apply_viewport(AppState *state, int width, int height, const char *reason)
@@ -2902,8 +3881,8 @@ static void update_touch_position(AppState *state, TouchSlot *slot)
         break;
     }
 
-    slot->x = clamp_double(tx, 0, 1) * width;
-    slot->y = clamp_double(ty, 0, 1) * height;
+    slot->x = clamp_double(tx, 0, 1) * MAX(0, width - 1);
+    slot->y = clamp_double(ty, 0, 1) * MAX(0, height - 1);
 }
 
 static guint32 input_event_time_ms(const struct input_event *event)
@@ -2944,20 +3923,73 @@ static void schedule_scroll_stop(AppState *state)
     state->scroll_stop_source_id = g_timeout_add(delay, scroll_stop_tick, state);
 }
 
+static gboolean transform_game_video_point(AppState *state, double *x, double *y)
+{
+    if (!state || !x || !y || !state->game_input_active || !state->view)
+        return FALSE;
+
+    const char *value = g_object_get_data(G_OBJECT(state->view), "wpe-video-overlay-input-geometry");
+    if (!value || !value[0])
+        return FALSE;
+
+    int version = 0;
+    char fit[16] = { 0 };
+    int dom_x = 0;
+    int dom_y = 0;
+    int dom_w = 0;
+    int dom_h = 0;
+    int visible_x = 0;
+    int visible_y = 0;
+    int visible_w = 0;
+    int visible_h = 0;
+    if (sscanf(value, "%d,%15[^,],%d,%d,%d,%d,%d,%d,%d,%d",
+            &version, fit, &dom_x, &dom_y, &dom_w, &dom_h,
+            &visible_x, &visible_y, &visible_w, &visible_h) != 10
+        || version != 1 || g_strcmp0(fit, "contain")
+        || dom_w <= 0 || dom_h <= 0 || visible_w <= 0 || visible_h <= 0)
+        return FALSE;
+
+    double visible_max_x = visible_x + visible_w - 1;
+    double visible_max_y = visible_y + visible_h - 1;
+    if (*x < visible_x || *x > visible_max_x
+        || *y < visible_y || *y > visible_max_y)
+        return FALSE;
+
+    double normalized_x = (*x - visible_x) / MAX(1.0, (double)visible_w - 1.0);
+    double normalized_y = (*y - visible_y) / MAX(1.0, (double)visible_h - 1.0);
+    normalized_x = clamp_double(normalized_x, 0, 1);
+    normalized_y = clamp_double(normalized_y, 0, 1);
+    *x = dom_x + normalized_x * MAX(0, dom_w - 1);
+    *y = dom_y + normalized_y * MAX(0, dom_h - 1);
+    return TRUE;
+}
+
+static gboolean uses_native_touch_events(AppState *state)
+{
+    if (!state)
+        return FALSE;
+    return (state->game_input_active || !state->touch_scroll_fallback)
+        && (state->send_touch_events || state->game_input_active);
+}
+
 static void send_touch_event(AppState *state, WPEEventType type, guint32 sequence_id, double x, double y, guint32 time_ms)
 {
     if (!state->send_touch_events && !state->game_input_active)
         return;
 
-    double view_y = web_event_y(state, y);
+    double screen_x = x;
+    double screen_y = y;
+    gboolean video_mapped = transform_game_video_point(state, &x, &y);
+    double view_y = video_mapped ? y : web_event_y(state, y);
     WPEEvent *event = wpe_event_touch_new(type, state->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time_ms, 0, sequence_id, x, view_y);
     wpe_view_event(state->view, event);
     wpe_event_unref(event);
 
     state->touch_event_count++;
-    if (state->touch_event_count <= 8 || !(state->touch_event_count % 80))
-        g_print("Touch event: type=%d seq=%u x=%.1f y=%.1f screen_y=%.1f count=%" G_GUINT64_FORMAT "\n",
-                type, sequence_id, x, view_y, y, state->touch_event_count);
+    if (type == WPE_EVENT_TOUCH_DOWN || type == WPE_EVENT_TOUCH_UP
+        || state->touch_event_count <= 8 || !(state->touch_event_count % 80))
+        g_print("Touch event: type=%d seq=%u x=%.1f y=%.1f screen=%.1f,%.1f video_mapped=%d count=%" G_GUINT64_FORMAT "\n",
+                type, sequence_id, x, view_y, screen_x, screen_y, video_mapped, state->touch_event_count);
 }
 
 static void send_pointer_tap(AppState *state, double x, double y, guint32 time_ms)
@@ -2967,7 +3999,10 @@ static void send_pointer_tap(AppState *state, double x, double y, guint32 time_m
 
     state->last_pointer_tap_us = g_get_monotonic_time();
     wpe_view_focus_in(state->view);
-    double view_y = web_event_y(state, y);
+    double screen_x = x;
+    double screen_y = y;
+    gboolean video_mapped = transform_game_video_point(state, &x, &y);
+    double view_y = video_mapped ? y : web_event_y(state, y);
 
     WPEEvent *move = wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, state->view,
                                                 WPE_INPUT_SOURCE_MOUSE, time_ms,
@@ -2994,7 +4029,8 @@ static void send_pointer_tap(AppState *state, double x, double y, guint32 time_m
         wpe_event_unref(up);
     }
 
-    g_print("Pointer tap: x=%.1f y=%.1f screen_y=%.1f\n", x, view_y, y);
+    g_print("Pointer tap: x=%.1f y=%.1f screen=%.1f,%.1f video_mapped=%d\n",
+            x, view_y, screen_x, screen_y, video_mapped);
 }
 
 static void send_js_scroll_event(AppState *state, double x, double y, double delta_y)
@@ -3190,6 +4226,7 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             continue;
 
         update_touch_position(state, slot);
+        gboolean native_touch = uses_native_touch_events(state);
 
         if (slot->just_down) {
             if (state->native_scroll_source_id) {
@@ -3213,21 +4250,82 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             slot->max_move_sq = 0;
             slot->scrolling = FALSE;
             slot->chrome_consumed = chrome_touch_down_consumes(state, slot->x, slot->y);
-            slot->tabs_scroll_candidate = FALSE;
+            slot->panel_gesture = CHROME_PANEL_GESTURE_NONE;
+            slot->panel_start_offset = 0;
+            slot->panel_velocity = 0;
+            slot->panel_last_time_ms = time_ms;
+            state->chrome.pressed_row = -1;
+            state->chrome.pressed_segment = -1;
+            state->chrome.pressed_control = -1;
             if (slot->chrome_consumed && state->chrome.panel == CHROME_PANEL_TABS) {
                 ChromeTabsGeometry geometry = chrome_tabs_geometry(state);
-                slot->tabs_scroll_candidate = slot->x >= geometry.panel_x
+                if (slot->x >= geometry.panel_x
                     && slot->x < geometry.panel_x + geometry.panel_width
                     && slot->y >= geometry.list_top
-                    && slot->y < geometry.footer_top;
+                    && slot->y < geometry.footer_top) {
+                    slot->panel_gesture = CHROME_PANEL_GESTURE_TABS_VERTICAL;
+                    slot->panel_start_offset = state->chrome.tabs_scroll_offset;
+                    state->chrome.pressed_row = (int)floor(
+                        (slot->y - geometry.list_top
+                         + state->chrome.tabs_scroll_offset) / geometry.row_height);
+                }
+            } else if (slot->chrome_consumed && state->chrome.panel == CHROME_PANEL_MENU) {
+                ChromeMenuGeometry geometry = chrome_menu_geometry(state);
+                if (slot->x >= geometry.panel_x
+                    && slot->x < geometry.panel_x + geometry.panel_width
+                    && slot->y >= geometry.panel_y
+                    && slot->y < geometry.panel_y + geometry.panel_height) {
+                    slot->panel_gesture = CHROME_PANEL_GESTURE_MENU_HORIZONTAL;
+                    slot->panel_start_offset = state->chrome.menu_scroll_offset;
+                    int page_x = (int)floor(slot->x - geometry.panel_x
+                        + state->chrome.menu_scroll_offset);
+                    int page = page_x / MAX(1, geometry.panel_width);
+                    int local_x = page_x % MAX(1, geometry.panel_width);
+                    int column = CLAMP(local_x * geometry.columns
+                        / MAX(1, geometry.panel_width), 0, geometry.columns - 1);
+                    int row = CLAMP((int)(slot->y - geometry.panel_y)
+                        * geometry.rows / MAX(1, geometry.panel_height),
+                        0, geometry.rows - 1);
+                    state->chrome.pressed_row = page
+                        * CHROME_MENU_ITEMS_PER_PAGE + row * geometry.columns + column;
+                    chrome_cancel_menu_snap(&state->chrome);
+                }
+            } else if (slot->chrome_consumed
+                       && chrome_panel_is_internal_list(state->chrome.panel)) {
+                ChromeListGeometry geometry =
+                    chrome_list_geometry(state, state->chrome.panel);
+                if (slot->x >= geometry.panel_x
+                    && slot->x < geometry.panel_x + geometry.panel_width
+                    && slot->y >= geometry.list_top
+                    && slot->y < geometry.list_top + geometry.list_height) {
+                    slot->panel_gesture = CHROME_PANEL_GESTURE_LIST_VERTICAL;
+                    slot->panel_start_offset =
+                        state->chrome.panel_scroll_offsets[state->chrome.panel];
+                    state->chrome.pressed_row = (int)floor(
+                        (slot->y - geometry.list_top
+                         + state->chrome.panel_scroll_offsets[state->chrome.panel])
+                        / geometry.row_height);
+                }
+            } else if (slot->chrome_consumed) {
+                int panel_width = state->panel_width > 0 ? state->panel_width : 960;
+                int button_x = chrome_toolbar_controls_x(panel_width);
+                if (slot->x < chrome_address_right(panel_width))
+                    state->chrome.pressed_control = -2;
+                else if (slot->x >= button_x)
+                    state->chrome.pressed_control = CLAMP(
+                        (int)((slot->x - button_x)
+                            / chrome_toolbar_legacy_button_width(panel_width)),
+                        0, CHROME_TOOLBAR_BUTTON_COUNT - 1);
             }
+            if (slot->chrome_consumed)
+                chrome_publish_motion(state, FALSE);
             g_print("Touch down: raw=%d,%d mapped=%.1f,%.1f chrome=%d visible=%d panel=%s\n",
                     slot->raw_x, slot->raw_y, slot->x, slot->y, slot->chrome_consumed,
                     state->chrome.visible, chrome_panel_name(state->chrome.panel));
-            if (!slot->chrome_consumed && (state->game_input_active || !state->touch_scroll_fallback))
+            if (!slot->chrome_consumed && native_touch)
                 send_touch_event(state, WPE_EVENT_TOUCH_DOWN, i, slot->x, slot->y, time_ms);
         } else if (slot->just_up) {
-            if (!slot->chrome_consumed && (state->game_input_active || !state->touch_scroll_fallback))
+            if (!slot->chrome_consumed && native_touch)
                 send_touch_event(state, WPE_EVENT_TOUCH_UP, i, slot->last_x, slot->last_y, time_ms);
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
             if (slot->chrome_consumed) {
@@ -3235,14 +4333,26 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
                 if (chrome_tap_limit > tap_limit)
                     tap_limit = chrome_tap_limit;
             }
-            if (slot->chrome_consumed && slot->tabs_scroll_candidate && slot->scrolling) {
-                chrome_clamp_tabs_scroll(state);
-                chrome_update_render_state(state);
-                chrome_request_frame(state);
+            if (slot->chrome_consumed && slot->panel_gesture != CHROME_PANEL_GESTURE_NONE
+                    && slot->scrolling) {
+                if (slot->panel_gesture == CHROME_PANEL_GESTURE_TABS_VERTICAL) {
+                    chrome_clamp_tabs_scroll(state);
+                    chrome_publish_motion(state, FALSE);
+                    chrome_update_render_state(state);
+                } else if (slot->panel_gesture == CHROME_PANEL_GESTURE_LIST_VERTICAL) {
+                    chrome_clamp_list_scroll(state, state->chrome.panel);
+                    chrome_publish_motion(state, FALSE);
+                    chrome_update_render_state(state);
+                } else {
+                    double drag_distance = state->chrome.menu_scroll_offset
+                        - slot->panel_start_offset;
+                    chrome_snap_menu(state, slot->panel_start_offset,
+                                     drag_distance, slot->panel_velocity);
+                }
             } else if (!slot->scrolling && slot->max_move_sq <= tap_limit * tap_limit) {
                 if (slot->chrome_consumed)
                     chrome_handle_toolbar_tap(state, slot->last_x, slot->last_y);
-                else if (!state->game_input_active)
+                else if (!native_touch || (state->game_input_active && state->game_pointer_tap_fallback))
                     send_pointer_tap(state, slot->last_x, slot->last_y, time_ms);
             }
             else {
@@ -3257,10 +4367,15 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             }
             slot->scrolling = FALSE;
             slot->chrome_consumed = FALSE;
-            slot->tabs_scroll_candidate = FALSE;
+            slot->panel_gesture = CHROME_PANEL_GESTURE_NONE;
+            slot->panel_velocity = 0;
             slot->tracking_id = -1;
+            state->chrome.pressed_row = -1;
+            state->chrome.pressed_segment = -1;
+            state->chrome.pressed_control = -1;
+            chrome_publish_motion(state, FALSE);
         } else if (slot->active && (slot->x != slot->last_x || slot->y != slot->last_y)) {
-            if (!slot->chrome_consumed && (state->game_input_active || !state->touch_scroll_fallback))
+            if (!slot->chrome_consumed && native_touch)
                 send_touch_event(state, WPE_EVENT_TOUCH_MOVE, i, slot->x, slot->y, time_ms);
             double from_down_x = slot->x - slot->down_x;
             double from_down_y = slot->y - slot->down_y;
@@ -3268,19 +4383,41 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             if (move_sq > slot->max_move_sq)
                 slot->max_move_sq = move_sq;
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
-            if (slot->chrome_consumed && slot->tabs_scroll_candidate) {
+            if (slot->chrome_consumed && slot->panel_gesture != CHROME_PANEL_GESTURE_NONE) {
                 double panel_drag_threshold = env_double("WPE_CHROME_PANEL_DRAG_PX", 8);
-                if (slot->scrolling || slot->max_move_sq > panel_drag_threshold * panel_drag_threshold) {
+                double delta_x = slot->x - slot->last_x;
+                double delta_y = slot->y - slot->last_y;
+                gboolean vertical_gesture =
+                    slot->panel_gesture == CHROME_PANEL_GESTURE_TABS_VERTICAL
+                    || slot->panel_gesture == CHROME_PANEL_GESTURE_LIST_VERTICAL;
+                gboolean direction_matches = vertical_gesture
+                    ? fabs(from_down_y) >= fabs(from_down_x)
+                    : fabs(from_down_x) >= fabs(from_down_y);
+                if (direction_matches
+                    && (slot->scrolling
+                        || slot->max_move_sq > panel_drag_threshold * panel_drag_threshold)) {
                     slot->scrolling = TRUE;
-                    state->chrome.tabs_scroll_offset -= slot->y - slot->last_y;
-                    chrome_clamp_tabs_scroll(state);
-                    gint64 now_us = g_get_monotonic_time();
-                    if (now_us - state->chrome.tabs_scroll_last_publish_us >= 16000) {
-                        state->chrome.tabs_scroll_last_publish_us = now_us;
-                        chrome_update_render_state(state);
-                        chrome_request_frame(state);
+                    state->chrome.pressed_row = -1;
+                    state->chrome.pressed_segment = -1;
+                    state->chrome.pressed_control = -1;
+                    guint32 elapsed_ms = time_ms - slot->panel_last_time_ms;
+                    if (slot->panel_gesture == CHROME_PANEL_GESTURE_TABS_VERTICAL) {
+                        state->chrome.tabs_scroll_offset -= delta_y;
+                        chrome_clamp_tabs_scroll(state);
+                    } else if (slot->panel_gesture
+                               == CHROME_PANEL_GESTURE_LIST_VERTICAL) {
+                        ChromePanel panel = state->chrome.panel;
+                        state->chrome.panel_scroll_offsets[panel] -= delta_y;
+                        chrome_clamp_list_scroll(state, panel);
+                    } else {
+                        state->chrome.menu_scroll_offset -= delta_x;
+                        chrome_clamp_menu_scroll(state);
+                        if (elapsed_ms)
+                            slot->panel_velocity = -delta_x * 1000.0 / elapsed_ms;
                     }
+                    chrome_publish_motion(state, TRUE);
                 }
+                slot->panel_last_time_ms = time_ms;
             } else if (!slot->chrome_consumed && !state->game_input_active) {
                 if (slot->scrolling) {
                     queue_scroll_event(state, slot->x, slot->y, slot->x - slot->last_x, slot->y - slot->last_y, time_ms);
@@ -3435,13 +4572,12 @@ static void setup_raw_touch(AppState *state)
         if (state->touch_active_y_max <= state->touch_active_y_min)
             state->touch_active_y_enabled = FALSE;
     }
-    /* 默认值以 run.sh 为唯一事实来源;此处兜底值必须与 run.sh 的 export 保持一致,
-     * 仅在绕过 run.sh 直接启动本程序时生效。
-     * 注意:生产 run.sh 固定 WPE_SEND_TOUCH_EVENTS=0 且 WPE_TOUCH_SCROLL_FALLBACK=1,
-     * 因此 send_touch_event 原生触摸事件路径仅作为调试开关保留。 */
-    state->send_touch_events = env_enabled("WPE_SEND_TOUCH_EVENTS", FALSE);
+    /* 默认值以 run.sh 为唯一事实来源; 此处仅覆盖绕过 run.sh 的直接启动。
+     * 正常交互必须走 WPE 原生 touch event，不能只依赖鼠标轻点和滚动回退。 */
+    state->send_touch_events = env_enabled("WPE_SEND_TOUCH_EVENTS", TRUE);
     state->synthesize_pointer_tap = env_enabled("WPE_SYNTHESIZE_POINTER_TAP", TRUE);
-    state->touch_scroll_fallback = env_enabled("WPE_TOUCH_SCROLL_FALLBACK", TRUE);
+    state->game_pointer_tap_fallback = env_enabled("WPE_GAME_POINTER_TAP_FALLBACK", FALSE);
+    state->touch_scroll_fallback = env_enabled("WPE_TOUCH_SCROLL_FALLBACK", FALSE);
     state->touch_native_scroll_fallback = env_enabled("WPE_TOUCH_NATIVE_SCROLL", TRUE);
     state->touch_js_scroll_fallback = env_enabled("WPE_TOUCH_JS_SCROLL", FALSE);
     state->touch_horizontal_scroll = env_enabled("WPE_TOUCH_HORIZONTAL_SCROLL", FALSE);
@@ -3455,7 +4591,7 @@ static void setup_raw_touch(AppState *state)
     init_touch_slots(state);
 
     state->touch_source_id = g_unix_fd_add(fd, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL, touch_io_cb, state);
-    g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d touch_rotation=%d touch_offset=%d,%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_invert_y=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
+    g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d touch_rotation=%d touch_offset=%d,%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d game_pointer_tap=%d scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_invert_y=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
             device, fd,
             state->panel_width, state->panel_height, state->panel_rotation,
             state->touch_rotation, state->touch_offset_x, state->touch_offset_y,
@@ -3469,6 +4605,7 @@ static void setup_raw_touch(AppState *state)
             state->touch_active_y_enabled ? state->touch_active_y_max : state->abs_y_max,
             state->touch_swap_xy, state->touch_invert_x, state->touch_invert_y,
             state->send_touch_events, state->synthesize_pointer_tap,
+            state->game_pointer_tap_fallback,
             state->touch_scroll_fallback, state->touch_native_scroll_fallback,
             state->touch_js_scroll_fallback,
             state->touch_horizontal_scroll, state->touch_scroll_invert_y, state->touch_scroll_scale,
@@ -3523,6 +4660,15 @@ static gboolean profile_runtime_initialize(GError **error)
         profile_runtime.profile.home_url = g_strdup(default_home_url());
         profile_runtime.profile.site_profile = g_strdup("mobile");
         profile_runtime.profile.cookie_policy = BROWSER_COOKIE_ACCEPT_NEVER;
+        profile_runtime.profile.search_engine = g_strdup("baidu");
+        profile_runtime.profile.custom_search_template = g_strdup("");
+        profile_runtime.profile.page_zoom = 1.0;
+        profile_runtime.profile.default_font_size = 16;
+        profile_runtime.profile.javascript_enabled = TRUE;
+        profile_runtime.profile.autoplay_requires_gesture = FALSE;
+        profile_runtime.profile.smooth_scrolling = FALSE;
+        profile_runtime.profile.block_popups = TRUE;
+        profile_runtime.profile.restore_tabs = TRUE;
     } else {
         gboolean loaded = FALSE;
         if (override && override[0]) {
@@ -3762,13 +4908,34 @@ static gboolean uri_uses_game_input(const char *uri)
     return matched;
 }
 
-static void update_input_profile_for_uri(AppState *state, const char *uri)
+static void update_page_zoom_for_uri(AppState *state, const char *uri)
+{
+    if (!state || !state->web_view)
+        return;
+
+    double zoom = state->chrome.page_zoom > 0
+        ? state->chrome.page_zoom : 1.0;
+    if (uri_uses_game_input(uri)) {
+        int height = state->panel_height > 0 ? state->panel_height : state->viewport_height;
+        double default_zoom = height > 0 && height <= 300 ? 0.5 : 1.0;
+        zoom = env_double("WPE_CLOUD_GAME_ZOOM", default_zoom);
+        zoom = clamp_double(zoom, 0.25, 2.0);
+    }
+
+    double current_zoom = webkit_web_view_get_zoom_level(state->web_view);
+    if (fabs(current_zoom - zoom) < 0.001)
+        return;
+
+    webkit_web_view_set_zoom_level(state->web_view, zoom);
+    g_print("Page zoom: %.2f -> %.2f uri=%s\n",
+            current_zoom, zoom, uri ? uri : "(null)");
+}
+
+static void set_game_input_active(AppState *state, gboolean game_active,
+                                  const char *reason, const char *uri)
 {
     if (!state)
         return;
-    const char *profile = normalize_input_profile(state->input_profile);
-    gboolean game_active = !g_strcmp0(profile, "game")
-        || (!g_strcmp0(profile, "auto") && uri_uses_game_input(uri));
     if (state->game_input_active == game_active)
         return;
 
@@ -3785,8 +4952,410 @@ static void update_input_profile_for_uri(AppState *state, const char *uri)
     state->pending_native_scroll_y = 0;
     state->scroll_active = FALSE;
     state->game_input_active = game_active;
-    g_print("Input profile: configured=%s active=%s uri=%s\n",
-            profile, game_active ? "game" : "browser", uri ? uri : "(null)");
+
+    if (env_enabled("WPE_GAME_MEDIA_IMMERSIVE", TRUE)) {
+        BrowserChrome *chrome = &state->chrome;
+        if (game_active && !state->game_media_immersive) {
+            state->game_media_immersive = TRUE;
+            state->chrome_visible_before_game_media = chrome->visible;
+            chrome->panel = CHROME_PANEL_NONE;
+            chrome_set_visible(state, FALSE);
+            chrome_update_render_state(state);
+            chrome_apply_layout(state, "game_media_enter");
+            chrome_request_frame(state);
+            g_print("Game media immersive entered: chrome_hidden=1 previous_visible=%d\n",
+                    state->chrome_visible_before_game_media);
+        } else if (!game_active && state->game_media_immersive) {
+            state->game_media_immersive = FALSE;
+            if (!state->page_fullscreen)
+                chrome_set_visible(state, state->chrome_visible_before_game_media);
+            chrome_update_render_state(state);
+            chrome_apply_layout(state, "game_media_leave");
+            chrome_request_frame(state);
+            g_print("Game media immersive left: chrome_visible=%d page_fullscreen=%d\n",
+                    chrome->visible, state->page_fullscreen);
+        }
+    }
+
+    g_print("Input profile: configured=%s active=%s reason=%s uri=%s\n",
+            normalize_input_profile(state->input_profile),
+            game_active ? "game" : "browser",
+            reason ? reason : "unknown",
+            uri ? uri : "(null)");
+}
+
+static void update_input_profile_for_uri(AppState *state, const char *uri)
+{
+    if (!state)
+        return;
+    const char *profile = normalize_input_profile(state->input_profile);
+    /*
+     * Auto mode must preserve browser click semantics on cloud-game landing,
+     * reward and queue pages. The page-side media observer switches to direct
+     * touch only after a real video begins playback.
+     */
+    set_game_input_active(state, !g_strcmp0(profile, "game"),
+                          "navigation", uri);
+}
+
+static gboolean on_game_input_script_message_with_reply(
+    WebKitUserContentManager *manager, JSCValue *value,
+    WebKitScriptMessageReply *reply, gpointer user_data)
+{
+    (void)manager;
+    AppState *state = (AppState *)user_data;
+    if (!state || !value || !reply)
+        return FALSE;
+
+    char *message = jsc_value_to_string(value);
+    GHashTable *params = query_parse_params(message);
+    gboolean active = params_get_bool(params, "active", FALSE);
+    const char *reason = params_get_string(params, "reason",
+                                            active ? "video_playing" : "video_stopped");
+    const char *uri = state->web_view ? webkit_web_view_get_uri(state->web_view) : NULL;
+    const char *profile = normalize_input_profile(state->input_profile);
+
+    if (!g_strcmp0(profile, "auto") && uri_uses_game_input(uri)) {
+        if (state->web_view) {
+            if (active) {
+                double current_zoom = webkit_web_view_get_zoom_level(state->web_view);
+                if (fabs(current_zoom - 1.0) >= 0.001) {
+                    webkit_web_view_set_zoom_level(state->web_view, 1.0);
+                    g_print("Page zoom: %.2f -> 1.00 reason=game_media uri=%s\n",
+                            current_zoom, uri ? uri : "(null)");
+                }
+            } else
+                update_page_zoom_for_uri(state, uri);
+        }
+        set_game_input_active(state, active, reason, uri);
+    } else
+        g_print("Input profile media signal ignored: configured=%s active=%d reason=%s uri=%s\n",
+                profile, active, reason, uri ? uri : "(null)");
+
+    keyboard_reply_message(value, reply, "op=ok");
+    g_hash_table_unref(params);
+    g_free(message);
+    return TRUE;
+}
+
+static gboolean on_cloud_launch_script_message_with_reply(
+    WebKitUserContentManager *manager, JSCValue *value,
+    WebKitScriptMessageReply *reply, gpointer user_data)
+{
+    (void)manager;
+    AppState *state = (AppState *)user_data;
+    if (!state || !value || !reply)
+        return FALSE;
+
+    char *message = jsc_value_to_string(value);
+    GHashTable *params = query_parse_params(message);
+    const char *op = params_get_string(params, "op", "");
+    const char *x_text = params_get_string(params, "x", "");
+    const char *y_text = params_get_string(params, "y", "");
+    const char *top_text = params_get_string(params, "top", "0");
+    const char *host = params_get_string(params, "host", "");
+    const char *tag = params_get_string(params, "tag", "");
+    const char *trusted = params_get_string(params, "trusted", "");
+    char *x_end = NULL;
+    char *y_end = NULL;
+    double css_x = g_ascii_strtod(x_text, &x_end);
+    double css_y = g_ascii_strtod(y_text, &y_end);
+    const char *uri = state->web_view ? webkit_web_view_get_uri(state->web_view) : NULL;
+
+    if (!g_strcmp0(op, "probe")) {
+        g_print("Cloud launch probe: host=%s top=%s\n", host, top_text);
+    } else if (!g_strcmp0(op, "capabilities")) {
+        const char *peer_connection = params_get_string(params, "pc", "0");
+        const char *data_channel = params_get_string(params, "dc", "0");
+        const char *create_data_channel = params_get_string(params, "create", "0");
+        const char *sctp = params_get_string(params, "sctp", "0");
+        g_print("Cloud WebRTC capabilities: host=%s top=%s pc=%s dc=%s create_data_channel=%s sctp=%s\n",
+                host, top_text, peer_connection, data_channel, create_data_channel, sctp);
+    } else if (!g_strcmp0(op, "sdp-application")) {
+        const char *phase = params_get_string(params, "phase", "(none)");
+        const char *max_message_size = params_get_string(params, "max", "(none)");
+        const char *sctp_map = params_get_string(params, "sctpmap", "0");
+        const char *sctp_port = params_get_string(params, "sctpport", "(none)");
+        g_print("Cloud JS SDP application: phase=%s host=%s top=%s sctp_port=%s max_message_size=%s sctpmap=%s\n",
+                phase, host, top_text, sctp_port, max_message_size, sctp_map);
+    } else if (!g_strcmp0(op, "sdp-media")) {
+        const char *phase = params_get_string(params, "phase", "(none)");
+        const char *index = params_get_string(params, "index", "(none)");
+        const char *media = params_get_string(params, "media", "(none)");
+        const char *proto = params_get_string(params, "proto", "(none)");
+        const char *mid = params_get_string(params, "mid", "(none)");
+        const char *direction = params_get_string(params, "direction", "(none)");
+        const char *payloads = params_get_string(params, "payloads", "(none)");
+        const char *extmaps = params_get_string(params, "extmaps", "0");
+        const char *mixed = params_get_string(params, "mixed", "0");
+        const char *rtcp_mux = params_get_string(params, "rtcp_mux", "0");
+        const char *rtcp_rsize = params_get_string(params, "rtcp_rsize", "0");
+        g_print("Cloud JS SDP media: phase=%s index=%s media=%s proto=%s mid=%s direction=%s payloads=%s extmaps=%s mixed=%s rtcp_mux=%s rtcp_rsize=%s\n",
+                phase, index, media, proto, mid, direction, payloads,
+                extmaps, mixed, rtcp_mux, rtcp_rsize);
+    } else if (!g_strcmp0(op, "sdp-codec")) {
+        const char *phase = params_get_string(params, "phase", "(none)");
+        const char *index = params_get_string(params, "index", "(none)");
+        const char *payload = params_get_string(params, "pt", "(none)");
+        const char *rtpmap = params_get_string(params, "rtpmap", "(none)");
+        const char *fmtp = params_get_string(params, "fmtp", "(none)");
+        const char *feedback = params_get_string(params, "fb", "(none)");
+        g_print("Cloud JS SDP codec: phase=%s index=%s pt=%s rtpmap=%s fmtp=%s rtcp_fb=%s\n",
+                phase, index, payload, rtpmap, fmtp, feedback);
+    } else if (!g_strcmp0(op, "rtc-state")) {
+        const char *reason = params_get_string(params, "reason", "(none)");
+        const char *connection = params_get_string(params, "connection", "(none)");
+        const char *ice = params_get_string(params, "ice", "(none)");
+        const char *signaling = params_get_string(params, "signaling", "(none)");
+        const char *gathering = params_get_string(params, "gathering", "(none)");
+        const char *dtls = params_get_string(params, "dtls", "(none)");
+        g_print("Cloud JS RTC state: reason=%s connection=%s ice=%s signaling=%s gathering=%s dtls=%s\n",
+                reason, connection, ice, signaling, gathering, dtls);
+    } else if (!g_strcmp0(op, "click")) {
+        /* Keep the trace structural: page text, URLs and event payloads may be private. */
+        g_print("Cloud page click: host=%s top=%s tag=%s trusted=%s\n",
+                host, top_text, tag, trusted);
+    } else if (g_strcmp0(op, "target") || x_end == x_text || y_end == y_text || !uri_uses_game_input(uri)) {
+        g_print("Cloud launch target ignored: op=%s uri=%s\n", op, uri ? uri : "(null)");
+    } else if (g_strcmp0(top_text, "1")) {
+        g_print("Cloud launch target observed in child frame: host=%s css=%.1f,%.1f\n",
+            host, css_x, css_y);
+    } else if (state->cloud_launch_requested) {
+        g_print("Cloud launch target ignored: already requested css=%.1f,%.1f\n", css_x, css_y);
+    } else if (!state->cloud_autostart) {
+        g_print("Cloud launch target observed: css=%.1f,%.1f auto=off\n", css_x, css_y);
+    } else {
+        double zoom = webkit_web_view_get_zoom_level(state->web_view);
+        double screen_x = css_x * zoom;
+        double screen_y = css_y * zoom + chrome_page_top_inset(state);
+        if (screen_x < 0 || screen_x >= state->viewport_width || screen_y < 0 || screen_y >= state->viewport_height) {
+            g_warning("Cloud launch target rejected: css=%.1f,%.1f zoom=%.2f screen=%.1f,%.1f viewport=%dx%d",
+                css_x, css_y, zoom, screen_x, screen_y, state->viewport_width, state->viewport_height);
+        } else {
+            state->cloud_launch_requested = TRUE;
+            g_print("Cloud launch native tap: css=%.1f,%.1f zoom=%.2f screen=%.1f,%.1f\n",
+                css_x, css_y, zoom, screen_x, screen_y);
+            send_pointer_tap(state, screen_x, screen_y,
+                (guint32)(g_get_monotonic_time() / 1000));
+        }
+    }
+
+    keyboard_reply_message(value, reply, "op=ok");
+    g_hash_table_unref(params);
+    g_free(message);
+    return TRUE;
+}
+
+static void setup_cloud_autostart_user_script(WebKitUserContentManager *manager,
+                                               AppState *state)
+{
+    if (!manager || !state)
+        return;
+
+    g_signal_connect(manager, "script-message-with-reply-received::haasCloudLaunch",
+                     G_CALLBACK(on_cloud_launch_script_message_with_reply), state);
+    if (!webkit_user_content_manager_register_script_message_handler_with_reply(
+            manager, "haasCloudLaunch", NULL))
+        g_warning("Cloud launch script message handler already registered");
+
+    const char *source =
+        "(function(){"
+        "if(window.__haasCloudLaunchInstalled)return;"
+        "window.__haasCloudLaunchInstalled=true;"
+        "if(!/(?:^|\\.)(?:mihoyo\\.com|mihoyocg\\.com)$/.test(location.hostname))return;"
+        "var sent=false,attempts=0;"
+        "function normalized(s){return (s||'').replace(/\\s+/g,'').trim();}"
+        "function post(s){try{Promise.resolve(window.webkit.messageHandlers.haasCloudLaunch.postMessage(s)).catch(function(){});}catch(e){}}"
+        "post('op=probe&host='+encodeURIComponent(location.hostname)+'&top='+(window.top===window?'1':'0'));"
+        "try{"
+        " var pc=typeof window.RTCPeerConnection==='function';"
+        " var dc=typeof window.RTCDataChannel!=='undefined';"
+        " var create=pc&&typeof window.RTCPeerConnection.prototype.createDataChannel==='function';"
+        " var sctp=pc&&'sctp' in window.RTCPeerConnection.prototype;"
+        " post('op=capabilities&pc='+(pc?'1':'0')+'&dc='+(dc?'1':'0')"
+        "  +'&create='+(create?'1':'0')+'&sctp='+(sctp?'1':'0')"
+        "  +'&host='+encodeURIComponent(location.hostname)+'&top='+(window.top===window?'1':'0'));"
+        " function reportSdp(phase,desc){try{"
+        "  var text=desc&&typeof desc.sdp==='string'?desc.sdp:'';"
+        "  var sections=text.split(/(?=^m=)/m);"
+        "  sections.forEach(function(section,index){"
+        "   if(!/^m=/m.test(section))return;"
+        "   var lines=section.split(/\\r?\\n/).filter(Boolean);"
+        "   var m=(lines[0]||'').trim().split(/\\s+/);"
+        "   var media=m[0]&&m[0].slice(2)||'none',proto=m[2]||'none';"
+        "   var payloads=m.slice(3),mid='none',direction='sendrecv',extmaps=0;"
+        "   var mixed=false,rtcpMux=false,rtcpRsize=false;"
+        "   lines.forEach(function(line){"
+        "    var match;"
+        "    if((match=line.match(/^a=mid:(.+)$/)))mid=match[1];"
+        "    else if(/^a=(sendonly|recvonly|inactive|sendrecv)$/.test(line))direction=line.slice(2);"
+        "    else if(/^a=extmap:/.test(line))extmaps++;"
+        "    else if(line==='a=extmap-allow-mixed')mixed=true;"
+        "    else if(line==='a=rtcp-mux')rtcpMux=true;"
+        "    else if(line==='a=rtcp-rsize')rtcpRsize=true;"
+        "   });"
+        "   post('op=sdp-media&phase='+encodeURIComponent(phase)"
+        "    +'&index='+index+'&media='+encodeURIComponent(media)"
+        "    +'&proto='+encodeURIComponent(proto)+'&mid='+encodeURIComponent(mid)"
+        "    +'&direction='+encodeURIComponent(direction)"
+        "    +'&payloads='+encodeURIComponent(payloads.join(','))"
+        "    +'&extmaps='+extmaps+'&mixed='+(mixed?'1':'0')"
+        "    +'&rtcp_mux='+(rtcpMux?'1':'0')+'&rtcp_rsize='+(rtcpRsize?'1':'0'));"
+        "   payloads.forEach(function(pt){"
+        "    var escaped=String(pt).replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');"
+        "    var rtp=(section.match(new RegExp('(?:^|\\\\r?\\\\n)a=rtpmap:'+escaped+'[ \\\\t]+([^\\\\r\\\\n]+)','m'))||[])[1]||'none';"
+        "    var fmtp=(section.match(new RegExp('(?:^|\\\\r?\\\\n)a=fmtp:'+escaped+'[ \\\\t]+([^\\\\r\\\\n]+)','m'))||[])[1]||'none';"
+        "    var fb=[];"
+        "    section.replace(new RegExp('(?:^|\\\\r?\\\\n)a=rtcp-fb:'+escaped+'[ \\\\t]+([^\\\\r\\\\n]+)','gm'),function(_,value){fb.push(value);return _;});"
+        "    post('op=sdp-codec&phase='+encodeURIComponent(phase)"
+        "     +'&index='+index+'&pt='+encodeURIComponent(pt)"
+        "     +'&rtpmap='+encodeURIComponent(rtp)+'&fmtp='+encodeURIComponent(fmtp)"
+        "     +'&fb='+encodeURIComponent(fb.join(',')));"
+        "   });"
+        "  });"
+        "  var app=(text.match(/(?:^|\\r?\\n)m=application[^]*?(?=\\r?\\nm=|$)/)||[''])[0];"
+        "  if(!app)return;"
+        "  var port=(app.match(/(?:^|\\r?\\n)a=sctp-port:(\\d+)/)||[])[1]||'none';"
+        "  var max=(app.match(/(?:^|\\r?\\n)a=max-message-size:(\\d+)/)||[])[1]||'none';"
+        "  var legacy=/(?:^|\\r?\\n)a=sctpmap:/m.test(app);"
+        "  post('op=sdp-application&phase='+encodeURIComponent(phase)"
+        "   +'&sctpport='+encodeURIComponent(port)+'&max='+encodeURIComponent(max)"
+        "   +'&sctpmap='+(legacy?'1':'0')+'&host='+encodeURIComponent(location.hostname)"
+        "   +'&top='+(window.top===window?'1':'0'));"
+        " }catch(e){}}"
+        " function observePc(peer){try{"
+        "  if(!peer||peer.__haasRtcStateObserved)return;"
+        "  peer.__haasRtcStateObserved=true;"
+        "  var last='';"
+        "  function reportState(reason){try{"
+        "   var dtls=peer.sctp&&peer.sctp.transport?peer.sctp.transport.state:'none';"
+        "   var snapshot=[peer.connectionState,peer.iceConnectionState,peer.signalingState,"
+        "    peer.iceGatheringState,dtls].join('|');"
+        "   if(reason==='poll'&&snapshot===last)return; last=snapshot;"
+        "   post('op=rtc-state&reason='+encodeURIComponent(reason)"
+        "    +'&connection='+encodeURIComponent(peer.connectionState||'none')"
+        "    +'&ice='+encodeURIComponent(peer.iceConnectionState||'none')"
+        "    +'&signaling='+encodeURIComponent(peer.signalingState||'none')"
+        "    +'&gathering='+encodeURIComponent(peer.iceGatheringState||'none')"
+        "    +'&dtls='+encodeURIComponent(dtls));"
+        "  }catch(e){}}"
+        "  ['connectionstatechange','iceconnectionstatechange','signalingstatechange',"
+        "   'icegatheringstatechange'].forEach(function(name){"
+        "    peer.addEventListener(name,function(){reportState(name);});"
+        "  });"
+        "  var ticks=0,timer=setInterval(function(){"
+        "   reportState('poll'); if(++ticks>=120)clearInterval(timer);"
+        "  },250);"
+        "  reportState('attach');"
+        " }catch(e){}}"
+        " if(pc){"
+        "  var proto=window.RTCPeerConnection.prototype;"
+        "  if(!proto.__haasSdpWrapped){"
+        "   proto.__haasSdpWrapped=true;"
+        "   var setRemote=proto.setRemoteDescription;"
+        "   proto.setRemoteDescription=function(desc){observePc(this);reportSdp('remote',desc);return setRemote.apply(this,arguments);};"
+        "   var setLocal=proto.setLocalDescription;"
+        "   proto.setLocalDescription=function(desc){observePc(this);reportSdp('local',desc);return setLocal.apply(this,arguments);};"
+        "  }"
+        " }"
+        "}catch(e){}"
+        "document.addEventListener('click',function(e){"
+        " var t=e.target||{},tag=String(t.tagName||'').slice(0,24);"
+        " post('op=click&tag='+encodeURIComponent(tag)+'&trusted='+(e.isTrusted?'1':'0')"
+        "  +'&host='+encodeURIComponent(location.hostname)+'&top='+(window.top===window?'1':'0'));"
+        "},true);"
+        "function report(el,r){"
+        " if(sent)return; sent=true;"
+        " var payload='op=target&x='+encodeURIComponent(String(r.left+r.width/2))"
+        "+'&y='+encodeURIComponent(String(r.top+r.height/2))"
+        "+'&tag='+encodeURIComponent(el.tagName||'')"
+        "+'&host='+encodeURIComponent(location.hostname)"
+        "+'&top='+(window.top===window?'1':'0');"
+        " post(payload);"
+        "}"
+        "function find(){"
+        " attempts++; var nodes=document.querySelectorAll('button,[role=button],[role=link],a,div');"
+        " for(var i=0;i<nodes.length&&i<1200;i++){var el=nodes[i];"
+        "  if(normalized(el.innerText||el.textContent)!=='进入游戏')continue;"
+        "  if(el.disabled||el.getAttribute('aria-disabled')==='true')continue;"
+        "  var r=el.getBoundingClientRect();"
+        "  if(r.width>=48&&r.height>=16&&r.right>0&&r.bottom>0&&r.left<innerWidth&&r.top<innerHeight){report(el,r);return;}"
+        " }"
+        " if(attempts>=80)clearInterval(window.__haasCloudLaunchTimer);"
+        "}"
+        "window.__haasCloudLaunchTimer=setInterval(find,250);find();"
+        "})();";
+    WebKitUserScript *script = webkit_user_script_new(source,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+        NULL,
+        NULL);
+    webkit_user_content_manager_add_script(manager, script);
+    webkit_user_script_unref(script);
+    g_print("Cloud launch observer installed: auto=%d\n", state->cloud_autostart);
+}
+
+static void setup_game_input_user_script(WebKitUserContentManager *manager,
+                                         AppState *state)
+{
+    if (!manager || !state)
+        return;
+
+    g_signal_connect(manager, "script-message-with-reply-received::haasGameInput",
+                     G_CALLBACK(on_game_input_script_message_with_reply), state);
+    if (!webkit_user_content_manager_register_script_message_handler_with_reply(
+            manager, "haasGameInput", NULL))
+        g_warning("Game input script message handler already registered");
+
+    const char *source =
+        "(function(){"
+        "if(window.__haasGameInputInstalled)return;"
+        "window.__haasGameInputInstalled=true;"
+        "window.__haasGameInputActive=false;"
+        "window.__haasGameInputTimer=0;"
+        "function post(active,reason){"
+        " if(window.__haasGameInputActive===active)return;"
+        " window.__haasGameInputActive=active;"
+        " try{Promise.resolve(window.webkit.messageHandlers.haasGameInput.postMessage("
+        "  'active='+(active?'1':'0')+'&reason='+encodeURIComponent(reason)"
+        " )).catch(function(){});}catch(e){}"
+        "}"
+        "function playing(){"
+        " var list=document.getElementsByTagName('video');"
+        " for(var i=0;i<list.length;i++){var v=list[i];"
+        "  if(!v.paused&&!v.ended&&v.readyState>=2&&v.videoWidth>0&&v.videoHeight>0)return true;"
+        " }"
+        " return false;"
+        "}"
+        "function scan(reason){"
+        " clearTimeout(window.__haasGameInputTimer);"
+        " if(playing()){post(true,reason||'video_playing');return;}"
+        " if(window.__haasGameInputActive)window.__haasGameInputTimer=setTimeout(function(){"
+        "  if(!playing())post(false,'video_stopped');"
+        " },1500);"
+        "}"
+        "document.addEventListener('play',function(e){"
+        " if(e.target&&e.target.tagName==='VIDEO')scan('video_playing');"
+        "},true);"
+        "document.addEventListener('playing',function(e){"
+        " if(e.target&&e.target.tagName==='VIDEO')scan('video_playing');"
+        "},true);"
+        "document.addEventListener('pause',function(e){"
+        " if(e.target&&e.target.tagName==='VIDEO')scan('video_paused');"
+        "},true);"
+        "document.addEventListener('ended',function(e){"
+        " if(e.target&&e.target.tagName==='VIDEO')scan('video_ended');"
+        "},true);"
+        "setInterval(function(){scan('video_poll');},1000);"
+        "})();";
+    WebKitUserScript *script = webkit_user_script_new(source,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+        NULL,
+        NULL);
+    webkit_user_content_manager_add_script(manager, script);
+    webkit_user_script_unref(script);
+    g_print("Game input media observer installed\n");
 }
 
 static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer user_data) {
@@ -3800,8 +5369,10 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
     BrowserChrome *chrome = &state->chrome;
     BrowserTab *tab = chrome_active_tab(chrome);
     const char *uri = webkit_web_view_get_uri(web_view);
-    if (load_event == WEBKIT_LOAD_STARTED || load_event == WEBKIT_LOAD_REDIRECTED || load_event == WEBKIT_LOAD_COMMITTED)
+    if (load_event == WEBKIT_LOAD_STARTED || load_event == WEBKIT_LOAD_REDIRECTED || load_event == WEBKIT_LOAD_COMMITTED) {
         update_input_profile_for_uri(state, uri);
+        update_page_zoom_for_uri(state, uri);
+    }
     if (tab && uri && uri[0] && g_strcmp0(tab->url, uri)) {
         if (!chrome->suppress_history && tab->url[0]) {
             history_push(tab->back, &tab->back_count, tab->url);
@@ -3876,6 +5447,52 @@ static void on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointe
     }
 }
 
+static gboolean on_enter_fullscreen(WebKitWebView *web_view, gpointer user_data)
+{
+    (void)web_view;
+    AppState *state = user_data;
+    if (!state || state->page_fullscreen)
+        return FALSE;
+
+    BrowserChrome *chrome = &state->chrome;
+    state->page_fullscreen = TRUE;
+    state->chrome_visible_before_fullscreen = chrome->visible;
+    chrome->panel = CHROME_PANEL_NONE;
+    chrome->visible = FALSE;
+    chrome->transition_us = 0;
+    chrome->scroll_accum = 0;
+    chrome->scroll_velocity_peak = 0;
+    chrome->scroll_direction = 0;
+    chrome_update_render_state(state);
+    chrome_apply_layout(state, "page_fullscreen_enter");
+    chrome_request_frame(state);
+    g_print("Page fullscreen entered: chrome_hidden=1 previous_visible=%d\n",
+            state->chrome_visible_before_fullscreen);
+    return FALSE;
+}
+
+static gboolean on_leave_fullscreen(WebKitWebView *web_view, gpointer user_data)
+{
+    (void)web_view;
+    AppState *state = user_data;
+    if (!state || !state->page_fullscreen)
+        return FALSE;
+
+    state->page_fullscreen = FALSE;
+    state->chrome.panel = CHROME_PANEL_NONE;
+    if (state->game_media_immersive) {
+        state->game_media_immersive = FALSE;
+        state->chrome_visible_before_game_media = TRUE;
+        chrome_set_visible(state, TRUE);
+    } else
+        chrome_set_visible(state, state->chrome_visible_before_fullscreen);
+    chrome_update_render_state(state);
+    chrome_apply_layout(state, "page_fullscreen_leave");
+    chrome_request_frame(state);
+    g_print("Page fullscreen left: chrome_visible=%d\n", state->chrome.visible);
+    return FALSE;
+}
+
 static gboolean print_view_state(gpointer user_data) {
     AppState *state = (AppState *)user_data;
     WPEView *view = state->view;
@@ -3886,13 +5503,14 @@ static gboolean print_view_state(gpointer user_data) {
     int top_height = 0;
     if (state->toplevel)
         wpe_toplevel_get_size(state->toplevel, &top_width, &top_height);
-    g_print("View state: size=%dx%d top=%dx%d visible=%d mapped=%d focus=%d frame=%" G_GUINT64_FORMAT " touch=%" G_GUINT64_FORMAT " scroll=%" G_GUINT64_FORMAT " title=%s uri=%s\n",
+    g_print("View state: size=%dx%d top=%dx%d visible=%d mapped=%d focus=%d fullscreen=%d frame=%" G_GUINT64_FORMAT " touch=%" G_GUINT64_FORMAT " scroll=%" G_GUINT64_FORMAT " title=%s uri=%s\n",
             wpe_view_get_width(view),
             wpe_view_get_height(view),
             top_width, top_height,
             wpe_view_get_visible(view),
             wpe_view_get_mapped(view),
             wpe_view_get_has_focus(view),
+            state->page_fullscreen,
             frame_count,
             state->touch_event_count,
             state->scroll_event_count,
@@ -4364,37 +5982,60 @@ int main(int argc, char **argv) {
     }
 
     /* 2. Create WebView (this internally creates WPEView + WPEToplevel) */
-    /* 单任务设备的内存防线：上限按物理内存动态计算（55%，1GB 机型约 560MB），
-     * 超限×0.92 主动 shrinkOrDie 自杀重启（由 on_web_process_terminated 崩溃
-     * 重载接管恢复）。写死 300MB 在抖音这类重站上会触发杀→重载循环。 */
-    guint memory_limit_mb = 675;
+    /*
+     * MiniApp 自身在部分 1GB SKU 上固定占用约 340MB，其中约 185MB 是 card1
+     * framebuffer 映射。WebProcess 不能再按“独占整机”预算内存，否则内核会
+     * 先杀 MiniApp 生命周期宿主。低内存设备给 WebProcess 340MB，并在到达
+     * kill 阈值前主动回收；更大内存设备仍按物理内存比例扩展。
+     */
+    guint memory_limit_mb = 340;
+    guint64 total_mb = 0;
     {
         struct sysinfo si;
         if (sysinfo(&si) == 0 && si.totalram > 0) {
-            guint64 total_mb = (guint64)si.totalram * si.mem_unit / (1024 * 1024);
-            /* 68%：bilibili/抖音这类重站实测稳态 ~620MB，55%（kill≈500MB）会
-             * 30s 一轮杀→重载循环。设备有 512MB swap 且浏览器 oom_score_adj
-             * 已置 -600，物理内存吃紧时由 swap 与其他进程让位。 */
-            memory_limit_mb = (guint)(total_mb * 68 / 100);
-            if (memory_limit_mb < 192)
-                memory_limit_mb = 192;
+            total_mb = (guint64)si.totalram * si.mem_unit / (1024 * 1024);
+            if (total_mb > 1536)
+                memory_limit_mb = (guint)MIN(total_mb * 45 / 100, 768);
         }
+    }
+    const char *memory_limit_override = g_getenv("WPE_WEB_PROCESS_MEMORY_LIMIT_MB");
+    if (memory_limit_override && memory_limit_override[0]) {
+        char *end = NULL;
+        guint64 parsed = g_ascii_strtoull(memory_limit_override, &end, 10);
+        if (end != memory_limit_override && !*end && parsed >= 192 && parsed <= 2048)
+            memory_limit_mb = (guint)parsed;
+        else
+            g_warning("Ignoring invalid WPE_WEB_PROCESS_MEMORY_LIMIT_MB=%s", memory_limit_override);
     }
     WebKitMemoryPressureSettings *memory_pressure = webkit_memory_pressure_settings_new();
     webkit_memory_pressure_settings_set_memory_limit(memory_pressure, memory_limit_mb);
     /* setter 断言要求 conservative < strict < kill，必须先抬高 strict 再设 conservative */
-    webkit_memory_pressure_settings_set_strict_threshold(memory_pressure, 0.7);
-    webkit_memory_pressure_settings_set_conservative_threshold(memory_pressure, 0.5);
-    webkit_memory_pressure_settings_set_kill_threshold(memory_pressure, 0.92);
+    webkit_memory_pressure_settings_set_strict_threshold(memory_pressure, 0.65);
+    webkit_memory_pressure_settings_set_conservative_threshold(memory_pressure, 0.45);
+    webkit_memory_pressure_settings_set_kill_threshold(memory_pressure, 0.90);
     WebKitWebContext *context = g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", memory_pressure,
         NULL);
-    webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
+    WebKitCacheModel cache_model = total_mb && total_mb <= 1536
+        ? WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER
+        : WEBKIT_CACHE_MODEL_WEB_BROWSER;
+    const char *cache_model_name = g_getenv("WPE_WEBKIT_CACHE_MODEL");
+    if (cache_model_name && !g_ascii_strcasecmp(cache_model_name, "document-viewer"))
+        cache_model = WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER;
+    else if (cache_model_name && !g_ascii_strcasecmp(cache_model_name, "document-browser"))
+        cache_model = WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER;
+    else if (cache_model_name && !g_ascii_strcasecmp(cache_model_name, "web-browser"))
+        cache_model = WEBKIT_CACHE_MODEL_WEB_BROWSER;
+    webkit_web_context_set_cache_model(context, cache_model);
     webkit_web_context_add_path_to_sandbox(context, "/userdisk", TRUE);
     webkit_web_context_add_path_to_sandbox(context, "/tmp", FALSE);
-    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=document_browser mem_limit=%uMB kill=0.92\n", memory_limit_mb);
+    const char *cache_model_log = cache_model == WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER ? "document-viewer"
+        : cache_model == WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER ? "document-browser" : "web-browser";
+    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=%s total_ram=%" G_GUINT64_FORMAT "MB mem_limit=%uMB kill=0.90\n",
+        cache_model_log, total_mb, memory_limit_mb);
     WebKitSettings *settings = webkit_settings_new();
-    webkit_settings_set_enable_javascript(settings, TRUE);
+    webkit_settings_set_enable_javascript(settings,
+                                          profile_runtime.profile.javascript_enabled);
     webkit_settings_set_enable_javascript_markup(settings, TRUE);
     webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
     webkit_settings_set_enable_webgl(settings, gpu_render_profile);
@@ -4402,11 +6043,19 @@ int main(int argc, char **argv) {
     webkit_settings_set_enable_media(settings, TRUE);
     webkit_settings_set_enable_webaudio(settings, TRUE);
     webkit_settings_set_enable_mediasource(settings, TRUE);
+    webkit_settings_set_enable_fullscreen(settings, TRUE);
     gboolean webrtc_enabled = env_enabled("WPE_WEBRTC", TRUE);
     webkit_settings_set_enable_media_stream(settings, webrtc_enabled);
     webkit_settings_set_enable_webrtc(settings, webrtc_enabled);
-    webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
+    webkit_settings_set_media_playback_requires_user_gesture(
+        settings, profile_runtime.profile.autoplay_requires_gesture);
     webkit_settings_set_media_playback_allows_inline(settings, TRUE);
+    webkit_settings_set_default_font_size(
+        settings, CLAMP(profile_runtime.profile.default_font_size, 14, 20));
+    webkit_settings_set_enable_smooth_scrolling(
+        settings, profile_runtime.profile.smooth_scrolling);
+    webkit_settings_set_javascript_can_open_windows_automatically(
+        settings, !profile_runtime.profile.block_popups);
     /* 移动 UA：不设时 WPE 默认桌面 UA，抖音/百度会喂桌面版页面，
      * 对 960x266 小屏是数倍的排版/内存/脚本开销（日志曾证实加载
      * www.douyin.com 桌面版）。 */
@@ -4429,9 +6078,6 @@ int main(int argc, char **argv) {
             g_getenv("WPE_WEBRTC_CAPTURE") ? g_getenv("WPE_WEBRTC_CAPTURE") : "deny",
             webkit_settings_get_user_agent(settings));
     WebKitUserContentManager *user_content_manager = webkit_user_content_manager_new();
-    WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
-        "autoplay", WEBKIT_AUTOPLAY_ALLOW,
-        NULL);
     webkit_network_session_set_memory_pressure_settings(memory_pressure);
     webkit_memory_pressure_settings_free(memory_pressure);
     WebKitNetworkSession *network_session = profile_network_session_new();
@@ -4439,7 +6085,6 @@ int main(int argc, char **argv) {
         g_printerr("Failed to create isolated WebKit network session\n");
         g_object_unref(user_content_manager);
         g_object_unref(settings);
-        g_object_unref(policies);
         g_object_unref(context);
         g_object_unref(display);
         profile_runtime_destroy();
@@ -4450,11 +6095,9 @@ int main(int argc, char **argv) {
         "network-session", network_session,
         "settings", settings,
         "user-content-manager", user_content_manager,
-        "website-policies", policies,
         "display", display,
         NULL);
     g_object_unref(settings);
-    g_object_unref(policies);
 
     /* 基底背景保持默认白：大量页面不设自身背景色、依赖 UA 默认白底，
      * 设黑会让这类页面整页变黑（m.baidu.com 实测回归）。inset 布局下
@@ -4496,26 +6139,32 @@ int main(int argc, char **argv) {
         state->web_view = web_view;
         state->network_session = network_session;
         state->touch_fd = -1;
+        state->cloud_autostart = env_enabled("WPE_CLOUD_AUTOSTART", FALSE);
         state->viewport_width = width;
         state->viewport_height = height;
         chrome_load_state(state, url);
         g_strlcpy(state->input_profile, normalize_input_profile(g_getenv("WPE_INPUT_PROFILE")), sizeof(state->input_profile));
         const char *initial_input_uri = chrome_active_tab(&state->chrome) && chrome_active_tab(&state->chrome)->url[0]
             ? chrome_active_tab(&state->chrome)->url : url;
-        state->game_input_active = !g_strcmp0(state->input_profile, "game")
-            || (!g_strcmp0(state->input_profile, "auto") && uri_uses_game_input(initial_input_uri));
-        g_print("Input profile: configured=%s active=%s uri=%s\n",
+        state->game_input_active = !g_strcmp0(state->input_profile, "game");
+        g_print("Input profile: configured=%s active=%s reason=initial uri=%s\n",
                 state->input_profile, state->game_input_active ? "game" : "browser",
                 initial_input_uri ? initial_input_uri : "(null)");
-        chrome_apply_site_profile(state);
+        chrome_apply_web_preferences(state, FALSE);
         setup_keyboard_bridge(state);
         setup_keyboard_user_script(user_content_manager, state);
+        setup_cloud_autostart_user_script(user_content_manager, state);
+        setup_game_input_user_script(user_content_manager, state);
         g_signal_connect(web_view, "load-changed",
                          G_CALLBACK(on_load_changed), state);
         g_signal_connect(web_view, "notify::estimated-load-progress",
                          G_CALLBACK(on_estimated_load_progress_changed), state);
         g_signal_connect(web_view, "notify::title",
                          G_CALLBACK(on_title_changed), state);
+        g_signal_connect(web_view, "enter-fullscreen",
+                         G_CALLBACK(on_enter_fullscreen), state);
+        g_signal_connect(web_view, "leave-fullscreen",
+                         G_CALLBACK(on_leave_fullscreen), state);
 
         if (top_width > 0 && top_height > 0 && (width != top_width || height != top_height))
             wpe_view_resized(wpe_view, top_width, top_height);
@@ -4548,8 +6197,13 @@ int main(int argc, char **argv) {
 
     /* 4. Load URL */
     const char *startup_url = url;
-    if (state && chrome_active_tab(&state->chrome) && chrome_active_tab(&state->chrome)->url[0])
+    gboolean force_startup_url = env_enabled("WPE_START_URL_OVERRIDE", FALSE);
+    if (!force_startup_url && state && chrome_active_tab(&state->chrome) && chrome_active_tab(&state->chrome)->url[0])
         startup_url = chrome_active_tab(&state->chrome)->url;
+    if (force_startup_url)
+        g_print("Startup URL override: %s\n", startup_url);
+    if (state)
+        update_page_zoom_for_uri(state, startup_url);
     g_print("Loading %s...\n", startup_url);
     load_uri_preserving_local_html(web_view, startup_url);
 

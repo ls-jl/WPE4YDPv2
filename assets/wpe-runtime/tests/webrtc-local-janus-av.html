@@ -1,0 +1,221 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Janus H264 Opus Starting</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #080b10;
+      color: #fff;
+      font: 14px sans-serif;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+
+    #status {
+      position: fixed;
+      left: 8px;
+      top: 8px;
+      z-index: 2;
+      max-width: calc(100% - 16px);
+      padding: 5px 7px;
+      background: rgba(0, 0, 0, 0.78);
+      white-space: pre-wrap;
+    }
+  </style>
+  <script src="adapter.min.js"></script>
+  <script src="janus.js"></script>
+</head>
+<body>
+  <div id="status">initializing</div>
+  <video id="remoteVideo" autoplay playsinline></video>
+  <script>
+    const JANUS_URL = 'http://192.168.100.118:8088/janus';
+    const params = new URLSearchParams(location.search);
+    const STREAM_ID = Number(params.get('stream') || 901);
+    const VIDEO_ONLY = params.get('videoOnly') === '1';
+    const statusNode = document.getElementById('status');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const remoteStream = new MediaStream();
+    let janus = null;
+    let streaming = null;
+    let connected = false;
+    let failed = false;
+    let videoTrack = false;
+    let audioTrack = false;
+    let videoPackets = 0;
+    let videoFrames = 0;
+    let audioPackets = 0;
+    let playbackRequested = false;
+
+    // Keep one MediaStream object bound for the whole session. Reassigning
+    // srcObject when each remote track arrives rebuilds WebKit's media player
+    // while the first H.264 keyframe is being delivered.
+    remoteVideo.srcObject = remoteStream;
+
+    function log(message) {
+      statusNode.textContent = message;
+      console.log(`LOCAL_JANUS_AV ${message}`);
+    }
+
+    function fail(error) {
+      if (failed)
+        return;
+      failed = true;
+      const message = error && error.message ? error.message : String(error);
+      document.title = 'FAIL Local Janus H264 Opus';
+      log(`FAIL ${message}`);
+    }
+
+    function ensurePlayback() {
+      if (playbackRequested)
+        return;
+      playbackRequested = true;
+      setTimeout(() => {
+        playbackRequested = false;
+        remoteVideo.play().catch((error) => {
+          if (error && error.name === 'AbortError')
+            return;
+          fail(error);
+        });
+      }, 0);
+    }
+
+    function attachStreamingPlugin() {
+      janus.attach({
+        plugin: 'janus.plugin.streaming',
+        opaqueId: `wpe-local-${Janus.randomString(12)}`,
+        success(pluginHandle) {
+          streaming = pluginHandle;
+          log(`plugin attached; requesting stream ${STREAM_ID}`);
+          streaming.send({ message: { request: 'watch', id: STREAM_ID } });
+        },
+        error: fail,
+        iceState(state) {
+          log(`ice=${state}`);
+        },
+        webrtcState(up) {
+          connected = connected || up;
+          log(`webrtc=${up ? 'up' : 'down'}`);
+        },
+        onmessage(message, jsep) {
+          if (message.error) {
+            fail(new Error(message.error));
+            return;
+          }
+          if (!jsep)
+            return;
+          console.log(`LOCAL_JANUS_AV remote offer SDP\n${jsep.sdp || ''}`);
+          streaming.createAnswer({
+            jsep,
+            tracks: VIDEO_ONLY ? [
+              { type: 'audio', recv: false },
+              { type: 'video', recv: true },
+              { type: 'data' }
+            ] : [{ type: 'data' }],
+            success(answer) {
+              console.log(`LOCAL_JANUS_AV local answer SDP\n${answer.sdp || ''}`);
+              log('answer created; starting stream');
+              streaming.send({ message: { request: 'start' }, jsep: answer });
+            },
+            error: fail
+          });
+        },
+        onremotetrack(track, mid, on) {
+          console.log(`LOCAL_JANUS_AV remote-event kind=${track.kind} id=${track.id} mid=${mid} on=${on} ready=${track.readyState}`);
+          if (VIDEO_ONLY && track.kind === 'audio')
+            return;
+          if (!on) {
+            // Janus emits transient off/on pairs while finalizing the remote
+            // description. Removing a still-live track here tears down the
+            // MediaStream player during the first H.264 keyframe.
+            if (track.readyState === 'ended' && remoteStream.getTracks().includes(track))
+              remoteStream.removeTrack(track);
+            return;
+          }
+          if (!remoteStream.getTracks().includes(track))
+            remoteStream.addTrack(track);
+          videoTrack = videoTrack || track.kind === 'video';
+          audioTrack = audioTrack || track.kind === 'audio';
+          ensurePlayback();
+          log(`remote=${track.kind} mid=${mid} tracks=${remoteStream.getTracks().map(item => item.kind).join(',')}`);
+        },
+        oncleanup() {
+          if (!failed)
+            log('cleanup');
+        }
+      });
+    }
+
+    async function collectStats() {
+      const pc = streaming && streaming.webrtcStuff && streaming.webrtcStuff.pc;
+      if (!pc || typeof pc.getStats !== 'function')
+        return;
+      const reports = await pc.getStats();
+      reports.forEach((report) => {
+        if (report.type !== 'inbound-rtp' || report.isRemote)
+          return;
+        const kind = report.kind || report.mediaType;
+        if (kind === 'video') {
+          videoPackets = Number(report.packetsReceived || 0);
+          videoFrames = Number(report.framesDecoded || report.framesReceived || 0);
+        } else if (kind === 'audio')
+          audioPackets = Number(report.packetsReceived || 0);
+      });
+    }
+
+    setInterval(async () => {
+      try {
+        await collectStats();
+      } catch (error) {
+        console.warn(`LOCAL_JANUS_AV stats failed: ${error}`);
+      }
+      const state = `connected=${connected} videoTrack=${videoTrack} audioTrack=${audioTrack} ` +
+        `ready=${remoteVideo.readyState} size=${remoteVideo.videoWidth}x${remoteVideo.videoHeight} ` +
+        `time=${remoteVideo.currentTime.toFixed(2)} videoPackets=${videoPackets} ` +
+        `videoFrames=${videoFrames} audioPackets=${audioPackets}`;
+      if (connected && videoTrack && audioTrack && videoPackets > 10 && videoFrames > 2 && audioPackets > 10
+          && remoteVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && remoteVideo.currentTime > 0.2) {
+        document.title = 'PASS Local Janus H264 Opus';
+        log(`PASS ${state}`);
+      } else if (!failed)
+        log(state);
+    }, 1000);
+
+    setTimeout(() => {
+      if (!document.title.startsWith('PASS'))
+        fail(new Error(`timeout videoTrack=${videoTrack} audioTrack=${audioTrack} ready=${remoteVideo.readyState}`));
+    }, 45000);
+
+    Janus.init({
+      debug: 'all',
+      callback() {
+        if (!Janus.isWebrtcSupported()) {
+          fail(new Error('WebRTC unsupported'));
+          return;
+        }
+        janus = new Janus({
+          server: JANUS_URL,
+          iceServers: [],
+          success: attachStreamingPlugin,
+          error: fail,
+          destroyed() {
+            if (!failed)
+              log('session destroyed');
+          }
+        });
+      }
+    });
+  </script>
+</body>
+</html>

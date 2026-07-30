@@ -1,0 +1,17 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -168,9 +168,11 @@
+ 
+     bool synchronizeIncomingSamples = g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC"), "1");
+     m_sink = gst_element_factory_make("fakesink", "sink");
+-    g_object_set(m_sink.get(), "sync", synchronizeIncomingSamples, "enable-last-sample", FALSE, "qos", TRUE, nullptr);
+-    GST_INFO_OBJECT(m_sink.get(), "Intermediate incoming-track clock synchronization: %s",
+-        synchronizeIncomingSamples ? "enabled" : "disabled");
++    bool asynchronousStateChanges = m_data.type != RealtimeMediaSource::Type::Audio;
++    g_object_set(m_sink.get(), "sync", synchronizeIncomingSamples, "async", asynchronousStateChanges,
++        "enable-last-sample", FALSE, "qos", TRUE, nullptr);
++    GST_INFO_OBJECT(m_sink.get(), "Intermediate incoming-track clock synchronization: %s, async state changes: %s",
++        synchronizeIncomingSamples ? "enabled" : "disabled", asynchronousStateChanges ? "enabled" : "disabled");
+ 
+     auto queue = gst_element_factory_make("queue", "queue");
+ 

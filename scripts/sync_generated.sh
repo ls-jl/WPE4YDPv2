@@ -22,14 +22,17 @@ reject_lfs_pointer() {
 
 validate_webkit_elf() {
   path="$1"
-  min_size=$((100 * 1024 * 1024))
+  # The production library is stripped with --strip-unneeded and is currently
+  # about 99 MiB. Keep a conservative floor while validating the ELF identity
+  # instead of coupling integrity to the old unstripped file size.
+  min_size=$((90 * 1024 * 1024))
   size="$(wc -c <"$path" | tr -d ' ')"
   description="$(file -b "$path")"
 
   case "$description" in
-    *ELF*) ;;
+    *ELF*"shared object"*"ARM aarch64"*) ;;
     *)
-      echo "error: WebKit runtime is not an ELF binary: $description" >&2
+      echo "error: WebKit runtime is not an AArch64 ELF shared object: $description" >&2
       exit 1
       ;;
   esac

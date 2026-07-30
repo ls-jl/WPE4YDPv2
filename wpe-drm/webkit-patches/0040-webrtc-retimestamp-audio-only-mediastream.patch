@@ -1,0 +1,14 @@
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+index 000000000000..000000000000 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+@@ -655,8 +655,7 @@ private:
+         m_isIncomingVideoSource = trackSource.isIncomingVideoSource();
+         m_isVideoTrack = m_track->isVideo();
+         m_useLeakyIncomingVideoQueue = m_isIncomingVideoSource && m_consumerIsVideoPlayer && useLeakyIncomingVideoQueue();
+-        m_retimestampIncomingMedia = m_consumerIsVideoPlayer
+-            && (m_isIncomingVideoSource || trackSource.isIncomingAudioSource())
++        m_retimestampIncomingMedia = (m_isIncomingVideoSource || trackSource.isIncomingAudioSource())
+             && retimestampIncomingMedia();
+         m_reparseIncomingH264 = m_consumerIsVideoPlayer && m_isIncomingVideoSource
+             && reparseIncomingH264();

@@ -22,6 +22,8 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 - **单任务内存倾斜**：浏览器 oom_score_adj=-600、启动时 drop_caches、运行期 swappiness=100（退出恢复），后台进程冷页压进 512MB swap。
 - **移动 UA + 站点档案**：默认 Android Chrome UA；支持按站点切换 desktop/mobile 档案。
 - **多用户 Profile 与 Cookie 持久化**：最多 8 个持久 Profile 和访客模式；Cookie、LocalStorage、IndexedDB、Service Worker、缓存、标签、历史、收藏和站点档案完全隔离。浏览器元数据使用 SQLite WAL，Cookie 使用 WebKit 独立 SQLite CookieJar。
+- **Chrome Material 原生界面**：浅色/深色主题、共享圆角卡片和 native 图标、按压态、开关/单选/危险操作样式；工具栏、Tabs、溢出菜单和内部设置页使用同一套 raster 组件。
+- **分组设置**：外观、网页、启动与搜索、隐私与数据、关于。主题和工具栏自动隐藏全局保存；缩放、字体、网页能力、搜索引擎和启动行为按 Profile 隔离，Guest 网页设置只在当前会话生效。
 - 原生工具栏 `inset` 布局（显隐不 resize WebView）、Chrome 风格三点分层菜单、地址栏直接键盘编辑、横向滚动、系统键盘桥、双显示模式（原生/横屏旋转）。
 
 ## 目录结构
@@ -40,7 +42,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `WPEViewDRM.cpp`（含 VideoOverlay 模块）、`WPEDisplayDRM.cpp/Private.h`、`WPEDRM.h/cpp`：WPEPlatform DRM 后端，对应 `Source/WebKit/WPEPlatform/wpe/drm/`。
   - `GStreamerHolePunchQuirkRockchip.{h,cpp}`：视频直出 WebProcess 端 quirk，对应 `Source/WebCore/platform/gstreamer/`。
   - `webkit-patches/`：**服务器 WebKit 树里其他子系统的源码级补丁**（按 `Source/` 原始路径镜像），清单和原因见 `webkit-patches/README.md`——包括 dma-heap 黑名单等。
-- `tools/`：文档（`DRM_HOLE_RENDERING_PIPELINE.md` 出屏链路、`KEYBOARD_INPUT.md`、`RUNTIME_SIZE_REPORT.md` 体积清单）。
+- `tools/`：文档（`DRM_HOLE_RENDERING_PIPELINE.md` 出屏链路、`CLOUD_GAME_WEBRTC_DEBUGGING.md` 云游戏排障、`KEYBOARD_INPUT.md`、`RUNTIME_SIZE_REPORT.md` 体积清单）。
 - `debug/`：本地调试页（不随包）。
 - `8001779591038449.1_0_0.amr`：打包产物（Git LFS 入库）。
 

@@ -1,0 +1,59 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -253,9 +253,54 @@
+ 
+ GRefPtr<GstElement> GStreamerIncomingTrackProcessor::incomingTrackProcessor()
+ {
+-    if (m_data.type == RealtimeMediaSource::Type::Audio)
+-        return createParser();
++    if (m_data.type == RealtimeMediaSource::Type::Audio) {
++        bool forceEarlyAudioDecoding = !g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_FORCE_EARLY_AUDIO_DECODING"), "1");
++        if (!forceEarlyAudioDecoding)
++            return createParser();
++
++        GST_WARNING_OBJECT(m_bin.get(), "Decoding incoming WebRTC audio before MediaStream playback");
++        GRefPtr<GstElement> decodebin = makeGStreamerElement("decodebin3"_s);
++        m_isDecoding = true;
++
++        g_signal_connect_data(decodebin.get(), "deep-element-added", G_CALLBACK(+[](GstBin*, GstBin*, GstElement* element, gpointer userData) {
++            String elementClass = unsafeSpan(gst_element_get_metadata(element, GST_ELEMENT_METADATA_KLASS));
++            auto classifiers = elementClass.split('/');
+ 
++            RefPtr self = reinterpret_cast<ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor>*>(userData)->get();
++            if (!self)
++                return;
++
++            if (classifiers.contains("Depayloader"_s)) {
++                auto pad = adoptGRef(gst_element_get_static_pad(element, "sink"));
++                self->installRtpBufferPadProbe(pad);
++                return;
++            }
++
++            if (classifiers.contains("Decoder"_s) && classifiers.contains("Audio"_s))
++                configureMediaStreamAudioDecoder(element);
++        }), new ThreadSafeWeakPtr { *this }, [](gpointer data, GClosure*) {
++            delete static_cast<ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor>*>(data);
++        }, static_cast<GConnectFlags>(0));
++
++        g_signal_connect_data(decodebin.get(), "pad-added", G_CALLBACK(+[](GstElement*, GstPad* pad, gpointer userData) {
++            RefPtr self = reinterpret_cast<ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor>*>(userData)->get();
++            if (!self)
++                return;
++
++            auto queue = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(self->m_bin.get()), "queue"));
++            auto sinkPad = adoptGRef(gst_element_get_static_pad(queue.get(), "sink"));
++            if (gst_pad_link(pad, sinkPad.get()) != GST_PAD_LINK_OK) {
++                GST_ERROR_OBJECT(self->m_bin.get(), "Failed to link decoded WebRTC audio to incoming track queue");
++                return;
++            }
++            self->trackReady();
++        }), new ThreadSafeWeakPtr { *this }, [](gpointer data, GClosure*) {
++            delete static_cast<ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor>*>(data);
++        }, static_cast<GConnectFlags>(0));
++
++        return decodebin;
++    }
++
+     if (m_data.type == RealtimeMediaSource::Type::Video) {
+         GST_DEBUG_OBJECT(m_bin.get(), "Requesting a key-frame");
+         gst_pad_send_event(m_pad.get(), gst_video_event_new_upstream_force_key_unit(GST_CLOCK_TIME_NONE, TRUE, 1));

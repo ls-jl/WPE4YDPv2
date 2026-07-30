@@ -1,0 +1,75 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MediaStream AV Preroll Starting</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #101214; color: #fff; font: 14px sans-serif; }
+  main { box-sizing: border-box; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; height: 100%; padding: 8px; }
+  canvas, video { width: 100%; min-height: 0; background: #000; object-fit: contain; }
+  pre { grid-column: 1 / -1; height: 54px; margin: 0; color: #55b9ff; white-space: pre-wrap; }
+</style>
+<main>
+  <canvas id="source" width="320" height="180"></canvas>
+  <video id="remote" autoplay muted playsinline></video>
+  <pre id="status">starting</pre>
+</main>
+<script>
+  const canvas = document.querySelector('#source');
+  const context = canvas.getContext('2d');
+  const remote = document.querySelector('#remote');
+  const status = document.querySelector('#status');
+  let frame = 0;
+  let lastTime = 0;
+
+  function log(message) {
+    console.log(`MEDIASTREAM_AV_TEST ${message}`);
+    status.textContent = message;
+  }
+
+  function fail(error) {
+    document.title = 'FAIL MediaStream AV Preroll';
+    log(`FAIL ${error && (error.stack || error.message) || error}`);
+  }
+
+  function draw() {
+    const x = frame++ % canvas.width;
+    context.fillStyle = '#071018';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = '#168cff';
+    context.fillRect(x, 0, 24, canvas.height);
+    context.fillStyle = '#fff';
+    context.font = '24px sans-serif';
+    context.fillText(`frame ${frame}`, 12, 34);
+    requestAnimationFrame(draw);
+  }
+
+  (async () => {
+    draw();
+    const stream = canvas.captureStream(30);
+    const audioContext = new AudioContext();
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    const destination = audioContext.createMediaStreamDestination();
+    gain.gain.value = 0.01;
+    oscillator.connect(gain).connect(destination);
+    oscillator.start();
+    await audioContext.resume();
+    stream.addTrack(destination.stream.getAudioTracks()[0]);
+    remote.srcObject = stream;
+    await remote.play();
+
+    setInterval(() => {
+      const progressed = remote.currentTime > lastTime + 0.05;
+      lastTime = Math.max(lastTime, remote.currentTime);
+      log(`tracks=${stream.getTracks().map(track => track.kind).join(',')} time=${remote.currentTime.toFixed(2)}`);
+      if (progressed && remote.readyState >= 2) {
+        document.title = 'PASS MediaStream AV Preroll';
+        log(`PASS time=${remote.currentTime.toFixed(2)} ready=${remote.readyState}`);
+      }
+    }, 1000);
+
+    setTimeout(() => {
+      if (!document.title.startsWith('PASS'))
+        fail(new Error(`timeout time=${remote.currentTime.toFixed(2)} ready=${remote.readyState}`));
+    }, 12000);
+  })().catch(fail);
+</script>

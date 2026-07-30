@@ -1,0 +1,14 @@
+--- a/ext/dtls/gstdtlsconnection.c
++++ b/ext/dtls/gstdtlsconnection.c
+@@ -1056,6 +1056,11 @@ openssl_poll (GstDtlsConnection * self, gboolean * notify_state, GError ** err)
+       if (!self->priv->keys_exported) {
+         GST_INFO_OBJECT (self,
+             "handshake just completed successfully, exporting keys");
++        GST_WARNING_OBJECT (self,
++            "DTLS negotiated version=%s cipher=%s role=%s",
++            SSL_get_version (self->priv->ssl),
++            SSL_get_cipher_name (self->priv->ssl),
++            self->priv->is_client ? "client" : "server");
+ 
+         if (!export_srtp_keys (self, err))
+           return GST_FLOW_ERROR;

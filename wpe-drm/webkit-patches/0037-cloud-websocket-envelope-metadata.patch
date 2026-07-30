@@ -1,0 +1,64 @@
+--- a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+@@
++static void logCloudWebSocketEnvelope(SoupWebsocketConnection* connection, const char* direction, std::span<const uint8_t> data)
++{
++    if (!cloudWebSocketDiagnosticsEnabled() || data.size() < 8)
++        return;
++
++    uint32_t envelopeType = static_cast<uint32_t>(data[0]) << 24
++        | static_cast<uint32_t>(data[1]) << 16
++        | static_cast<uint32_t>(data[2]) << 8
++        | static_cast<uint32_t>(data[3]);
++    uint32_t declaredLength = static_cast<uint32_t>(data[4]) << 24
++        | static_cast<uint32_t>(data[5]) << 16
++        | static_cast<uint32_t>(data[6]) << 8
++        | static_cast<uint32_t>(data[7]);
++    if (envelopeType < 1 || envelopeType > 4 || declaredLength != data.size() - 8)
++        return;
++
++    GUri* uri = connection ? soup_websocket_connection_get_uri(connection) : nullptr;
++    g_message("WebSocket envelope: host=%s port=%d direction=%s envelope_type=%u declared_bytes=%u total_bytes=%zu",
++        uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++        uri ? g_uri_get_port(uri) : -1,
++        direction,
++        envelopeType,
++        declaredLength,
++        data.size());
++
++    if (envelopeType != 2 || declaredLength < 12)
++        return;
++
++    std::span proxyPacket = data.subspan(8);
++    if (proxyPacket[0] != 0x45 || proxyPacket[1] != 0x67
++        || proxyPacket[proxyPacket.size() - 2] != 0x89
++        || proxyPacket[proxyPacket.size() - 1] != 0xab)
++        return;
++
++    uint16_t commandID = static_cast<uint16_t>(proxyPacket[2]) << 8
++        | static_cast<uint16_t>(proxyPacket[3]);
++    uint16_t headerLength = static_cast<uint16_t>(proxyPacket[4]) << 8
++        | static_cast<uint16_t>(proxyPacket[5]);
++    uint32_t messageLength = static_cast<uint32_t>(proxyPacket[6]) << 24
++        | static_cast<uint32_t>(proxyPacket[7]) << 16
++        | static_cast<uint32_t>(proxyPacket[8]) << 8
++        | static_cast<uint32_t>(proxyPacket[9]);
++    if (12ULL + headerLength + messageLength != proxyPacket.size())
++        return;
++
++    g_message("WebSocket proxy packet: host=%s port=%d direction=%s command_id=%u header_bytes=%u message_bytes=%u",
++        uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++        uri ? g_uri_get_port(uri) : -1,
++        direction,
++        commandID,
++        headerLength,
++        messageLength);
++}
+@@
+     logCloudWebSocketPayload(task->m_connection.get(), "inbound",
+         dataType == SOUP_WEBSOCKET_DATA_TEXT ? "text" : "binary", data.size());
++    if (dataType == SOUP_WEBSOCKET_DATA_BINARY)
++        logCloudWebSocketEnvelope(task->m_connection.get(), "inbound", data);
+@@
+         logCloudWebSocketPayload(m_connection.get(), "outbound", "binary", data.size());
++        logCloudWebSocketEnvelope(m_connection.get(), "outbound", data);

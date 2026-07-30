@@ -418,6 +418,69 @@ void GStreamerMediaEndpoint::disposeElementChain(GstElement* element)
     gst_element_release_request_pad(m_webrtcBin.get(), peer.get());
 }
 
+static bool needsCloudGameIceController(const Document& document)
+{
+    static bool enabled = g_strcmp0(g_getenv("WEBKIT_CLOUD_FORCE_ICE_CONTROLLER"), "0");
+    return enabled && (document.url().isMatchingDomain("www.xbox.com"_s)
+        || document.url().isMatchingDomain("mihoyo.com"_s));
+}
+
+static void forceCloudGameIceController(GstElement* webrtcBin, GstElement* pipeline, ASCIILiteral phase)
+{
+    GRefPtr<GstWebRTCICE> ice;
+    g_object_get(webrtcBin, "ice-agent", &ice.outPtr(), nullptr);
+    if (!ice) {
+        GST_WARNING_OBJECT(pipeline, "Unable to apply cloud-game ICE quirk at %s: missing ICE agent",
+            phase.characters());
+        return;
+    }
+
+    gst_webrtc_ice_set_is_controller(ice.get(), true);
+    GST_INFO_OBJECT(pipeline, "Applying cloud-game ICE quirk at %s: forcing controlling role for candidate nomination",
+        phase.characters());
+}
+
+static bool cloudGameSDPDiagnosticsEnabled()
+{
+    static bool enabled = !g_strcmp0(g_getenv("WEBKIT_CLOUD_SDP_DIAGNOSTICS"), "1");
+    return enabled;
+}
+
+static void logCloudGameSDPSummary(GstElement* pipeline, const GstSDPMessage* message, const char* phase)
+{
+    if (!cloudGameSDPDiagnosticsEnabled() || !message)
+        return;
+
+    auto mediaCount = gst_sdp_message_medias_len(message);
+    const char* bundleGroup = gst_sdp_message_get_attribute_val(message, "group");
+    GST_WARNING_OBJECT(pipeline, "Cloud SDP: phase=%s mlines=%u bundle=%s", phase, mediaCount, bundleGroup ? bundleGroup : "(none)");
+    for (unsigned index = 0; index < mediaCount; ++index) {
+        const auto* media = gst_sdp_message_get_media(message, index);
+        bool hasRtcpMux = false;
+        const char* direction = "sendrecv";
+        const char* mid = "(none)";
+        const char* setup = "(none)";
+        const char* sctpPort = "(none)";
+        unsigned attributeCount = gst_sdp_media_attributes_len(media);
+        for (unsigned attributeIndex = 0; attributeIndex < attributeCount; ++attributeIndex) {
+            const auto* attribute = gst_sdp_media_get_attribute(media, attributeIndex);
+            if (!g_strcmp0(attribute->key, "rtcp-mux"))
+                hasRtcpMux = true;
+            else if (!g_strcmp0(attribute->key, "mid"))
+                mid = attribute->value;
+            else if (!g_strcmp0(attribute->key, "setup"))
+                setup = attribute->value;
+            else if (!g_strcmp0(attribute->key, "sctp-port"))
+                sctpPort = attribute->value;
+            else if (!g_strcmp0(attribute->key, "sendonly") || !g_strcmp0(attribute->key, "recvonly") || !g_strcmp0(attribute->key, "inactive") || !g_strcmp0(attribute->key, "sendrecv"))
+                direction = attribute->key;
+        }
+        GST_WARNING_OBJECT(pipeline, "Cloud SDP media=%u type=%s proto=%s port=%u formats=%u mid=%s setup=%s sctp_port=%s direction=%s rtcp_mux=%d",
+            index, gst_sdp_media_get_media(media), gst_sdp_media_get_proto(media), gst_sdp_media_get_port(media),
+            gst_sdp_media_formats_len(media), mid, setup, sctpPort, direction, hasRtcpMux);
+    }
+}
+
 bool GStreamerMediaEndpoint::setConfiguration(MediaEndpointConfiguration& configuration)
 {
     auto peerConnectionBackend = this->peerConnectionBackend();
@@ -429,16 +492,27 @@ bool GStreamerMediaEndpoint::setConfiguration(MediaEndpointConfiguration& config
 
     auto& document = downcast<Document>(*peerConnectionBackend->connection().scriptExecutionContext());
     GST_DEBUG_OBJECT(m_pipeline.get(), "Configuring webrtcbin for PeerConnection created by %s", document.url().string().utf8().data());
-    GstWebRTCBundlePolicy bundlePolicy;
+    auto bundlePolicy = bundlePolicyFromConfiguration(configuration);
     if (document.url().isMatchingDomain("www.xbox.com"_s) || document.url().isMatchingDomain("mihoyo.com"_s)) {
         GST_DEBUG_OBJECT(m_pipeline.get(), "Applying cloud-game quirk, forcing max-bundle policy");
         bundlePolicy = GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE;
-    } else
-        bundlePolicy = bundlePolicyFromConfiguration(configuration);
+    } else if (bundlePolicy == GST_WEBRTC_BUNDLE_POLICY_BALANCED) {
+        // GStreamer 1.22 accepts this value but cannot generate a balanced
+        // Answer, which drops a=group:BUNDLE and leaves bundled video payloads
+        // without an RTP clock-rate map.
+        GST_INFO_OBJECT(m_pipeline.get(), "Mapping unsupported balanced bundle policy to max-bundle");
+        bundlePolicy = GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE;
+    }
     g_object_set(m_webrtcBin.get(), "bundle-policy", bundlePolicy, nullptr);
 
     auto iceTransportPolicy = iceTransportPolicyFromConfiguration(configuration);
     g_object_set(m_webrtcBin.get(), "ice-transport-policy", iceTransportPolicy, nullptr);
+
+    // libnice only applies controlling-mode immediately before candidate
+    // gathering starts. Setting it from set-description callbacks is too late:
+    // the change is deferred until a future ICE restart.
+    if (needsCloudGameIceController(document))
+        forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "initial configuration"_s);
 
     bool stunSet = false;
     for (auto& server : configuration.iceServers) {
@@ -841,6 +915,8 @@ void GStreamerMediaEndpoint::doSetLocalDescription(const RTCSessionDescription* 
             return;
         }
 
+        logCloudGameSDPSummary(m_pipeline.get(), sdpMessage.get(), "local-input");
+
         // Make sure each outgoing media source is configured using the proposed codec and linked to webrtcbin.
         linkOutgoingSources(sdpMessage.get());
     }
@@ -855,6 +931,12 @@ void GStreamerMediaEndpoint::doSetLocalDescription(const RTCSessionDescription* 
         auto peerConnectionBackend = protectedThis->peerConnectionBackend();
         if (!peerConnectionBackend)
             return;
+
+        auto& document = downcast<Document>(*peerConnectionBackend->connection().scriptExecutionContext());
+        if (needsCloudGameIceController(document))
+            forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "local description"_s);
+
+        logCloudGameSDPSummary(m_pipeline.get(), &message, "local-applied");
 
         auto descriptions = descriptionsFromWebRTCBin(m_webrtcBin.get(), GatherSignalingState::Yes);
 
@@ -947,6 +1029,8 @@ void GStreamerMediaEndpoint::doSetRemoteDescription(const RTCSessionDescription&
             return;
         }
 
+        logCloudGameSDPSummary(m_pipeline.get(), sdpMessage.get(), "remote-input");
+
         if (unsigned totalMedias = gst_sdp_message_medias_len(sdpMessage.get())) {
             bool hasInvalidFormat = false;
             bool hasRtcpMuxAttribute = false;
@@ -1003,24 +1087,20 @@ void GStreamerMediaEndpoint::doSetRemoteDescription(const RTCSessionDescription&
             return;
 
         auto& document = downcast<Document>(*peerConnectionBackend->connection().scriptExecutionContext());
-        if (document.url().isMatchingDomain("www.xbox.com"_s) || document.url().isMatchingDomain("mihoyo.com"_s)) {
+        if (needsCloudGameIceController(document)) {
             /*
              * Some cloud-game ICE endpoints answer connectivity checks but
              * never nominate a pair after sending the Offer. GStreamer 1.22
              * normally makes the answerer controlled, leaving both peers
-             * waiting until libnice times out. Make this peer controlling
-             * before candidate gathering starts so its regular nomination
-             * check carries USE-CANDIDATE. The role is preserved when the
-             * local Answer is applied.
+             * waiting until libnice times out. Set the role after the remote
+             * Offer, then set it again after the local Answer because
+             * webrtcbin reapplies its default answerer role while processing
+             * the local description.
              */
-            GRefPtr<GstWebRTCICE> ice;
-            g_object_get(m_webrtcBin.get(), "ice-agent", &ice.outPtr(), nullptr);
-            if (ice) {
-                gst_webrtc_ice_set_is_controller(ice.get(), true);
-                GST_INFO_OBJECT(m_pipeline.get(), "Applying cloud-game ICE quirk, forcing controlling role for candidate nomination");
-            } else
-                GST_WARNING_OBJECT(m_pipeline.get(), "Unable to apply cloud-game ICE quirk: missing ICE agent");
+            forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "remote description"_s);
         }
+
+        logCloudGameSDPSummary(m_pipeline.get(), &message, "remote-applied");
 
         processSDPMessage(&message, [this](unsigned, CStringView mid, const auto* media) {
             auto mediaType = CStringView::unsafeFromUTF8(gst_sdp_media_get_media(media));
@@ -1167,6 +1247,14 @@ void GStreamerMediaEndpoint::setDescription(const RTCSessionDescription* descrip
 #endif
 
     GUniquePtr<GstWebRTCSessionDescription> sessionDescription(gst_webrtc_session_description_new(type, message.release()));
+    if (descriptionType == DescriptionType::Remote && sdpType == RTCSdpType::Offer) {
+        auto peerConnectionBackend = this->peerConnectionBackend();
+        auto* context = peerConnectionBackend
+            ? peerConnectionBackend->connection().scriptExecutionContext()
+            : nullptr;
+        if (context && needsCloudGameIceController(downcast<Document>(*context)))
+            forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "before remote description"_s);
+    }
     g_signal_emit_by_name(m_webrtcBin.get(), signalName.ascii().data(), sessionDescription.get(), gst_promise_new_with_change_func([](GstPromise* rawPromise, gpointer userData) {
         auto* data = static_cast<SetDescriptionCallData*>(userData);
         auto promise = adoptGRef(rawPromise);
@@ -1705,7 +1793,8 @@ void GStreamerMediaEndpoint::connectPad(GstPad* pad)
 
     auto sinkPad = adoptGRef(gst_element_get_static_pad(bin, "sink"));
     gst_pad_link(pad, sinkPad.get());
-    gst_element_set_state(bin, GST_STATE_PAUSED);
+    if (!trackProcessor->scheduleStaticAudioTrackBeforeStart())
+        gst_element_set_state(bin, GST_STATE_PAUSED);
 
 #ifndef GST_DISABLE_GST_DEBUG
     auto dotFileName = makeString(unsafeSpan(GST_OBJECT_NAME(m_pipeline.get())), ".pending-"_s, unsafeSpan(GST_OBJECT_NAME(pad)));

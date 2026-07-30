@@ -26,6 +26,7 @@
 #include "config.h"
 #include "WPEViewDRM.h"
 
+#include "ChromeMotionState.h"
 #include "DRMUniquePtr.h"
 #include "WPEDisplayDRMPrivate.h"
 #include "WPEScreenDRMPrivate.h"
@@ -87,6 +88,12 @@ struct ChromeGlyph {
     std::vector<uint8_t> pixels;
 };
 
+enum class ChromeFontWeight : uint8_t {
+    Regular = 0,
+    Medium = 1,
+    Bold = 2,
+};
+
 class ChromeFontCache {
 public:
     static ChromeFontCache& singleton()
@@ -95,22 +102,24 @@ public:
         return cache;
     }
 
-    const ChromeGlyph* glyph(gunichar character)
+    const ChromeGlyph* glyph(gunichar character,
+                             ChromeFontWeight weight = ChromeFontWeight::Regular)
     {
-        if (!m_face)
+        auto& font = m_fonts[static_cast<size_t>(weight)];
+        if (!font.face)
             return nullptr;
-        auto found = m_glyphs.find(character);
-        if (found != m_glyphs.end())
+        auto found = font.glyphs.find(character);
+        if (found != font.glyphs.end())
             return &found->second;
-        if (FT_Load_Char(m_face, character, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT))
+        if (FT_Load_Char(font.face, character, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT))
             return nullptr;
-        auto& bitmap = m_face->glyph->bitmap;
+        auto& bitmap = font.face->glyph->bitmap;
         ChromeGlyph glyph;
         glyph.width = bitmap.width;
         glyph.height = bitmap.rows;
-        glyph.left = m_face->glyph->bitmap_left;
-        glyph.top = m_face->glyph->bitmap_top;
-        glyph.advance = std::max<int>(1, m_face->glyph->advance.x >> 6);
+        glyph.left = font.face->glyph->bitmap_left;
+        glyph.top = font.face->glyph->bitmap_top;
+        glyph.advance = std::max<int>(1, font.face->glyph->advance.x >> 6);
         glyph.pixels.resize(static_cast<size_t>(glyph.width) * glyph.height);
         for (int row = 0; row < glyph.height; ++row) {
             const uint8_t* source = bitmap.buffer + static_cast<ptrdiff_t>(row) * bitmap.pitch;
@@ -122,44 +131,67 @@ public:
                         source[column / 8] & (0x80 >> (column % 8)) ? 255 : 0;
             }
         }
-        if (m_glyphs.size() >= 512)
-            m_glyphs.clear();
-        return &m_glyphs.emplace(character, std::move(glyph)).first->second;
+        if (font.glyphs.size() >= 512)
+            font.glyphs.clear();
+        return &font.glyphs.emplace(character, std::move(glyph)).first->second;
     }
 
-    bool available() const { return m_face; }
+    bool available(ChromeFontWeight weight = ChromeFontWeight::Regular) const
+    {
+        return m_fonts[static_cast<size_t>(weight)].face;
+    }
 
 private:
+    struct Font {
+        FT_Face face { nullptr };
+        std::unordered_map<gunichar, ChromeGlyph> glyphs;
+    };
+
     ChromeFontCache()
     {
-        const char* path = g_getenv("WPE_CHROME_FONT");
-        if (!path || !*path || FT_Init_FreeType(&m_library)
-            || FT_New_Face(m_library, path, 0, &m_face)
-            || FT_Set_Pixel_Sizes(m_face, 0, 13)) {
-            if (m_face)
-                FT_Done_Face(m_face);
-            if (m_library)
-                FT_Done_FreeType(m_library);
-            m_face = nullptr;
+        if (FT_Init_FreeType(&m_library)) {
             m_library = nullptr;
-            g_warning("WPEViewDRM chrome_font=ascii-fallback path=%s", path ? path : "(unset)");
+            g_warning("WPEViewDRM chrome_font=ascii-fallback freetype_init_failed");
             return;
         }
-        g_message("WPEViewDRM chrome_font=freetype path=%s family=%s",
-            path, m_face->family_name ? m_face->family_name : "unknown");
+        const char* regular = g_getenv("WPE_CHROME_FONT");
+        const char* paths[] = {
+            regular,
+            g_getenv("WPE_CHROME_FONT_MEDIUM"),
+            g_getenv("WPE_CHROME_FONT_BOLD"),
+        };
+        const char* names[] = { "regular", "medium", "bold" };
+        for (size_t index = 0; index < m_fonts.size(); ++index) {
+            const char* path = paths[index] && *paths[index] ? paths[index] : regular;
+            if (!path || !*path
+                    || FT_New_Face(m_library, path, 0, &m_fonts[index].face)
+                    || FT_Set_Pixel_Sizes(m_fonts[index].face, 0, 13)) {
+                if (m_fonts[index].face)
+                    FT_Done_Face(m_fonts[index].face);
+                m_fonts[index].face = nullptr;
+                g_warning("WPEViewDRM chrome_font_weight=%s unavailable path=%s",
+                          names[index], path ? path : "(unset)");
+                continue;
+            }
+            g_message("WPEViewDRM chrome_font_weight=%s path=%s family=%s",
+                      names[index], path,
+                      m_fonts[index].face->family_name
+                        ? m_fonts[index].face->family_name : "unknown");
+        }
     }
 
     ~ChromeFontCache()
     {
-        if (m_face)
-            FT_Done_Face(m_face);
+        for (auto& font : m_fonts) {
+            if (font.face)
+                FT_Done_Face(font.face);
+        }
         if (m_library)
             FT_Done_FreeType(m_library);
     }
 
     FT_Library m_library { nullptr };
-    FT_Face m_face { nullptr };
-    std::unordered_map<gunichar, ChromeGlyph> m_glyphs;
+    std::array<Font, 3> m_fonts;
 };
 
 struct PanelSize {
@@ -538,6 +570,7 @@ struct ChromeRenderState {
     gint64 transitionUS { 0 };
     unsigned tabCount { 1 };
     unsigned activeTab { 0 };
+    char theme[8] { "light" };
     char panel[32] { "none" };
     char url[256] { };
     char title[128] { };
@@ -547,11 +580,30 @@ struct ChromeRenderState {
     int panelY { 44 };
     int panelWidth { 0 };
     int panelHeight { 0 };
-    int panelHeaderHeight { 28 };
-    int panelFooterHeight { 40 };
-    int panelRowHeight { 34 };
+    int panelHeaderHeight { 0 };
+    int panelFooterHeight { 0 };
+    int panelRowHeight { 48 };
     double panelScrollOffset { 0 };
+    double panelMaxScroll { 0 };
     bool panelCanAdd { true };
+    int panelColumns { 3 };
+    int panelRows { 2 };
+    int panelPageCount { 1 };
+    char itemIDs[10][32] { };
+    bool itemEnabled[10] { true, true, true, true, true, true, true, true, true, true };
+    bool lineEnabled[10] { };
+    bool lineDanger[10] { };
+    bool lineChecked[10] { };
+    char lineKinds[10][16] { };
+    char lineValues[10][96] { };
+    char lineIcons[10][24] { };
+    int lineSegmentCount[10] { };
+    char lineSegmentLabels[10][3][64] { };
+    bool lineSegmentEnabled[10][3] { };
+    bool lineSegmentDanger[10][3] { };
+    int pressedRow { -1 };
+    int pressedSegment { -1 };
+    int pressedControl { -1 };
 };
 
 static bool chromeEnabled()
@@ -602,6 +654,12 @@ static void copyKeyString(GKeyFile* keyFile, const char* group, const char* key,
 static ChromeRenderState readChromeRenderState()
 {
     ChromeRenderState state;
+    for (unsigned line = 0; line < 10; ++line) {
+        state.lineEnabled[line] = true;
+        state.lineSegmentCount[line] = 1;
+        for (unsigned segment = 0; segment < 3; ++segment)
+            state.lineSegmentEnabled[line][segment] = true;
+    }
     state.enabled = chromeEnabled();
     if (!state.enabled)
         return state;
@@ -646,6 +704,7 @@ static ChromeRenderState readChromeRenderState()
         state.activeTab = std::max<int>(0, g_key_file_get_integer(keyFile, "chrome", "active_tab", nullptr));
 
     copyKeyString(keyFile, "chrome", "panel", state.panel, sizeof(state.panel));
+    copyKeyString(keyFile, "chrome", "theme", state.theme, sizeof(state.theme));
     copyKeyString(keyFile, "chrome", "url", state.url, sizeof(state.url));
     copyKeyString(keyFile, "chrome", "title", state.title, sizeof(state.title));
 
@@ -673,8 +732,60 @@ static ChromeRenderState readChromeRenderState()
             state.panelRowHeight = g_key_file_get_integer(keyFile, "panel", "row_height", nullptr);
         if (g_key_file_has_key(keyFile, "panel", "scroll_offset", nullptr))
             state.panelScrollOffset = std::max(0.0, g_key_file_get_double(keyFile, "panel", "scroll_offset", nullptr));
+        if (g_key_file_has_key(keyFile, "panel", "max_scroll", nullptr))
+            state.panelMaxScroll = std::max(0.0, g_key_file_get_double(keyFile, "panel", "max_scroll", nullptr));
         if (g_key_file_has_key(keyFile, "panel", "can_add", nullptr))
             state.panelCanAdd = g_key_file_get_boolean(keyFile, "panel", "can_add", nullptr);
+        if (g_key_file_has_key(keyFile, "panel", "columns", nullptr))
+            state.panelColumns = std::clamp(g_key_file_get_integer(keyFile, "panel", "columns", nullptr), 1, 6);
+        if (g_key_file_has_key(keyFile, "panel", "rows", nullptr))
+            state.panelRows = std::clamp(g_key_file_get_integer(keyFile, "panel", "rows", nullptr), 1, 4);
+        if (g_key_file_has_key(keyFile, "panel", "page_count", nullptr))
+            state.panelPageCount = std::max(1, g_key_file_get_integer(keyFile, "panel", "page_count", nullptr));
+        for (int i = 0; i < 10; ++i) {
+            char key[32];
+            snprintf(key, sizeof(key), "line%d_enabled", i);
+            if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                state.lineEnabled[i] = g_key_file_get_boolean(keyFile, "panel", key, nullptr);
+            snprintf(key, sizeof(key), "line%d_danger", i);
+            if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                state.lineDanger[i] = g_key_file_get_boolean(keyFile, "panel", key, nullptr);
+            snprintf(key, sizeof(key), "line%d_checked", i);
+            if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                state.lineChecked[i] = g_key_file_get_boolean(keyFile, "panel", key, nullptr);
+            snprintf(key, sizeof(key), "line%d_kind", i);
+            copyKeyString(keyFile, "panel", key,
+                          state.lineKinds[i], sizeof(state.lineKinds[i]));
+            snprintf(key, sizeof(key), "line%d_value", i);
+            copyKeyString(keyFile, "panel", key,
+                          state.lineValues[i], sizeof(state.lineValues[i]));
+            snprintf(key, sizeof(key), "line%d_icon", i);
+            copyKeyString(keyFile, "panel", key,
+                          state.lineIcons[i], sizeof(state.lineIcons[i]));
+            snprintf(key, sizeof(key), "line%d_segment_count", i);
+            if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                state.lineSegmentCount[i] = std::clamp(
+                    g_key_file_get_integer(keyFile, "panel", key, nullptr), 1, 3);
+            for (int segment = 0; segment < 3; ++segment) {
+                snprintf(key, sizeof(key), "line%d_segment%d_label", i, segment);
+                copyKeyString(keyFile, "panel", key,
+                              state.lineSegmentLabels[i][segment],
+                              sizeof(state.lineSegmentLabels[i][segment]));
+                snprintf(key, sizeof(key), "line%d_segment%d_enabled", i, segment);
+                if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                    state.lineSegmentEnabled[i][segment] =
+                        g_key_file_get_boolean(keyFile, "panel", key, nullptr);
+                snprintf(key, sizeof(key), "line%d_segment%d_danger", i, segment);
+                if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                    state.lineSegmentDanger[i][segment] =
+                        g_key_file_get_boolean(keyFile, "panel", key, nullptr);
+            }
+            snprintf(key, sizeof(key), "item%d_id", i);
+            copyKeyString(keyFile, "panel", key, state.itemIDs[i], sizeof(state.itemIDs[i]));
+            snprintf(key, sizeof(key), "item%d_enabled", i);
+            if (g_key_file_has_key(keyFile, "panel", key, nullptr))
+                state.itemEnabled[i] = g_key_file_get_boolean(keyFile, "panel", key, nullptr);
+        }
     }
 
     g_key_file_unref(keyFile);
@@ -1135,12 +1246,14 @@ public:
         }
     }
 
-    void drawText(int x, int y, const char* text, uint32_t color, int scale, int maxWidth)
+    void drawText(int x, int y, const char* text, uint32_t color, int scale,
+                  int maxWidth,
+                  ChromeFontWeight weight = ChromeFontWeight::Regular)
     {
         if (!text)
             return;
         auto& font = ChromeFontCache::singleton();
-        if (font.available()) {
+        if (font.available(weight)) {
             int cursor = x;
             const char* position = text;
             while (*position) {
@@ -1150,7 +1263,7 @@ public:
                     position++;
                 } else
                     position = g_utf8_next_char(position);
-                const ChromeGlyph* glyph = font.glyph(character);
+                const ChromeGlyph* glyph = font.glyph(character, weight);
                 int advance = glyph ? glyph->advance : 7;
                 if (cursor + advance > x + maxWidth)
                     break;
@@ -1176,12 +1289,13 @@ public:
         }
     }
 
-    int measureText(const char* text, int scale)
+    int measureText(const char* text, int scale,
+                    ChromeFontWeight weight = ChromeFontWeight::Regular)
     {
         if (!text)
             return 0;
         auto& font = ChromeFontCache::singleton();
-        if (!font.available())
+        if (!font.available(weight))
             return static_cast<int>(strlen(text)) * 6 * scale;
 
         int width = 0;
@@ -1193,7 +1307,7 @@ public:
                 position++;
             } else
                 position = g_utf8_next_char(position);
-            const ChromeGlyph* glyph = font.glyph(character);
+            const ChromeGlyph* glyph = font.glyph(character, weight);
             width += glyph ? glyph->advance : 7;
         }
         return width;
@@ -1213,6 +1327,162 @@ private:
     int m_clipBottom { 0 };
 };
 
+static void drawChromeMenuIcon(PanelPixelWriter& painter, const char* id,
+                               int centerX, int centerY, uint32_t color)
+{
+    if (!strcmp(id, "bookmark")) {
+        painter.drawLine(centerX - 7, centerY - 8, centerX + 7, centerY - 8, 2, color);
+        painter.drawLine(centerX - 7, centerY - 8, centerX - 7, centerY + 8, 2, color);
+        painter.drawLine(centerX + 7, centerY - 8, centerX + 7, centerY + 8, 2, color);
+        painter.drawLine(centerX - 7, centerY + 8, centerX, centerY + 3, 2, color);
+        painter.drawLine(centerX, centerY + 3, centerX + 7, centerY + 8, 2, color);
+    } else if (!strcmp(id, "history")) {
+        painter.drawArc(centerX, centerY, 9, 0, 359, 2, color);
+        painter.drawLine(centerX, centerY, centerX, centerY - 6, 2, color);
+        painter.drawLine(centerX, centerY, centerX + 5, centerY + 3, 2, color);
+    } else if (!strcmp(id, "bookmarks")) {
+        painter.drawRoundedRect(centerX - 9, centerY - 8, 14, 17, 3, 0x00000000, color, 2);
+        painter.drawRoundedRect(centerX - 3, centerY - 5, 12, 14, 3, 0x00000000, color, 2);
+    } else if (!strcmp(id, "profiles")) {
+        painter.fillCircle(centerX, centerY - 6, 5, color);
+        painter.drawArc(centerX, centerY + 10, 10, 200, 340, 3, color);
+        painter.fillCircle(centerX - 10, centerY - 1, 3, color);
+        painter.fillCircle(centerX + 10, centerY - 1, 3, color);
+    } else if (!strcmp(id, "privacy")) {
+        painter.drawLine(centerX, centerY - 10, centerX - 8, centerY - 6, 2, color);
+        painter.drawLine(centerX - 8, centerY - 6, centerX - 6, centerY + 4, 2, color);
+        painter.drawLine(centerX - 6, centerY + 4, centerX, centerY + 10, 2, color);
+        painter.drawLine(centerX, centerY + 10, centerX + 6, centerY + 4, 2, color);
+        painter.drawLine(centerX + 6, centerY + 4, centerX + 8, centerY - 6, 2, color);
+        painter.drawLine(centerX + 8, centerY - 6, centerX, centerY - 10, 2, color);
+    } else if (!strcmp(id, "theme")) {
+        painter.fillCircle(centerX, centerY, 5, color);
+        for (int offset = -10; offset <= 10; offset += 20) {
+            painter.drawLine(centerX + offset, centerY - 3,
+                             centerX + offset, centerY + 3, 2, color);
+            painter.drawLine(centerX - 3, centerY + offset,
+                             centerX + 3, centerY + offset, 2, color);
+        }
+    } else if (!strcmp(id, "web") || !strcmp(id, "webkit")) {
+        painter.drawArc(centerX, centerY, 9, 0, 359, 2, color);
+        painter.drawArc(centerX, centerY, 4, 80, 280, 1, color);
+        painter.drawLine(centerX - 8, centerY, centerX + 8, centerY, 1, color);
+    } else if (!strcmp(id, "search") || !strcmp(id, "zoom")) {
+        painter.drawArc(centerX - 2, centerY - 2, 6, 0, 359, 2, color);
+        painter.drawLine(centerX + 3, centerY + 3,
+                         centerX + 9, centerY + 9, 2, color);
+    } else if (!strcmp(id, "home")) {
+        painter.drawLine(centerX - 9, centerY, centerX, centerY - 8, 2, color);
+        painter.drawLine(centerX, centerY - 8, centerX + 9, centerY, 2, color);
+        painter.drawRoundedRect(centerX - 6, centerY, 12, 9, 2,
+                                0x00000000, color, 2);
+    } else if (!strcmp(id, "toolbar")) {
+        painter.drawRoundedRect(centerX - 10, centerY - 7, 20, 14, 3,
+                                0x00000000, color, 2);
+        painter.fillRect(centerX - 7, centerY - 4, 14, 3, color);
+    } else if (!strcmp(id, "font")) {
+        painter.drawLine(centerX - 7, centerY + 8, centerX, centerY - 9, 2, color);
+        painter.drawLine(centerX, centerY - 9, centerX + 7, centerY + 8, 2, color);
+        painter.drawLine(centerX - 4, centerY + 2, centerX + 4, centerY + 2, 2, color);
+    } else if (!strcmp(id, "javascript") || !strcmp(id, "custom")) {
+        painter.drawLine(centerX - 2, centerY - 7, centerX - 8, centerY, 2, color);
+        painter.drawLine(centerX - 8, centerY, centerX - 2, centerY + 7, 2, color);
+        painter.drawLine(centerX + 2, centerY - 7, centerX + 8, centerY, 2, color);
+        painter.drawLine(centerX + 8, centerY, centerX + 2, centerY + 7, 2, color);
+    } else if (!strcmp(id, "autoplay")) {
+        painter.drawArc(centerX, centerY, 10, 0, 359, 2, color);
+        painter.fillTriangle(centerX - 3, centerY - 6,
+                             centerX - 3, centerY + 6,
+                             centerX + 7, centerY, color);
+    } else if (!strcmp(id, "scroll")) {
+        painter.drawLine(centerX - 8, centerY - 6, centerX + 8, centerY - 6, 2, color);
+        painter.drawLine(centerX - 8, centerY, centerX + 5, centerY, 2, color);
+        painter.drawLine(centerX - 8, centerY + 6, centerX + 8, centerY + 6, 2, color);
+    } else if (!strcmp(id, "popup") || !strcmp(id, "display")) {
+        painter.drawRoundedRect(centerX - 10, centerY - 8, 20, 16, 3,
+                                0x00000000, color, 2);
+        painter.fillRect(centerX - 7, centerY - 5, 14, 2, color);
+    } else if (!strcmp(id, "tabs")) {
+        painter.drawRoundedRect(centerX - 8, centerY - 9, 16, 18, 4,
+                                0x00000000, color, 2);
+    } else if (!strcmp(id, "clear") || !strcmp(id, "cache")) {
+        painter.drawArc(centerX, centerY + 2, 8, 35, 315, 2, color);
+        painter.fillTriangle(centerX + 9, centerY + 1,
+                             centerX + 3, centerY,
+                             centerX + 8, centerY - 6, color);
+    } else if (!strcmp(id, "about") || !strcmp(id, "renderer")) {
+        painter.drawArc(centerX, centerY, 9, 0, 359, 2, color);
+        painter.fillCircle(centerX, centerY - 4, 2, color);
+        painter.drawLine(centerX, centerY, centerX, centerY + 6, 2, color);
+    } else {
+        painter.drawArc(centerX, centerY, 7, 0, 359, 3, color);
+        painter.fillCircle(centerX, centerY, 3, color);
+        constexpr double pi = 3.14159265358979323846;
+        for (int angle = 0; angle < 360; angle += 45) {
+            double radians = angle * pi / 180.0;
+            int innerX = centerX + static_cast<int>(std::lround(cos(radians) * 9));
+            int innerY = centerY + static_cast<int>(std::lround(sin(radians) * 9));
+            int outerX = centerX + static_cast<int>(std::lround(cos(radians) * 12));
+            int outerY = centerY + static_cast<int>(std::lround(sin(radians) * 12));
+            painter.drawLine(innerX, innerY, outerX, outerY, 2, color);
+        }
+    }
+}
+
+struct ChromeTheme {
+    uint32_t toolbar;
+    uint32_t background;
+    uint32_t surface;
+    uint32_t surfaceVariant;
+    uint32_t outline;
+    uint32_t text;
+    uint32_t secondaryText;
+    uint32_t disabled;
+    uint32_t accent;
+    uint32_t onAccent;
+    uint32_t pressed;
+    uint32_t danger;
+    uint32_t dangerSurface;
+    uint32_t shadow;
+};
+
+static ChromeTheme chromeTheme(const ChromeRenderState& state)
+{
+    if (!g_ascii_strcasecmp(state.theme, "dark")) {
+        return {
+            0xff202124, 0xff121212, 0xff252525, 0xff303134,
+            0xff5f6368, 0xfff1f3f4, 0xffbdc1c6, 0xff777b80,
+            0xff8ab4f8, 0xff202124, 0x408ab4f8, 0xffff8a80,
+            0xff4a2022, 0x42000000
+        };
+    }
+    return {
+        0xfff1f3f4, 0xfff8f9fa, 0xffffffff, 0xffeef3f8,
+        0xffd2d8df, 0xff202124, 0xff5f6368, 0xff9aa0a6,
+        0xff1a73e8, 0xffffffff, 0x301a73e8, 0xffd93025,
+        0xffffe8e6, 0x24000000
+    };
+}
+
+static void drawMaterialSwitch(PanelPixelWriter& painter, int centerX, int centerY,
+                               bool checked, bool enabled, const ChromeTheme& theme)
+{
+    uint32_t track = !enabled ? theme.outline
+        : checked ? theme.accent : theme.secondaryText;
+    uint32_t thumb = !enabled ? theme.disabled
+        : checked ? theme.onAccent : theme.surface;
+    painter.drawRoundedRect(centerX - 16, centerY - 8, 32, 16, 8,
+                            track, track, 1);
+    painter.fillCircle(centerX + (checked ? 8 : -8), centerY, 6, thumb);
+}
+
+static void drawMaterialChevron(PanelPixelWriter& painter, int centerX, int centerY,
+                                uint32_t color)
+{
+    painter.drawLine(centerX - 3, centerY - 5, centerX + 3, centerY, 2, color);
+    painter.drawLine(centerX + 3, centerY, centerX - 3, centerY + 5, 2, color);
+}
+
 static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
 {
     const auto& chrome = cachedChromeRenderState();
@@ -1225,15 +1495,16 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
     }
 
     PanelPixelWriter painter(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation);
-    const uint32_t black = 0xff111820;
-    const uint32_t dark = 0xee202a33;
-    const uint32_t mid = 0xff53606b;
-    const uint32_t white = 0xffffffff;
-    const uint32_t text = 0xff1a222b;
-    const uint32_t disabled = 0xff7f8a94;
-    const uint32_t accent = 0xff1d8dbb;
+    const auto theme = chromeTheme(chrome);
+    const uint32_t black = theme.surfaceVariant;
+    const uint32_t dark = theme.toolbar;
+    const uint32_t mid = theme.outline;
+    const uint32_t white = theme.surface;
+    const uint32_t text = theme.text;
+    const uint32_t disabled = theme.disabled;
+    const uint32_t accent = theme.accent;
     const uint32_t progressBlue = 0xff4285f4;
-    const uint32_t panel = 0xf8f5f7fa;
+    const uint32_t panel = theme.background;
 
     int chromeHeight = std::clamp<int>(chrome.height, 24, std::min<int>(80, panelHeight));
     bool hasPanel = strcmp(chrome.panel, "none") && chrome.panel[0];
@@ -1262,17 +1533,32 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
     int addressWidth = std::max<int>(1, addressRight - 8);
     int controlHeight = chromeHeight - 12;
     painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8, white, mid, 1);
+    if (chrome.pressedControl == -2)
+        painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8,
+                                theme.pressed, theme.pressed, 1);
     painter.drawText(18, toolbarY + 17, chrome.url[0] ? chrome.url : "HOME", text, 1, std::max(1, addressWidth - 20));
 
-    bool enabled[5] = { chrome.canBack, chrome.canForward, true, true, true };
+    bool tabsPanelOpen = !strcmp(chrome.panel, "tabs");
+    bool overflowPanelOpen = hasPanel && !tabsPanelOpen;
+    bool enabled[5] = {
+        chrome.canBack,
+        chrome.canForward,
+        true,
+        overflowPanelOpen || !tabsPanelOpen || chrome.panelCanAdd,
+        true
+    };
     for (int i = 0; i < 5; ++i) {
         int x = buttonX + i * buttonW;
         painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4, controlHeight, 6,
-                                black, enabled[i] ? accent : mid, 1);
+                                theme.surface, enabled[i] ? theme.outline : mid, 1);
+        if (chrome.pressedControl == i)
+            painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4,
+                                    controlHeight, 6,
+                                    theme.pressed, theme.pressed, 1);
 
         int centerX = x + buttonW / 2;
         int centerY = toolbarY + chromeHeight / 2;
-        uint32_t iconColor = enabled[i] ? white : disabled;
+        uint32_t iconColor = enabled[i] ? accent : disabled;
         switch (i) {
         case 0:
             painter.drawLine(centerX + 4, centerY - 7, centerX - 4, centerY, 2, iconColor);
@@ -1288,13 +1574,22 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
             snprintf(tabCount, sizeof(tabCount), "%u", std::max<unsigned>(1, chrome.tabCount));
             painter.drawRoundedRect(centerX - 10, centerY - 10, 20, 20, 5,
                                     black, iconColor, 2);
-            int labelWidth = painter.measureText(tabCount, 1);
+            int labelWidth = painter.measureText(tabCount, 1, ChromeFontWeight::Bold);
             int labelY = ChromeFontCache::singleton().available() ? centerY - 7 : centerY - 3;
-            painter.drawText(centerX - labelWidth / 2, labelY, tabCount, iconColor, 1, 18);
+            painter.drawText(centerX - labelWidth / 2, labelY, tabCount,
+                             iconColor, 1, 18, ChromeFontWeight::Bold);
             break;
         }
         case 3:
-            if (chrome.loading) {
+            if (tabsPanelOpen) {
+                painter.drawLine(centerX - 6, centerY, centerX + 6, centerY, 2, iconColor);
+                painter.drawLine(centerX, centerY - 6, centerX, centerY + 6, 2, iconColor);
+            } else if (overflowPanelOpen) {
+                // Arc runs from upper-right through the bottom to upper-left,
+                // leaving a symmetric top gap for the power stem.
+                painter.drawArc(centerX, centerY + 1, 8, -45, 225, 2, iconColor);
+                painter.drawLine(centerX, centerY - 10, centerX, centerY, 2, iconColor);
+            } else if (chrome.loading) {
                 painter.drawLine(centerX - 5, centerY - 5, centerX + 5, centerY + 5, 2, iconColor);
                 painter.drawLine(centerX + 5, centerY - 5, centerX - 5, centerY + 5, 2, iconColor);
             } else {
@@ -1304,9 +1599,14 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
             }
             break;
         case 4:
-            painter.fillCircle(centerX, centerY - 6, 2, iconColor);
-            painter.fillCircle(centerX, centerY, 2, iconColor);
-            painter.fillCircle(centerX, centerY + 6, 2, iconColor);
+            if (overflowPanelOpen) {
+                painter.drawLine(centerX - 6, centerY - 6, centerX + 6, centerY + 6, 2, iconColor);
+                painter.drawLine(centerX + 6, centerY - 6, centerX - 6, centerY + 6, 2, iconColor);
+            } else {
+                painter.fillCircle(centerX, centerY - 6, 2, iconColor);
+                painter.fillCircle(centerX, centerY, 2, iconColor);
+                painter.fillCircle(centerX, centerY + 6, 2, iconColor);
+            }
             break;
         }
     }
@@ -1321,24 +1621,17 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
         int tabsHeight = chrome.panelHeight > 0 ? chrome.panelHeight : static_cast<int>(panelHeight) - tabsY;
         tabsWidth = std::clamp(tabsWidth, 1, static_cast<int>(panelWidth) - tabsX);
         tabsHeight = std::clamp(tabsHeight, 1, static_cast<int>(panelHeight) - tabsY);
-        int headerHeight = std::clamp(chrome.panelHeaderHeight, 24, std::min(48, tabsHeight));
-        int footerHeight = std::clamp(chrome.panelFooterHeight, 32, std::min(56, tabsHeight));
+        int headerHeight = std::clamp(chrome.panelHeaderHeight, 0, std::min(48, tabsHeight));
+        int footerHeight = std::clamp(chrome.panelFooterHeight, 0, std::min(56, tabsHeight));
         int rowHeight = std::clamp(chrome.panelRowHeight, 26, 48);
         int listTop = tabsY + headerHeight;
         int footerTop = tabsY + tabsHeight - footerHeight;
         if (footerTop < listTop)
             footerTop = listTop;
 
+        painter.drawRoundedRect(tabsX + 1, tabsY + 2, tabsWidth - 1, tabsHeight - 2,
+                                10, theme.shadow, theme.shadow, 1);
         painter.drawRoundedRect(tabsX, tabsY, tabsWidth, tabsHeight, 10, panel, mid, 1);
-        int backCenterX = tabsX + 17;
-        int headerCenterY = tabsY + headerHeight / 2;
-        painter.drawLine(backCenterX + 3, headerCenterY - 6, backCenterX - 3, headerCenterY, 2, accent);
-        painter.drawLine(backCenterX - 3, headerCenterY, backCenterX + 3, headerCenterY + 6, 2, accent);
-        char panelTitle[64];
-        snprintf(panelTitle, sizeof(panelTitle), "TABS %u", std::max<unsigned>(1, chrome.tabCount));
-        painter.drawText(tabsX + 34, tabsY + std::max(5, (headerHeight - 14) / 2),
-                         panelTitle, accent, 1, tabsWidth - 48);
-        painter.fillRect(tabsX + 1, listTop - 1, tabsWidth - 2, 1, 0xffd4dbe2);
 
         painter.setClipRect(tabsX + 1, listTop, tabsWidth - 2, std::max(0, footerTop - listTop));
         int scrollOffset = static_cast<int>(std::lround(chrome.panelScrollOffset));
@@ -1347,65 +1640,224 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
             if (rowY + rowHeight <= listTop || rowY >= footerTop)
                 continue;
             bool active = i == chrome.activeTab;
-            uint32_t rowFill = active ? 0xffdcecf7 : ((i % 2) ? 0xffedf1f5 : 0xffffffff);
-            uint32_t rowBorder = active ? accent : 0xffd4dbe2;
-            painter.drawRoundedRect(tabsX + 7, rowY + 2, tabsWidth - 14, rowHeight - 4,
-                                    6, rowFill, rowBorder, 1);
-            int closeWidth = 42;
+            uint32_t rowFill = active ? theme.surfaceVariant : theme.surface;
+            if (chrome.pressedRow == static_cast<int>(i))
+                rowFill = theme.pressed;
+            uint32_t rowBorder = active ? accent : theme.outline;
+            painter.drawRoundedRect(tabsX + 7, rowY + 3, tabsWidth - 14, rowHeight - 6,
+                                    8, rowFill, rowBorder, 1);
+            int closeWidth = 52;
             painter.drawText(tabsX + 16, rowY + std::max(5, (rowHeight - 14) / 2),
                              chrome.lines[i], text, 1, tabsWidth - closeWidth - 24);
             int closeCenterX = tabsX + tabsWidth - closeWidth / 2;
             int closeCenterY = rowY + rowHeight / 2;
-            painter.drawLine(closeCenterX - 4, closeCenterY - 4,
-                             closeCenterX + 4, closeCenterY + 4, 2, mid);
-            painter.drawLine(closeCenterX + 4, closeCenterY - 4,
-                             closeCenterX - 4, closeCenterY + 4, 2, mid);
+            painter.drawLine(closeCenterX - 5, closeCenterY - 5,
+                             closeCenterX + 5, closeCenterY + 5, 2, mid);
+            painter.drawLine(closeCenterX + 5, closeCenterY - 5,
+                             closeCenterX - 5, closeCenterY + 5, 2, mid);
+        }
+        painter.resetClip();
+        return;
+    }
+
+    if (!strcmp(chrome.panel, "menu")) {
+        int menuX = std::clamp(chrome.panelX, 0, std::max(0, static_cast<int>(panelWidth) - 1));
+        int menuY = std::clamp(chrome.panelY, toolbarY + chromeHeight,
+                               std::max(toolbarY + chromeHeight, static_cast<int>(panelHeight) - 1));
+        int menuWidth = chrome.panelWidth > 0 ? chrome.panelWidth : static_cast<int>(panelWidth) - menuX;
+        int menuHeight = chrome.panelHeight > 0 ? chrome.panelHeight : static_cast<int>(panelHeight) - menuY;
+        menuWidth = std::clamp(menuWidth, 1, static_cast<int>(panelWidth) - menuX);
+        menuHeight = std::clamp(menuHeight, 1, static_cast<int>(panelHeight) - menuY);
+        int columns = std::clamp(chrome.panelColumns, 1, 6);
+        int rows = std::clamp(chrome.panelRows, 1, 4);
+        int pageCount = std::max(1, chrome.panelPageCount);
+        int dotsHeight = pageCount > 1 ? 14 : 0;
+        int gridHeight = std::max(1, menuHeight - dotsHeight);
+        int cellWidth = std::max(1, menuWidth / columns);
+        int cellHeight = std::max(1, gridHeight / rows);
+
+        painter.drawRoundedRect(menuX + 1, menuY + 2, menuWidth - 1, menuHeight - 2,
+                                10, theme.shadow, theme.shadow, 1);
+        painter.drawRoundedRect(menuX, menuY, menuWidth, menuHeight, 10, panel, mid, 1);
+        painter.setClipRect(menuX + 1, menuY + 1, menuWidth - 2, menuHeight - 2);
+        int scrollOffset = static_cast<int>(std::lround(chrome.panelScrollOffset));
+        int itemsPerPage = columns * rows;
+        for (unsigned i = 0; i < chrome.lineCount; ++i) {
+            int pageIndex = static_cast<int>(i) / itemsPerPage;
+            int pageItem = static_cast<int>(i) % itemsPerPage;
+            int row = pageItem / columns;
+            int column = pageItem % columns;
+            int cellX = menuX + pageIndex * menuWidth - scrollOffset + column * cellWidth;
+            int cellY = menuY + row * cellHeight;
+            if (cellX + cellWidth <= menuX || cellX >= menuX + menuWidth)
+                continue;
+
+            bool itemIsEnabled = i < 10 ? chrome.itemEnabled[i] : true;
+            uint32_t cellFill = itemIsEnabled ? theme.surface : theme.surfaceVariant;
+            if (chrome.pressedRow == static_cast<int>(i))
+                cellFill = theme.pressed;
+            uint32_t cellBorder = itemIsEnabled ? theme.outline : mid;
+            uint32_t itemColor = itemIsEnabled ? accent : disabled;
+            painter.drawRoundedRect(cellX + 7, cellY + 6, cellWidth - 14,
+                                    std::max(1, cellHeight - 12), 8,
+                                    cellFill, cellBorder, 1);
+            int iconCenterY = cellY + std::max(20, cellHeight / 2 - 10);
+            drawChromeMenuIcon(painter, i < 10 ? chrome.itemIDs[i] : "",
+                               cellX + cellWidth / 2, iconCenterY, itemColor);
+            int labelWidth = painter.measureText(chrome.lines[i], 1,
+                                                 ChromeFontWeight::Medium);
+            int labelX = cellX + std::max(6, (cellWidth - labelWidth) / 2);
+            int labelY = cellY + cellHeight - 23;
+            painter.drawText(labelX, labelY, chrome.lines[i], itemColor, 1,
+                             std::max(1, cellWidth - 12),
+                             ChromeFontWeight::Medium);
         }
         painter.resetClip();
 
-        painter.fillRect(tabsX + 1, footerTop, tabsWidth - 2, 1, 0xffd4dbe2);
-        int addWidth = 48;
-        int addHeight = std::min(28, std::max(22, footerHeight - 10));
-        int addX = tabsX + (tabsWidth - addWidth) / 2;
-        int addY = footerTop + (footerHeight - addHeight) / 2;
-        uint32_t addColor = chrome.panelCanAdd ? accent : mid;
-        painter.drawRoundedRect(addX, addY, addWidth, addHeight, 8, addColor, addColor, 1);
-        int addCenterX = addX + addWidth / 2;
-        int addCenterY = addY + addHeight / 2;
-        uint32_t addIconColor = chrome.panelCanAdd ? white : disabled;
-        painter.drawLine(addCenterX - 6, addCenterY, addCenterX + 6, addCenterY, 2, addIconColor);
-        painter.drawLine(addCenterX, addCenterY - 6, addCenterX, addCenterY + 6, 2, addIconColor);
-
-        if (chrome.touchDebug)
-            painter.drawText(tabsX + tabsWidth - 112, tabsY + 6, "TOUCH DEBUG", accent, 1, 104);
+        if (pageCount > 1) {
+            int dotsWidth = (pageCount - 1) * 12 + 6;
+            int firstX = menuX + (menuWidth - dotsWidth) / 2 + 3;
+            int activePage = std::clamp(static_cast<int>(std::lround(
+                chrome.panelScrollOffset / std::max(1, menuWidth))), 0, pageCount - 1);
+            for (int pageIndex = 0; pageIndex < pageCount; ++pageIndex)
+                painter.fillCircle(firstX + pageIndex * 12, menuY + menuHeight - 7,
+                                   pageIndex == activePage ? 3 : 2,
+                                   pageIndex == activePage ? accent : mid);
+        }
         return;
     }
 
-    int panelY = toolbarY + chromeHeight;
-    int panelHeightPixels = std::min<int>(static_cast<int>(panelHeight) - panelY, 214);
-    if (panelHeightPixels <= 0)
-        return;
-    painter.fillRect(0, panelY, panelWidth, panelHeightPixels, panel);
-    painter.strokeRect(0, panelY, panelWidth, panelHeightPixels, mid);
-    painter.drawText(14, panelY + 5, "<", accent, 1, 16);
-    char panelTitle[64];
-    if (!strcmp(chrome.panel, "tabs"))
-        snprintf(panelTitle, sizeof(panelTitle), "TABS %u", std::max<unsigned>(1, chrome.tabCount));
-    else
-        snprintf(panelTitle, sizeof(panelTitle), "%s", chrome.panel);
-    painter.drawText(34, panelY + 5, panelTitle, accent, 1, panelWidth - 48);
+    int listX = std::clamp(chrome.panelX, 0,
+                           std::max(0, static_cast<int>(panelWidth) - 1));
+    int listY = std::clamp(chrome.panelY, toolbarY + chromeHeight,
+                           std::max(toolbarY + chromeHeight,
+                                    static_cast<int>(panelHeight) - 1));
+    int listWidth = chrome.panelWidth > 0
+        ? chrome.panelWidth : static_cast<int>(panelWidth) - listX;
+    int listHeight = chrome.panelHeight > 0
+        ? chrome.panelHeight : static_cast<int>(panelHeight) - listY;
+    listWidth = std::clamp(listWidth, 1, static_cast<int>(panelWidth) - listX);
+    listHeight = std::clamp(listHeight, 1, static_cast<int>(panelHeight) - listY);
+    int headerHeight = std::clamp(chrome.panelHeaderHeight, 24,
+                                  std::min(48, listHeight));
+    int rowHeight = std::clamp(chrome.panelRowHeight, 40, 64);
+    int contentTop = listY + headerHeight;
+    int contentBottom = listY + listHeight;
+    int scrollOffset = std::clamp(
+        static_cast<int>(std::lround(chrome.panelScrollOffset)), 0,
+        static_cast<int>(std::ceil(chrome.panelMaxScroll)));
+    const uint32_t dangerColor = theme.danger;
+    const uint32_t dangerFill = theme.dangerSurface;
+    const uint32_t disabledFill = theme.surfaceVariant;
 
-    int rowY = panelY + 22;
-    for (unsigned i = 0; i < chrome.lineCount && rowY + 21 <= panelY + panelHeightPixels; ++i) {
-        uint32_t rowColor = (i % 2) ? 0xffedf1f5 : 0xffffffff;
-        painter.fillRect(8, rowY, panelWidth - 16, 21, rowColor);
-        painter.strokeRect(8, rowY, panelWidth - 16, 21, 0xffd4dbe2);
-        painter.drawText(18, rowY + 4, chrome.lines[i], text, 1, panelWidth - 36);
-        rowY += 24;
-    }
+    painter.drawRoundedRect(listX + 1, listY + 2, listWidth - 1, listHeight - 2,
+                            10, theme.shadow, theme.shadow, 1);
+    painter.drawRoundedRect(listX, listY, listWidth, listHeight, 10,
+                            panel, mid, 1);
 
+    int backCenterX = listX + 20;
+    int headerCenterY = listY + headerHeight / 2;
+    painter.drawLine(backCenterX + 4, headerCenterY - 6,
+                     backCenterX - 3, headerCenterY, 2, accent);
+    painter.drawLine(backCenterX - 3, headerCenterY,
+                     backCenterX + 4, headerCenterY + 6, 2, accent);
+    painter.drawText(listX + 38,
+                     listY + std::max(5, (headerHeight - 14) / 2),
+                     chrome.panel, accent, 1,
+                     std::max(1, listWidth - 54),
+                     ChromeFontWeight::Bold);
     if (chrome.touchDebug)
-        painter.drawText(panelWidth - 140, panelY + 5, "TOUCH DEBUG", accent, 1, 130);
+        painter.drawText(listX + listWidth - 140,
+                         listY + std::max(5, (headerHeight - 14) / 2),
+                         "TOUCH DEBUG", accent, 1, 130);
+
+    painter.setClipRect(listX + 1, contentTop, listWidth - 2,
+                        std::max(0, contentBottom - contentTop));
+    for (unsigned i = 0; i < chrome.lineCount; ++i) {
+        int rowY = contentTop + static_cast<int>(i) * rowHeight - scrollOffset;
+        if (rowY + rowHeight <= contentTop || rowY >= contentBottom)
+            continue;
+
+        bool enabled = i < 10 ? chrome.lineEnabled[i] : true;
+        bool danger = i < 10 ? chrome.lineDanger[i] : false;
+        uint32_t rowFill = !enabled ? disabledFill
+            : danger ? dangerFill : theme.surface;
+        if (chrome.pressedRow == static_cast<int>(i) && enabled)
+            rowFill = theme.pressed;
+        uint32_t rowBorder = danger ? dangerColor
+            : enabled ? theme.outline : mid;
+        uint32_t rowText = !enabled ? disabled : danger ? dangerColor : text;
+        int cardX = listX + 7;
+        int cardY = rowY + 3;
+        int cardWidth = std::max(1, listWidth - 14);
+        int cardHeight = std::max(1, rowHeight - 6);
+        painter.drawRoundedRect(cardX + 1, cardY + 1, cardWidth, cardHeight, 8,
+                                theme.shadow, theme.shadow, 1);
+        painter.drawRoundedRect(cardX, cardY, cardWidth, cardHeight, 8,
+                                rowFill, rowBorder, 1);
+
+        int segmentCount = i < 10
+            ? std::clamp(chrome.lineSegmentCount[i], 1, 3) : 1;
+        int textY = rowY + std::max(5, (rowHeight - 14) / 2);
+        if (segmentCount == 1) {
+            const char* kind = chrome.lineKinds[i][0]
+                ? chrome.lineKinds[i] : "action";
+            int textLeft = cardX + 12;
+            if (chrome.lineIcons[i][0]) {
+                drawChromeMenuIcon(painter, chrome.lineIcons[i],
+                                   cardX + 19, rowY + rowHeight / 2,
+                                   enabled ? accent : disabled);
+                textLeft = cardX + 38;
+            }
+            int trailingWidth = 12;
+            if (!strcmp(kind, "toggle")) {
+                drawMaterialSwitch(painter, cardX + cardWidth - 27,
+                                   rowY + rowHeight / 2,
+                                   chrome.lineChecked[i], enabled, theme);
+                trailingWidth = 58;
+            } else if (!strcmp(kind, "navigation")) {
+                drawMaterialChevron(painter, cardX + cardWidth - 17,
+                                    rowY + rowHeight / 2,
+                                    enabled ? theme.secondaryText : disabled);
+                trailingWidth = 30;
+            }
+            if (chrome.lineValues[i][0]) {
+                int valueWidth = painter.measureText(chrome.lineValues[i], 1);
+                int valueRight = cardX + cardWidth - trailingWidth;
+                int valueX = std::max(textLeft + 40, valueRight - valueWidth);
+                painter.drawText(valueX, textY, chrome.lineValues[i],
+                                 enabled ? theme.secondaryText : disabled, 1,
+                                 std::max(1, valueRight - valueX));
+                trailingWidth += valueWidth + 12;
+            }
+            painter.drawText(textLeft, textY, chrome.lines[i], rowText, 1,
+                             std::max(1, cardWidth - (textLeft - cardX)
+                                              - trailingWidth),
+                             ChromeFontWeight::Medium);
+            continue;
+        }
+
+        for (int segment = 0; segment < segmentCount; ++segment) {
+            int segmentLeft = cardX + cardWidth * segment / segmentCount;
+            int segmentRight = cardX + cardWidth * (segment + 1) / segmentCount;
+            if (segment > 0)
+                painter.fillRect(segmentLeft, cardY + 5, 1,
+                                 std::max(1, cardHeight - 10), mid);
+            bool segmentEnabled = chrome.lineSegmentEnabled[i][segment];
+            bool segmentDanger = chrome.lineSegmentDanger[i][segment];
+            uint32_t segmentColor = !segmentEnabled ? disabled
+                : segmentDanger ? dangerColor : text;
+            const char* label = chrome.lineSegmentLabels[i][segment][0]
+                ? chrome.lineSegmentLabels[i][segment] : chrome.lines[i];
+            int segmentWidth = std::max(1, segmentRight - segmentLeft);
+            int labelWidth = painter.measureText(label, 1);
+            int labelX = segmentLeft
+                + std::max(6, (segmentWidth - labelWidth) / 2);
+            painter.drawText(labelX, textY, label, segmentColor, 1,
+                             std::max(1, segmentWidth - 12));
+        }
+    }
+    painter.resetClip();
 }
 
 class DRMScanoutBuffer;
@@ -1892,6 +2344,33 @@ public:
 
     bool lastCopyWasPartial() const { return m_lastCopyWasPartial; }
 
+    bool punchTransparentRect(int x1, int y1, int x2, int y2,
+        uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation, uint32_t topInset)
+    {
+        if (!m_mapping || m_format != DRM_FORMAT_ARGB8888)
+            return false;
+
+        auto rect = rotatedDestRect(x1, y1, x2, y2, panelWidth, panelHeight, rotation, topInset);
+        rect.x1 = std::clamp<int>(rect.x1, 0, static_cast<int>(m_width));
+        rect.y1 = std::clamp<int>(rect.y1, 0, static_cast<int>(m_height));
+        rect.x2 = std::clamp<int>(rect.x2, rect.x1, static_cast<int>(m_width));
+        rect.y2 = std::clamp<int>(rect.y2, rect.y1, static_cast<int>(m_height));
+        if (rect.x2 <= rect.x1 || rect.y2 <= rect.y1)
+            return false;
+
+        for (int y = rect.y1; y < rect.y2; ++y) {
+            auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_mapping)
+                + static_cast<size_t>(y) * m_pitch);
+            for (int x = rect.x1; x < rect.x2; ++x)
+                row[x] &= 0x00ffffff;
+        }
+
+        // Keep native chrome above fullscreen video whenever it is visible.
+        drawChromeOverlay(static_cast<uint8_t*>(m_mapping), m_pitch, m_width, m_height,
+            panelWidth, panelHeight, rotation);
+        return true;
+    }
+
     void copyRotatedPixels(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, OutputRotation rotation)
     {
         auto* destination = static_cast<uint8_t*>(m_mapping);
@@ -2045,6 +2524,12 @@ struct _WPEViewDRMPrivate {
     gint64 lastFrameCommitUS { 0 };
     gint64 frameThrottleIntervalUS { 0 };
     unsigned chromePollTick { 0 };
+    uint32_t chromeMotionSequence { 0 };
+    guint64 chromeMotionUpdates { 0 };
+    guint64 chromeMotionCoalesced { 0 };
+    guint64 chromeOverlayCommits { 0 };
+    gint64 chromeMotionStatsStartUS { 0 };
+    bool chromeMotionPending { false };
     bool lastUpdateDroppedBuffer { false };
     bool forceFullDamageNextFrame { false };
     OutputRotation outputRotation { OutputRotation::Rotate0 };
@@ -2261,33 +2746,89 @@ static void wpeViewDRMConstructed(GObject* object)
     g_source_attach(priv->eventSource.get(), g_main_context_get_thread_default());
 
     refreshChromeRenderState();
-    priv->chromeSource = adoptGRef(g_timeout_source_new(33));
+    priv->chromeMotionStatsStartUS = g_get_monotonic_time();
+    priv->chromeSource = adoptGRef(g_timeout_source_new(16));
     g_source_set_name(priv->chromeSource.get(), "WPE DRM chrome state poll");
     g_source_set_callback(priv->chromeSource.get(), reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(+[](gpointer userData) -> gboolean {
         auto* view = WPE_VIEW_DRM(userData);
         auto* priv = view->priv;
-        bool needsUpdate = refreshChromeRenderState() || chromeAnimationActive();
+        bool stateChanged = !(++priv->chromePollTick % 2) && refreshChromeRenderState();
+        bool animationActive = chromeAnimationActive();
+        bool motionChanged = false;
+        auto* motion = static_cast<const WPEChromeMotionState*>(
+            g_object_get_data(G_OBJECT(view), WPE_CHROME_MOTION_DATA_KEY));
+        if (motion && motion->version == WPE_CHROME_MOTION_VERSION) {
+            if (motion->sequence != priv->chromeMotionSequence) {
+                if (priv->chromeMotionSequence && motion->sequence > priv->chromeMotionSequence + 1)
+                    priv->chromeMotionCoalesced += motion->sequence - priv->chromeMotionSequence - 1;
+                priv->chromeMotionSequence = motion->sequence;
+                priv->chromeMotionUpdates++;
+                motionChanged = true;
+            }
+            auto& chrome = chromeStateCache().state;
+            bool panelMatches = (motion->panel == WPE_CHROME_MOTION_PANEL_TABS
+                    && !strcmp(chrome.panel, "tabs"))
+                || (motion->panel == WPE_CHROME_MOTION_PANEL_MENU
+                    && !strcmp(chrome.panel, "menu"))
+                || (motion->panel == WPE_CHROME_MOTION_PANEL_LIST
+                    && strcmp(chrome.panel, "none")
+                    && strcmp(chrome.panel, "tabs")
+                    && strcmp(chrome.panel, "menu"));
+            if (panelMatches && std::abs(chrome.panelScrollOffset - motion->offset) > 0.01) {
+                chrome.panelScrollOffset = std::max(0.0, motion->offset);
+                motionChanged = true;
+            }
+            if (chrome.pressedRow != motion->pressed_row
+                    || chrome.pressedSegment != motion->pressed_segment
+                    || chrome.pressedControl != motion->pressed_control) {
+                chrome.pressedRow = motion->pressed_row;
+                chrome.pressedSegment = motion->pressed_segment;
+                chrome.pressedControl = motion->pressed_control;
+                motionChanged = true;
+            }
+        }
+        if (stateChanged || animationActive || motionChanged)
+            priv->chromeMotionPending = true;
 
-        // 旋转文件极少变化：与 chrome 轮询共用一个定时器，每 8 tick（约 264ms）读一次，
+        bool rotationChanged = false;
+        // 旋转文件极少变化：与 chrome 轮询共用一个定时器，每 16 tick（约 256ms）读一次，
         // 取代原先独立的 250ms rotation GSource。
-        if (!(++priv->chromePollTick % 8)) {
+        if (!(priv->chromePollTick % 16)) {
             auto rotation = configuredOutputRotation();
             if (rotation != priv->outputRotation) {
                 priv->outputRotation = rotation;
                 g_message("WPEViewDRM output_rotation=%u", static_cast<unsigned>(rotation));
-                needsUpdate = true;
+                rotationChanged = true;
+                priv->chromeMotionPending = true;
             }
         }
 
-        if (!needsUpdate)
-            return G_SOURCE_CONTINUE;
-        // 工具栏 inset/旋转变了，视频 overlay 的落屏矩形要跟着重算。
-        videoOverlayRecommit(view);
-        if (priv->committedBuffer && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
+        if (stateChanged || animationActive || rotationChanged)
+            videoOverlayRecommit(view);
+        if (priv->chromeMotionPending && priv->committedBuffer
+            && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
             if (wpeViewDRMRequestUpdate(view, nullptr)) {
                 priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
                 wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
+                priv->chromeMotionPending = false;
+                priv->chromeOverlayCommits++;
             }
+        }
+
+        gint64 nowUS = g_get_monotonic_time();
+        gint64 elapsedUS = nowUS - priv->chromeMotionStatsStartUS;
+        if (elapsedUS >= 2 * G_USEC_PER_SEC) {
+            double overlayFPS = static_cast<double>(priv->chromeOverlayCommits)
+                * G_USEC_PER_SEC / elapsedUS;
+            if (priv->chromeMotionUpdates || priv->chromeOverlayCommits)
+                g_message("WPE chrome motion: updates=%" G_GUINT64_FORMAT
+                    " coalesced=%" G_GUINT64_FORMAT " overlay_fps=%.1f pending=%d",
+                    priv->chromeMotionUpdates, priv->chromeMotionCoalesced,
+                    overlayFPS, priv->chromeMotionPending);
+            priv->chromeMotionUpdates = 0;
+            priv->chromeMotionCoalesced = 0;
+            priv->chromeOverlayCommits = 0;
+            priv->chromeMotionStatsStartUS = nowUS;
         }
         return G_SOURCE_CONTINUE;
     })), object, nullptr);
@@ -2455,6 +2996,9 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
     return userData->scanoutBuffer;
 }
 
+struct VideoOverlayWireMessage;
+static void videoOverlayPunchActiveHole(WPEViewDRM*, DRMScanoutBuffer*);
+
 static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer, GError** error)
 {
     auto* priv = view->priv;
@@ -2477,6 +3021,7 @@ static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer, 
         } else if (!candidate->copyFromSHM(buffer, error))
             return nullptr;
 
+        videoOverlayPunchActiveHole(view, candidate.get());
         priv->nextSHMScanoutBufferIndex = (index + 1) % priv->shmScanoutBuffers.size();
         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMDumb);
         return candidate.get();
@@ -2510,6 +3055,7 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
         } else if (!candidate->copyRotatedFromDMABuf(device, buffer, rotation, error))
             return nullptr;
 
+        videoOverlayPunchActiveHole(view, candidate.get());
         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
         logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufRotatedDumb);
         return candidate.get();
@@ -2540,6 +3086,7 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
         } else if (!candidate->copyRotatedFromSHM(buffer, rotation, error))
             return nullptr;
 
+        videoOverlayPunchActiveHole(view, candidate.get());
         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMRotatedDumb);
         return candidate.get();
@@ -2864,6 +3411,40 @@ struct VideoOverlayFB {
     uint32_t handles[3] { 0, 0, 0 };
 };
 
+enum class VideoOverlayFit : uint8_t {
+    Contain,
+    Cover,
+    Stretch,
+};
+
+static constexpr const char* videoOverlayInputGeometryKey = "wpe-video-overlay-input-geometry";
+
+static VideoOverlayFit configuredVideoOverlayFit()
+{
+    static auto fit = [] {
+        const char* value = getenv("WPE_VIDEO_OVERLAY_FIT");
+        if (value && !g_ascii_strcasecmp(value, "cover"))
+            return VideoOverlayFit::Cover;
+        if (value && !g_ascii_strcasecmp(value, "stretch"))
+            return VideoOverlayFit::Stretch;
+        return VideoOverlayFit::Contain;
+    }();
+    return fit;
+}
+
+static const char* videoOverlayFitName(VideoOverlayFit fit)
+{
+    switch (fit) {
+    case VideoOverlayFit::Contain:
+        return "contain";
+    case VideoOverlayFit::Cover:
+        return "cover";
+    case VideoOverlayFit::Stretch:
+        return "stretch";
+    }
+    return "contain";
+}
+
 struct VideoOverlayState {
     WPEViewDRM* view { nullptr };
     int listenFD { -1 };
@@ -2879,7 +3460,96 @@ struct VideoOverlayState {
     bool planeEnabled { false };
     bool zposUnsupported { false };
     unsigned commitFailLogCount { 0 };
+    uint32_t loggedFrameWidth { 0 };
+    uint32_t loggedFrameHeight { 0 };
+    int32_t loggedCrtcWidth { 0 };
+    int32_t loggedCrtcHeight { 0 };
+    VideoOverlayFit loggedFit { VideoOverlayFit::Stretch };
 };
+
+static bool videoOverlayPunchHole(WPEViewDRM* view, DRMScanoutBuffer* scanoutBuffer,
+    const VideoOverlayWireMessage& frame)
+{
+    if (!scanoutBuffer || frame.rectWidth <= 0 || frame.rectHeight <= 0)
+        return false;
+
+    auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+    auto* screen = WPE_SCREEN_DRM(wpeDisplayDRMGetScreen(display));
+    auto* mode = wpeScreenDRMGetMode(screen);
+    auto panel = configuredPanelSize();
+    uint32_t panelWidth = panel.width ? panel.width : mode->hdisplay;
+    uint32_t panelHeight = panel.height ? panel.height : mode->vdisplay;
+    uint32_t topInset = chromeReservedTopInset(panelHeight);
+    bool punched = scanoutBuffer->punchTransparentRect(
+        frame.rectX, frame.rectY,
+        frame.rectX + frame.rectWidth, frame.rectY + frame.rectHeight,
+        panelWidth, panelHeight, view->priv->outputRotation, topInset);
+
+    static bool loggedSuccess;
+    static bool loggedUnsupported;
+    if (punched && !loggedSuccess) {
+        loggedSuccess = true;
+        g_message("WPEViewDRM video hole: source=native-scanout-alpha rect=%dx%d+%d+%d",
+            frame.rectWidth, frame.rectHeight, frame.rectX, frame.rectY);
+    } else if (!punched && !loggedUnsupported) {
+        loggedUnsupported = true;
+        g_warning("WPEViewDRM video hole: scanout buffer is not CPU-mappable ARGB; "
+            "video overlay may be covered by the primary plane");
+    }
+    return punched;
+}
+
+static void videoOverlayPunchActiveHole(WPEViewDRM* view, DRMScanoutBuffer* scanoutBuffer)
+{
+    auto* overlay = view->priv->videoOverlay;
+    if (!overlay || !overlay->haveFrame)
+        return;
+    videoOverlayPunchHole(view, scanoutBuffer, overlay->lastFrame);
+}
+
+static void videoOverlayPublishInputGeometry(WPEViewDRM* view, const VideoOverlayWireMessage& frame,
+    VideoOverlayFit fit, OutputRotation rotation)
+{
+    int32_t domX = frame.rectX;
+    int32_t domY = frame.rectY;
+    int32_t domW = frame.rectWidth;
+    int32_t domH = frame.rectHeight;
+    if (domW <= 0 || domH <= 0) {
+        g_object_set_data(G_OBJECT(view), videoOverlayInputGeometryKey, nullptr);
+        return;
+    }
+
+    int32_t visibleX = domX;
+    int32_t visibleY = domY;
+    int32_t visibleW = domW;
+    int32_t visibleH = domH;
+    if (fit == VideoOverlayFit::Contain) {
+        uint32_t sourceW = frame.width;
+        uint32_t sourceH = frame.height;
+        if (rotation == OutputRotation::Rotate90 || rotation == OutputRotation::Rotate270)
+            std::swap(sourceW, sourceH);
+        if (sourceW && sourceH) {
+            if (static_cast<uint64_t>(sourceW) * domH > static_cast<uint64_t>(sourceH) * domW) {
+                visibleH = std::max<int32_t>(1, static_cast<int64_t>(domW) * sourceH / sourceW);
+                visibleY += (domH - visibleH) / 2;
+            } else {
+                visibleW = std::max<int32_t>(1, static_cast<int64_t>(domH) * sourceW / sourceH);
+                visibleX += (domW - visibleW) / 2;
+            }
+        }
+    }
+
+    auto* serialized = g_strdup_printf("1,%s,%d,%d,%d,%d,%d,%d,%d,%d",
+        videoOverlayFitName(fit), domX, domY, domW, domH,
+        visibleX, visibleY, visibleW, visibleH);
+    const char* previous = static_cast<const char*>(g_object_get_data(G_OBJECT(view), videoOverlayInputGeometryKey));
+    if (previous && !strcmp(previous, serialized)) {
+        g_free(serialized);
+        return;
+    }
+    g_object_set_data_full(G_OBJECT(view), videoOverlayInputGeometryKey, serialized, g_free);
+    g_message("WPEViewDRM video input geometry: %s", serialized);
+}
 
 static const char* videoOverlaySocketPath()
 {
@@ -2980,9 +3650,42 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
     if (dstX2 <= dstX1 || dstY2 <= dstY1)
         return false;
 
-    // 裁剪到内容条带区，源矩形按比例跟进（16.16 定点）。
+    // 解码器已按输出方向预旋转。先按源帧纵横比适配完整目标矩形，再裁剪到
+    // panel-native 内容条带。contain 保留完整画面，cover 保留目标尺寸并居中
+    // 裁剪源帧，stretch 仅作为旧行为回滚开关。
+    auto fit = configuredVideoOverlayFit();
+    videoOverlayPublishInputGeometry(view, frame, fit, rotation);
     int32_t fullW = dstX2 - dstX1;
     int32_t fullH = dstY2 - dstY1;
+    uint64_t srcBaseX = 0;
+    uint64_t srcBaseY = 0;
+    uint64_t srcBaseW = static_cast<uint64_t>(frame.width) << 16;
+    uint64_t srcBaseH = static_cast<uint64_t>(frame.height) << 16;
+    if (fit == VideoOverlayFit::Contain) {
+        if (static_cast<uint64_t>(frame.width) * fullH > static_cast<uint64_t>(frame.height) * fullW) {
+            int32_t fittedH = std::max<int32_t>(1, static_cast<int64_t>(fullW) * frame.height / frame.width);
+            dstY1 += (fullH - fittedH) / 2;
+            dstY2 = dstY1 + fittedH;
+        } else {
+            int32_t fittedW = std::max<int32_t>(1, static_cast<int64_t>(fullH) * frame.width / frame.height);
+            dstX1 += (fullW - fittedW) / 2;
+            dstX2 = dstX1 + fittedW;
+        }
+        fullW = dstX2 - dstX1;
+        fullH = dstY2 - dstY1;
+    } else if (fit == VideoOverlayFit::Cover) {
+        if (static_cast<uint64_t>(frame.width) * fullH > static_cast<uint64_t>(frame.height) * fullW) {
+            uint64_t croppedWidth = static_cast<uint64_t>(frame.height) * fullW / fullH;
+            srcBaseX = ((static_cast<uint64_t>(frame.width) - croppedWidth) << 15);
+            srcBaseW = croppedWidth << 16;
+        } else {
+            uint64_t croppedHeight = static_cast<uint64_t>(frame.width) * fullH / fullW;
+            srcBaseY = ((static_cast<uint64_t>(frame.height) - croppedHeight) << 15);
+            srcBaseH = croppedHeight << 16;
+        }
+    }
+
+    // 裁剪到内容条带区，源矩形按比例跟进（16.16 定点）。
     int32_t clipX1 = std::max<int32_t>(dstX1, contentX1);
     int32_t clipY1 = std::max<int32_t>(dstY1, contentY1);
     int32_t clipX2 = std::min<int32_t>(dstX2, contentX2);
@@ -2998,12 +3701,24 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
         return true;
     }
 
-    uint64_t srcFullW = static_cast<uint64_t>(frame.width) << 16;
-    uint64_t srcFullH = static_cast<uint64_t>(frame.height) << 16;
-    uint64_t srcX = srcFullW * (clipX1 - dstX1) / fullW;
-    uint64_t srcY = srcFullH * (clipY1 - dstY1) / fullH;
-    uint64_t srcW = srcFullW * (clipX2 - clipX1) / fullW;
-    uint64_t srcH = srcFullH * (clipY2 - clipY1) / fullH;
+    uint64_t srcX = srcBaseX + srcBaseW * (clipX1 - dstX1) / fullW;
+    uint64_t srcY = srcBaseY + srcBaseH * (clipY1 - dstY1) / fullH;
+    uint64_t srcW = srcBaseW * (clipX2 - clipX1) / fullW;
+    uint64_t srcH = srcBaseH * (clipY2 - clipY1) / fullH;
+
+    if (overlay->loggedFrameWidth != frame.width || overlay->loggedFrameHeight != frame.height
+        || overlay->loggedCrtcWidth != clipX2 - clipX1 || overlay->loggedCrtcHeight != clipY2 - clipY1
+        || overlay->loggedFit != fit) {
+        g_message("WPEViewDRM video overlay geometry: fit=%s frame=%ux%u rect=%dx%d+%d+%d crtc=%dx%d+%d+%d src=%" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT " rotation=%u",
+            videoOverlayFitName(fit), frame.width, frame.height, frame.rectWidth, frame.rectHeight, frame.rectX, frame.rectY,
+            clipX2 - clipX1, clipY2 - clipY1, clipX1, clipY1,
+            srcW >> 16, srcH >> 16, srcX >> 16, srcY >> 16, static_cast<unsigned>(rotation));
+        overlay->loggedFrameWidth = frame.width;
+        overlay->loggedFrameHeight = frame.height;
+        overlay->loggedCrtcWidth = clipX2 - clipX1;
+        overlay->loggedCrtcHeight = clipY2 - clipY1;
+        overlay->loggedFit = fit;
+    }
 
     auto properties = overlay->plane->properties();
     properties.crtcID.second = crtc.id();
@@ -3069,6 +3784,7 @@ static void videoOverlayDisable(WPEViewDRM* view)
     videoOverlayReleaseFB(fd, overlay->retired[0]);
     videoOverlayReleaseFB(fd, overlay->current);
     overlay->haveFrame = false;
+    g_object_set_data(G_OBJECT(view), videoOverlayInputGeometryKey, nullptr);
 }
 
 static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMessage& frame, int* fds, unsigned fdCount)
@@ -3113,6 +3829,12 @@ static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMess
         videoOverlayReleaseFB(fd, fb);
         return;
     }
+
+    // GPU composition can leave the primary surface fully opaque even when
+    // WebCore painted a hole-punch video layer. Clear alpha in the final
+    // mapped ARGB scanout before placing the NV12 plane underneath it.
+    videoOverlayPunchHole(view, view->priv->committedScanoutBuffer, frame);
+    videoOverlayPunchHole(view, view->priv->pendingScanoutBuffer, frame);
 
     if (!videoOverlayCommit(view, overlay, fb.fbID, frame)) {
         videoOverlayReleaseFB(fd, fb);
@@ -3422,7 +4144,8 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
     bool needsScanoutRebuild = buffer && (rotation != OutputRotation::Rotate0
         || (priv->committedScanoutBuffer
             && (priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb
-                || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb)));
+                || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb
+                || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMDumb)));
     if (priv->pendingBuffer || needsScanoutRebuild) {
         UnixFileDescriptor renderingFence;
         bool pendingNeedsCPURead = priv->pendingBuffer && bufferNeedsCPURead(buffer, rotation);

@@ -63,6 +63,43 @@ GST_WEBRTC_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0001-webrtcbin-update-
 if ! patch -d "$GST_BAD_SOURCE" -p1 -R --dry-run <"$GST_WEBRTC_PATCH" >/dev/null 2>&1; then
   patch -d "$GST_BAD_SOURCE" -p1 <"$GST_WEBRTC_PATCH"
 fi
+GST_ICE_ROLE_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0002-webrtcbin-preserve-ice-controller.patch"
+if ! patch -d "$GST_BAD_SOURCE" -p1 -R --dry-run <"$GST_ICE_ROLE_PATCH" >/dev/null 2>&1; then
+  patch -d "$GST_BAD_SOURCE" -p1 <"$GST_ICE_ROLE_PATCH"
+fi
+GST_DTLS_MTU_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0003-dtls-bio-query-mtu-1200.patch"
+if ! patch -d "$GST_BAD_SOURCE" -p1 -R --dry-run <"$GST_DTLS_MTU_PATCH" >/dev/null 2>&1; then
+  patch -d "$GST_BAD_SOURCE" -p1 <"$GST_DTLS_MTU_PATCH"
+fi
+WEBKIT_MPP_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0002-registry-scanner-classify-mpp-as-hardware.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_MPP_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_MPP_PATCH"
+fi
+
+WEBKIT_WS_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0025-cloud-websocket-lifecycle-diagnostics.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WS_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WS_DIAGNOSTIC_PATCH"
+fi
+WEBKIT_WS_CLOSE_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0026-cloud-websocket-close-diagnostics.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WS_CLOSE_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WS_CLOSE_DIAGNOSTIC_PATCH"
+fi
+WEBKIT_DATACHANNEL_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0027-cloud-datachannel-state-diagnostics.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_DATACHANNEL_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_DATACHANNEL_DIAGNOSTIC_PATCH"
+fi
+WEBKIT_WEBSOCKET_OUTBOUND_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0028-cloud-websocket-outbound-diagnostics.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WEBSOCKET_OUTBOUND_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WEBSOCKET_OUTBOUND_DIAGNOSTIC_PATCH"
+fi
+WEBKIT_WEBSOCKET_ENDPOINT_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0029-cloud-websocket-endpoint-diagnostics.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WEBSOCKET_ENDPOINT_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WEBSOCKET_ENDPOINT_DIAGNOSTIC_PATCH"
+fi
+WEBKIT_WEBSOCKET_REQUEST_METADATA_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0030-cloud-websocket-request-metadata.patch"
+if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WEBSOCKET_REQUEST_METADATA_PATCH" >/dev/null 2>&1; then
+  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WEBSOCKET_REQUEST_METADATA_PATCH"
+fi
 
 WEBKIT_ENDPOINT_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp"
 WEBKIT_ENDPOINT_SOURCE="$WPE_ROOT/WebKit/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp"
@@ -72,6 +109,36 @@ if [ ! -f "$WEBKIT_ENDPOINT_MIRROR" ]; then
 fi
 if ! cmp -s "$WEBKIT_ENDPOINT_MIRROR" "$WEBKIT_ENDPOINT_SOURCE"; then
   install -m 0644 "$WEBKIT_ENDPOINT_MIRROR" "$WEBKIT_ENDPOINT_SOURCE"
+fi
+
+WEBKIT_DATACHANNEL_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp"
+WEBKIT_DATACHANNEL_SOURCE="$WPE_ROOT/WebKit/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp"
+if [ ! -f "$WEBKIT_DATACHANNEL_MIRROR" ]; then
+  echo "Missing WebKit DataChannel handler mirror: $WEBKIT_DATACHANNEL_MIRROR" >&2
+  exit 1
+fi
+if ! cmp -s "$WEBKIT_DATACHANNEL_MIRROR" "$WEBKIT_DATACHANNEL_SOURCE"; then
+  install -m 0644 "$WEBKIT_DATACHANNEL_MIRROR" "$WEBKIT_DATACHANNEL_SOURCE"
+fi
+
+WEBKIT_PLAYER_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp"
+WEBKIT_PLAYER_SOURCE="$WPE_ROOT/WebKit/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp"
+if [ ! -f "$WEBKIT_PLAYER_MIRROR" ]; then
+  echo "Missing WebKit media-player mirror: $WEBKIT_PLAYER_MIRROR" >&2
+  exit 1
+fi
+if ! cmp -s "$WEBKIT_PLAYER_MIRROR" "$WEBKIT_PLAYER_SOURCE"; then
+    install -m 0644 "$WEBKIT_PLAYER_MIRROR" "$WEBKIT_PLAYER_SOURCE"
+fi
+
+WEBKIT_WEBSOCKET_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp"
+WEBKIT_WEBSOCKET_SOURCE="$WPE_ROOT/WebKit/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp"
+if [ ! -f "$WEBKIT_WEBSOCKET_MIRROR" ]; then
+  echo "Missing WebKit WebSocket task mirror: $WEBKIT_WEBSOCKET_MIRROR" >&2
+  exit 1
+fi
+if ! cmp -s "$WEBKIT_WEBSOCKET_MIRROR" "$WEBKIT_WEBSOCKET_SOURCE"; then
+  install -m 0644 "$WEBKIT_WEBSOCKET_MIRROR" "$WEBKIT_WEBSOCKET_SOURCE"
 fi
 
 if [ ! -f "$PREFIX/lib/libcrypto.so.3" ]; then

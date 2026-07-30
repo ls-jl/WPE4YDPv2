@@ -1,0 +1,15 @@
+diff --git a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+@@ -420,8 +420,10 @@ void GStreamerMediaEndpoint::disposeElementChain(GstElement* element)
+ 
+ static bool needsCloudGameIceController(const Document& document)
+ {
+-    return document.url().isMatchingDomain("www.xbox.com"_s)
+-        || document.url().isMatchingDomain("mihoyo.com"_s);
++    static bool enabled = g_strcmp0(g_getenv("WEBKIT_CLOUD_FORCE_ICE_CONTROLLER"), "0");
++    return enabled && (document.url().isMatchingDomain("www.xbox.com"_s)
++        || document.url().isMatchingDomain("mihoyo.com"_s));
+ }
+ 
+ static void forceCloudGameIceController(GstElement* webrtcBin, GstElement* pipeline, ASCIILiteral phase)

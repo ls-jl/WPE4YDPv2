@@ -1,0 +1,23 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+@@ -351,13 +351,11 @@ GStreamerRegistryScanner::RegistryLookupResult GStreamerRegistryScanner::Elemen
+         for (auto& factory : candidates) {
+             auto metadata = String::fromLatin1(gst_element_factory_get_metadata(factory.get(), GST_ELEMENT_METADATA_KLASS));
+             auto components = metadata.split('/');
+             auto& quirksManager = GStreamerQuirksManager::singleton();
+-            if (quirksManager.isEnabled()) {
+-                auto isAccelerated = quirksManager.isHardwareAccelerated(factory.get());
+-                if (isAccelerated && *isAccelerated) {
+-                    isUsingHardware = true;
+-                    selectedFactory = factory;
+-                    break;
+-                }
++            auto isAccelerated = quirksManager.isHardwareAccelerated(factory.get());
++            if (isAccelerated && *isAccelerated) {
++                isUsingHardware = true;
++                selectedFactory = factory;
++                break;
+             }
+             if (components.contains("Hardware"_s)) {
+                 isUsingHardware = true;

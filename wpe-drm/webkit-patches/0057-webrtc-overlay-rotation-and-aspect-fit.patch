@@ -1,0 +1,165 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -48,6 +48,27 @@
+     return value && !g_strcmp0(value, "1");
+ }
+ 
++static void configureRockchipEarlyVideoRotation(GstElement* element)
++{
++    const char* quirk = g_getenv("WEBKIT_GST_HOLE_PUNCH_QUIRK");
++    if (g_strcmp0(quirk, "rockchip"))
++        return;
++
++    auto* factory = gst_element_get_factory(element);
++    if (!factory || g_strcmp0(GST_OBJECT_NAME(factory), "mppvideodec")
++        || !gstObjectHasProperty(element, "rotation"_s))
++        return;
++
++    const char* rotation = g_getenv("WPE_VIDEO_OVERLAY_ROTATION");
++    if (!rotation || !*rotation)
++        rotation = g_getenv("WPE_DRM_ROTATION");
++    if (!rotation || (!g_str_equal(rotation, "90") && !g_str_equal(rotation, "180") && !g_str_equal(rotation, "270")))
++        return;
++
++    gst_util_set_object_arg(G_OBJECT(element), "rotation", rotation);
++    GST_WARNING_OBJECT(element, "Applying Rockchip overlay rotation %s to early WebRTC decoder", rotation);
++}
++
+ static void configureLeakyAudioQueue(GstElement* queue)
+ {
+     g_object_set(queue,
+@@ -442,6 +463,7 @@
+             return;
+ 
+         self->m_videoDecoderName = configureMediaStreamVideoDecoder(element);
++        configureRockchipEarlyVideoRotation(element);
+         webkitGstTraceProcessingTimeForElement(element);
+ 
+         auto sinkPad = adoptGRef(gst_element_get_static_pad(element, "sink"));
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -2864,6 +2864,38 @@
+     uint32_t handles[3] { 0, 0, 0 };
+ };
+ 
++enum class VideoOverlayFit : uint8_t {
++    Contain,
++    Cover,
++    Stretch,
++};
++
++static VideoOverlayFit configuredVideoOverlayFit()
++{
++    static auto fit = [] {
++        const char* value = getenv("WPE_VIDEO_OVERLAY_FIT");
++        if (value && !g_ascii_strcasecmp(value, "cover"))
++            return VideoOverlayFit::Cover;
++        if (value && !g_ascii_strcasecmp(value, "stretch"))
++            return VideoOverlayFit::Stretch;
++        return VideoOverlayFit::Contain;
++    }();
++    return fit;
++}
++
++static const char* videoOverlayFitName(VideoOverlayFit fit)
++{
++    switch (fit) {
++    case VideoOverlayFit::Contain:
++        return "contain";
++    case VideoOverlayFit::Cover:
++        return "cover";
++    case VideoOverlayFit::Stretch:
++        return "stretch";
++    }
++    return "contain";
++}
++
+ struct VideoOverlayState {
+     WPEViewDRM* view { nullptr };
+     int listenFD { -1 };
+@@ -2879,6 +2911,11 @@
+     bool planeEnabled { false };
+     bool zposUnsupported { false };
+     unsigned commitFailLogCount { 0 };
++    uint32_t loggedFrameWidth { 0 };
++    uint32_t loggedFrameHeight { 0 };
++    int32_t loggedCrtcWidth { 0 };
++    int32_t loggedCrtcHeight { 0 };
++    VideoOverlayFit loggedFit { VideoOverlayFit::Stretch };
+ };
+ 
+ static const char* videoOverlaySocketPath()
+@@ -2980,9 +3017,41 @@
+     if (dstX2 <= dstX1 || dstY2 <= dstY1)
+         return false;
+ 
+-    // 裁剪到内容条带区，源矩形按比例跟进（16.16 定点）。
++    // 解码器已按输出方向预旋转。先按源帧纵横比适配完整目标矩形，再裁剪到
++    // panel-native 内容条带。contain 保留完整画面，cover 保留目标尺寸并居中
++    // 裁剪源帧，stretch 仅作为旧行为回滚开关。
++    auto fit = configuredVideoOverlayFit();
+     int32_t fullW = dstX2 - dstX1;
+     int32_t fullH = dstY2 - dstY1;
++    uint64_t srcBaseX = 0;
++    uint64_t srcBaseY = 0;
++    uint64_t srcBaseW = static_cast<uint64_t>(frame.width) << 16;
++    uint64_t srcBaseH = static_cast<uint64_t>(frame.height) << 16;
++    if (fit == VideoOverlayFit::Contain) {
++        if (static_cast<uint64_t>(frame.width) * fullH > static_cast<uint64_t>(frame.height) * fullW) {
++            int32_t fittedH = std::max<int32_t>(1, static_cast<int64_t>(fullW) * frame.height / frame.width);
++            dstY1 += (fullH - fittedH) / 2;
++            dstY2 = dstY1 + fittedH;
++        } else {
++            int32_t fittedW = std::max<int32_t>(1, static_cast<int64_t>(fullH) * frame.width / frame.height);
++            dstX1 += (fullW - fittedW) / 2;
++            dstX2 = dstX1 + fittedW;
++        }
++        fullW = dstX2 - dstX1;
++        fullH = dstY2 - dstY1;
++    } else if (fit == VideoOverlayFit::Cover) {
++        if (static_cast<uint64_t>(frame.width) * fullH > static_cast<uint64_t>(frame.height) * fullW) {
++            uint64_t croppedWidth = static_cast<uint64_t>(frame.height) * fullW / fullH;
++            srcBaseX = ((static_cast<uint64_t>(frame.width) - croppedWidth) << 15);
++            srcBaseW = croppedWidth << 16;
++        } else {
++            uint64_t croppedHeight = static_cast<uint64_t>(frame.width) * fullH / fullW;
++            srcBaseY = ((static_cast<uint64_t>(frame.height) - croppedHeight) << 15);
++            srcBaseH = croppedHeight << 16;
++        }
++    }
++
++    // 裁剪到内容条带区，源矩形按比例跟进（16.16 定点）。
+     int32_t clipX1 = std::max<int32_t>(dstX1, contentX1);
+     int32_t clipY1 = std::max<int32_t>(dstY1, contentY1);
+     int32_t clipX2 = std::min<int32_t>(dstX2, contentX2);
+@@ -2998,12 +3067,24 @@
+         return true;
+     }
+ 
+-    uint64_t srcFullW = static_cast<uint64_t>(frame.width) << 16;
+-    uint64_t srcFullH = static_cast<uint64_t>(frame.height) << 16;
+-    uint64_t srcX = srcFullW * (clipX1 - dstX1) / fullW;
+-    uint64_t srcY = srcFullH * (clipY1 - dstY1) / fullH;
+-    uint64_t srcW = srcFullW * (clipX2 - clipX1) / fullW;
+-    uint64_t srcH = srcFullH * (clipY2 - clipY1) / fullH;
++    uint64_t srcX = srcBaseX + srcBaseW * (clipX1 - dstX1) / fullW;
++    uint64_t srcY = srcBaseY + srcBaseH * (clipY1 - dstY1) / fullH;
++    uint64_t srcW = srcBaseW * (clipX2 - clipX1) / fullW;
++    uint64_t srcH = srcBaseH * (clipY2 - clipY1) / fullH;
++
++    if (overlay->loggedFrameWidth != frame.width || overlay->loggedFrameHeight != frame.height
++        || overlay->loggedCrtcWidth != clipX2 - clipX1 || overlay->loggedCrtcHeight != clipY2 - clipY1
++        || overlay->loggedFit != fit) {
++        g_message("WPEViewDRM video overlay geometry: fit=%s frame=%ux%u rect=%dx%d+%d+%d crtc=%dx%d+%d+%d src=%" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT " rotation=%u",
++            videoOverlayFitName(fit), frame.width, frame.height, frame.rectWidth, frame.rectHeight, frame.rectX, frame.rectY,
++            clipX2 - clipX1, clipY2 - clipY1, clipX1, clipY1,
++            srcW >> 16, srcH >> 16, srcX >> 16, srcY >> 16, static_cast<unsigned>(rotation));
++        overlay->loggedFrameWidth = frame.width;
++        overlay->loggedFrameHeight = frame.height;
++        overlay->loggedCrtcWidth = clipX2 - clipX1;
++        overlay->loggedCrtcHeight = clipY2 - clipY1;
++        overlay->loggedFit = fit;
++    }
+ 
+     auto properties = overlay->plane->properties();
+     properties.crtcID.second = crtc.id();

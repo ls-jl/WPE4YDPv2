@@ -1,0 +1,39 @@
+From: WPE4YDPv2 maintainers
+Subject: [PATCH] WebRTC: allow bypassing intermediate incoming-track sync
+
+Incoming WebRTC samples are handed from an intermediate fakesink to the
+RealtimeIncomingSource and then pushed into the MediaStream playback pipeline.
+The final playback pipeline already performs clock synchronization.
+
+Some cloud gaming servers expose RTP timestamps far ahead of the local
+pipeline running time. Synchronizing the intermediate fakesink to those
+timestamps blocks its queue after a few decoded frames, even though RTP
+packets continue to arrive.
+
+Keep the upstream behavior by default and add an explicit runtime switch for
+the embedded receiver. This keeps the experiment independently reversible.
+
+---
+ .../gstreamer/GStreamerIncomingTrackProcessor.cpp       | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+index 000000000000..000000000000 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -102,8 +102,12 @@ void GStreamerIncomingTrackProcessor::configure(ThreadSafeWeakPtr<GStreamerMedi
+     if (!m_sdpMsIdAndTrackId.second.isEmpty())
+         m_data.trackId = m_sdpMsIdAndTrackId.second;
+ 
++    bool synchronizeIncomingSamples = g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC"), "1");
+     m_sink = gst_element_factory_make("fakesink", "sink");
+-    g_object_set(m_sink.get(), "sync", TRUE, "enable-last-sample", FALSE, "qos", TRUE, nullptr);
++    g_object_set(m_sink.get(), "sync", synchronizeIncomingSamples, "enable-last-sample", FALSE, "qos", TRUE, nullptr);
++    GST_INFO_OBJECT(m_sink.get(), "Intermediate incoming-track clock synchronization: %s",
++        synchronizeIncomingSamples ? "enabled" : "disabled");
++
+     auto queue = gst_element_factory_make("queue", "queue");
+ 
+     auto trackProcessor = incomingTrackProcessor();
+-- 
+2.39.5

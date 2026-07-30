@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <glib/gstdio.h>
+#include <math.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -93,6 +94,8 @@ void browser_profile_clear(BrowserProfile *profile)
     g_free(profile->name);
     g_free(profile->home_url);
     g_free(profile->site_profile);
+    g_free(profile->search_engine);
+    g_free(profile->custom_search_template);
     memset(profile, 0, sizeof(*profile));
 }
 
@@ -269,6 +272,66 @@ static char *get_setting(BrowserProfileStore *store, int64_t profile_id,
     return value;
 }
 
+static gboolean setting_boolean(BrowserProfileStore *store, int64_t profile_id,
+                                const char *key, gboolean fallback)
+{
+    char *value = get_setting(store, profile_id, key, fallback ? "1" : "0");
+    gboolean result = value && (!g_ascii_strcasecmp(value, "1")
+        || !g_ascii_strcasecmp(value, "true")
+        || !g_ascii_strcasecmp(value, "yes")
+        || !g_ascii_strcasecmp(value, "on"));
+    g_free(value);
+    return result;
+}
+
+static double setting_double(BrowserProfileStore *store, int64_t profile_id,
+                             const char *key, double fallback,
+                             double minimum, double maximum)
+{
+    char fallback_value[G_ASCII_DTOSTR_BUF_SIZE];
+    g_ascii_dtostr(fallback_value, sizeof(fallback_value), fallback);
+    char *value = get_setting(store, profile_id, key, fallback_value);
+    char *end = NULL;
+    double parsed = g_ascii_strtod(value, &end);
+    if (!value[0] || end == value || *end || !isfinite(parsed))
+        parsed = fallback;
+    g_free(value);
+    return CLAMP(parsed, minimum, maximum);
+}
+
+static guint setting_uint(BrowserProfileStore *store, int64_t profile_id,
+                          const char *key, guint fallback,
+                          guint minimum, guint maximum)
+{
+    char fallback_value[16];
+    g_snprintf(fallback_value, sizeof(fallback_value), "%u", fallback);
+    char *value = get_setting(store, profile_id, key, fallback_value);
+    char *end = NULL;
+    guint64 parsed = g_ascii_strtoull(value, &end, 10);
+    if (!value[0] || end == value || *end)
+        parsed = fallback;
+    g_free(value);
+    return (guint)CLAMP(parsed, minimum, maximum);
+}
+
+static gboolean set_default_settings(BrowserProfileStore *store, int64_t profile_id,
+                                     GError **error)
+{
+    return set_setting(store, profile_id, "home_url", "https://m.baidu.com/", error)
+        && set_setting(store, profile_id, "site_profile", "mobile", error)
+        && set_setting(store, profile_id, "cookie_policy", "all", error)
+        && set_setting(store, profile_id, "search_engine", "baidu", error)
+        && set_setting(store, profile_id, "custom_search_template", "", error)
+        && set_setting(store, profile_id, "page_zoom", "1", error)
+        && set_setting(store, profile_id, "default_font_size", "16", error)
+        && set_setting(store, profile_id, "javascript_enabled", "1", error)
+        && set_setting(store, profile_id, "autoplay_requires_gesture", "0", error)
+        && set_setting(store, profile_id, "smooth_scrolling", "0", error)
+        && set_setting(store, profile_id, "block_popups", "1", error)
+        && set_setting(store, profile_id, "restore_tabs", "1", error)
+        && set_setting(store, profile_id, "next_tab_id", "2", error);
+}
+
 static gboolean create_default_profile(BrowserProfileStore *store, int64_t *profile_id, GError **error)
 {
     sqlite3_stmt *statement = NULL;
@@ -283,10 +346,7 @@ static gboolean create_default_profile(BrowserProfileStore *store, int64_t *prof
     *profile_id = sqlite3_last_insert_rowid(store->database);
     if (!set_meta_id(store, "active_profile_id", *profile_id, error))
         return FALSE;
-    return set_setting(store, *profile_id, "home_url", "https://m.baidu.com/", error)
-        && set_setting(store, *profile_id, "site_profile", "mobile", error)
-        && set_setting(store, *profile_id, "cookie_policy", "all", error)
-        && set_setting(store, *profile_id, "next_tab_id", "2", error);
+    return set_default_settings(store, *profile_id, error);
 }
 
 static gboolean database_has_profiles(BrowserProfileStore *store)
@@ -626,6 +686,27 @@ gboolean browser_profile_store_get_profile(BrowserProfileStore *store, int64_t p
     char *cookie_policy = get_setting(store, profile_id, "cookie_policy", "all");
     profile->cookie_policy = cookie_policy_from_name(cookie_policy);
     g_free(cookie_policy);
+    profile->search_engine = get_setting(store, profile_id, "search_engine", "baidu");
+    if (g_strcmp0(profile->search_engine, "baidu")
+            && g_strcmp0(profile->search_engine, "bing")
+            && g_strcmp0(profile->search_engine, "google")
+            && g_strcmp0(profile->search_engine, "custom")) {
+        g_free(profile->search_engine);
+        profile->search_engine = g_strdup("baidu");
+    }
+    profile->custom_search_template = get_setting(store, profile_id,
+                                                  "custom_search_template", "");
+    profile->page_zoom = setting_double(store, profile_id, "page_zoom", 1.0, 0.75, 1.25);
+    profile->default_font_size = setting_uint(store, profile_id,
+                                              "default_font_size", 16, 14, 20);
+    profile->javascript_enabled = setting_boolean(store, profile_id,
+                                                  "javascript_enabled", TRUE);
+    profile->autoplay_requires_gesture = setting_boolean(store, profile_id,
+                                                         "autoplay_requires_gesture", FALSE);
+    profile->smooth_scrolling = setting_boolean(store, profile_id,
+                                                "smooth_scrolling", FALSE);
+    profile->block_popups = setting_boolean(store, profile_id, "block_popups", TRUE);
+    profile->restore_tabs = setting_boolean(store, profile_id, "restore_tabs", TRUE);
     return TRUE;
 }
 
@@ -758,10 +839,7 @@ gboolean browser_profile_store_create_profile(BrowserProfileStore *store, const 
     sqlite3_finalize(statement);
     int64_t profile_id = sqlite3_last_insert_rowid(store->database);
     success = success
-        && set_setting(store, profile_id, "home_url", "https://m.baidu.com/", error)
-        && set_setting(store, profile_id, "site_profile", "mobile", error)
-        && set_setting(store, profile_id, "cookie_policy", "all", error)
-        && set_setting(store, profile_id, "next_tab_id", "2", error)
+        && set_default_settings(store, profile_id, error)
         && commit_transaction(store->database, error);
     if (!success)
         rollback_transaction(store->database);
@@ -891,6 +969,77 @@ gboolean browser_profile_store_set_cookie_policy(BrowserProfileStore *store, int
                                                  BrowserCookiePolicy policy, GError **error)
 {
     return set_setting(store, profile_id, "cookie_policy", browser_cookie_policy_name(policy), error);
+}
+
+gboolean browser_profile_store_save_preferences(BrowserProfileStore *store,
+                                                const BrowserProfile *profile,
+                                                GError **error)
+{
+    g_return_val_if_fail(store && profile && profile->id > 0, FALSE);
+    char zoom[G_ASCII_DTOSTR_BUF_SIZE];
+    char font_size[16];
+    g_ascii_dtostr(zoom, sizeof(zoom), CLAMP(profile->page_zoom, 0.75, 1.25));
+    g_snprintf(font_size, sizeof(font_size), "%u",
+               CLAMP(profile->default_font_size, 14, 20));
+
+    if (!begin_transaction(store->database, error))
+        return FALSE;
+    gboolean success =
+        set_setting(store, profile->id, "search_engine",
+                    profile->search_engine ? profile->search_engine : "baidu", error)
+        && set_setting(store, profile->id, "custom_search_template",
+                       profile->custom_search_template ? profile->custom_search_template : "", error)
+        && set_setting(store, profile->id, "page_zoom", zoom, error)
+        && set_setting(store, profile->id, "default_font_size", font_size, error)
+        && set_setting(store, profile->id, "javascript_enabled",
+                       profile->javascript_enabled ? "1" : "0", error)
+        && set_setting(store, profile->id, "autoplay_requires_gesture",
+                       profile->autoplay_requires_gesture ? "1" : "0", error)
+        && set_setting(store, profile->id, "smooth_scrolling",
+                       profile->smooth_scrolling ? "1" : "0", error)
+        && set_setting(store, profile->id, "block_popups",
+                       profile->block_popups ? "1" : "0", error)
+        && set_setting(store, profile->id, "restore_tabs",
+                       profile->restore_tabs ? "1" : "0", error)
+        && commit_transaction(store->database, error);
+    if (!success)
+        rollback_transaction(store->database);
+    return success;
+}
+
+void browser_profile_store_get_global_settings(BrowserProfileStore *store,
+                                               BrowserGlobalSettings *settings)
+{
+    g_return_if_fail(settings);
+    memset(settings, 0, sizeof(*settings));
+    g_strlcpy(settings->theme, "light", sizeof(settings->theme));
+    settings->toolbar_auto_hide = TRUE;
+    if (!store)
+        return;
+
+    char *theme = get_meta(store, "ui_theme");
+    if (theme && !g_ascii_strcasecmp(theme, "dark"))
+        g_strlcpy(settings->theme, "dark", sizeof(settings->theme));
+    g_free(theme);
+    char *auto_hide = get_meta(store, "toolbar_auto_hide");
+    if (auto_hide) {
+        settings->toolbar_auto_hide = !g_ascii_strcasecmp(auto_hide, "1")
+            || !g_ascii_strcasecmp(auto_hide, "true")
+            || !g_ascii_strcasecmp(auto_hide, "yes")
+            || !g_ascii_strcasecmp(auto_hide, "on");
+    }
+    g_free(auto_hide);
+}
+
+gboolean browser_profile_store_save_global_settings(BrowserProfileStore *store,
+                                                    const BrowserGlobalSettings *settings,
+                                                    GError **error)
+{
+    g_return_val_if_fail(store && settings, FALSE);
+    return set_meta(store, "ui_theme",
+                    !g_ascii_strcasecmp(settings->theme, "dark") ? "dark" : "light", error)
+        && set_meta(store, "toolbar_auto_hide",
+                    settings->toolbar_auto_hide ? "1" : "0", error);
 }
 
 static gboolean insert_navigation(sqlite3 *database, int64_t tab_id, int kind,

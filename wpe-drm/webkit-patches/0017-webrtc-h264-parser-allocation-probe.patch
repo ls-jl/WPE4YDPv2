@@ -1,0 +1,57 @@
+From: WPE4YDPv2 maintainers
+Subject: [PATCH] GStreamer: stop H.264 allocation before decodebin3
+
+Handling parsebin's autoplug allocation query is not sufficient after the
+parsebin source pad has been exposed. A second allocation query can enter
+decodebin3's parse-chain output probe while its decoder is being
+reconfigured. The appsrc task then blocks there and the MPP decoder receives
+only STREAM_START.
+
+Install an opt-in downstream query probe directly on h264parse's source pad
+when the element is created. Encoded H.264 needs no raw-video allocation
+pool, so complete allocation queries before they can enter parsebin or
+decodebin3. The existing autoplug handler remains as a fallback.
+
+---
+ .../gstreamer/MediaPlayerPrivateGStreamer.cpp | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -2800,6 +2800,33 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
+ 
+     if (isMediaStreamPlayer() && requireRockchipMppH264AccessUnits()) {
+         auto* factory = gst_element_get_factory(element);
++        if (factory && !g_strcmp0(GST_OBJECT_NAME(factory), "h264parse")
++            && !g_object_get_data(G_OBJECT(element), "webkit-h264-parser-allocation-probe")) {
++            auto sourcePad = adoptGRef(gst_element_get_static_pad(element, "src"));
++            if (sourcePad) {
++                gst_pad_add_probe(sourcePad.get(), GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
++                    +[](GstPad* pad, GstPadProbeInfo* info, gpointer) -> GstPadProbeReturn {
++                        auto* query = GST_PAD_PROBE_INFO_QUERY(info);
++                        if (!query || GST_QUERY_TYPE(query) != GST_QUERY_ALLOCATION)
++                            return GST_PAD_PROBE_OK;
++
++                        GstCaps* caps = nullptr;
++                        gboolean needPool = FALSE;
++                        gst_query_parse_allocation(query, &caps, &needPool);
++                        if (!caps || !doCapsHaveType(caps, "video/x-h264"_s))
++                            return GST_PAD_PROBE_OK;
++
++                        if (!g_object_get_data(G_OBJECT(pad), "webkit-h264-parser-allocation-handled")) {
++                            g_object_set_data(G_OBJECT(pad), "webkit-h264-parser-allocation-handled", GINT_TO_POINTER(1));
++                            GST_WARNING_OBJECT(pad, "Completing encoded H.264 allocation before parsebin/decodebin3 (need-pool=%s): %" GST_PTR_FORMAT,
++                                boolForPrinting(needPool), caps);
++                        }
++                        return GST_PAD_PROBE_HANDLED;
++                    }, nullptr, nullptr);
++                g_object_set_data(G_OBJECT(element), "webkit-h264-parser-allocation-probe", GINT_TO_POINTER(1));
++            }
++        }
++
+         if (factory && !g_strcmp0(GST_OBJECT_NAME(factory), "mppvideodec")
+             && !g_object_get_data(G_OBJECT(element), "webkit-mpp-h264-au-probe")) {
+             auto sinkPad = adoptGRef(gst_element_get_static_pad(element, "sink"));
+-- 
+2.39.5

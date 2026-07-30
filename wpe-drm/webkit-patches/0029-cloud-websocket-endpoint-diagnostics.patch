@@ -1,0 +1,94 @@
+--- a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+@@ -56,6 +56,20 @@
+     return enabled;
+ }
+ 
++static void logCloudWebSocketPayload(SoupWebsocketConnection* connection, const char* direction, const char* type, size_t byteCount)
++{
++    if (!cloudWebSocketDiagnosticsEnabled())
++        return;
++
++    GUri* uri = connection ? soup_websocket_connection_get_uri(connection) : nullptr;
++    g_message("WebSocket %s: host=%s port=%d type=%s bytes=%zu",
++        direction,
++        uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++        uri ? g_uri_get_port(uri) : -1,
++        type,
++        byteCount);
++}
++
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(WebSocketTask);
+ 
+ Ref<WebSocketTask> WebSocketTask::create(NetworkSocketChannel& channel, const WebCore::ResourceRequest& request, SoupSession* session, SoupMessage* msg, const String& protocol)
+@@ -113,11 +127,12 @@
+                 SoupMessageHeaders* requestHeaders = message ? soup_message_get_request_headers(message) : nullptr;
+                 const char* protocol = soup_websocket_connection_get_protocol(connection.get());
+                 const char* cookie = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Cookie") : nullptr;
+-                g_message("WebSocket handshake connected: host=%s port=%d protocol=%s cookie-present=%d",
+-                    uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
+-                    uri ? g_uri_get_port(uri) : -1,
+-                    protocol ? protocol : "(none)",
+-                    !!cookie);
++                if (cloudWebSocketDiagnosticsEnabled())
++                    g_message("WebSocket handshake connected: host=%s port=%d protocol=%s cookie-present=%d",
++                        uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++                        uri ? g_uri_get_port(uri) : -1,
++                        protocol ? protocol : "(none)",
++                        !!cookie);
+                 task->didConnect(WTF::move(connection));
+             } else {
+                 SoupMessage* message = task->m_handshakeMessage.get();
+@@ -216,7 +231,8 @@
+         return;
+ 
+     std::span data = span(message);
+-    g_message("WebSocket message: type=%u bytes=%zu", static_cast<unsigned>(dataType), data.size());
++    logCloudWebSocketPayload(task->m_connection.get(), "inbound",
++        dataType == SOUP_WEBSOCKET_DATA_TEXT ? "text" : "binary", data.size());
+     switch (dataType) {
+     case SOUP_WEBSOCKET_DATA_TEXT:
+         protect(task->m_channel)->didReceiveText(String::fromUTF8(data));
+@@ -272,7 +288,13 @@
+         code = SOUP_WEBSOCKET_CLOSE_ABNORMAL;
+     }
+     auto reason = String::fromUTF8(soup_websocket_connection_get_close_data(task->m_connection.get()));
+-    g_message("WebSocket closed: code=%u reason=%s", code, reason.utf8().data());
++    if (cloudWebSocketDiagnosticsEnabled()) {
++        GUri* uri = task->m_connection ? soup_websocket_connection_get_uri(task->m_connection.get()) : nullptr;
++        g_message("WebSocket closed: host=%s port=%d code=%u reason_bytes=%u",
++            uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++            uri ? g_uri_get_port(uri) : -1,
++            code, reason.sizeInBytes());
++    }
+     task->didClose(code, WTF::move(reason));
+ }
+ 
+@@ -288,8 +310,7 @@
+ void WebSocketTask::sendString(std::span<const uint8_t> utf8, CompletionHandler<void()>&& callback)
+ {
+     if (m_connection && soup_websocket_connection_get_state(m_connection.get()) == SOUP_WEBSOCKET_STATE_OPEN) {
+-        if (cloudWebSocketDiagnosticsEnabled())
+-            g_message("WebSocket outbound: type=text bytes=%zu", utf8.size());
++        logCloudWebSocketPayload(m_connection.get(), "outbound", "text", utf8.size());
+         // Soup is going to copy the data immediately, so we can use g_bytes_new_static() here to avoid more data copies.
+         GRefPtr<GBytes> bytes = adoptGRef(g_bytes_new_static(utf8.data(), utf8.size()));
+         soup_websocket_connection_send_message(m_connection.get(), SOUP_WEBSOCKET_DATA_TEXT, bytes.get());
+@@ -300,8 +321,7 @@
+ void WebSocketTask::sendData(std::span<const uint8_t> data, CompletionHandler<void()>&& callback)
+ {
+     if (m_connection && soup_websocket_connection_get_state(m_connection.get()) == SOUP_WEBSOCKET_STATE_OPEN) {
+-        if (cloudWebSocketDiagnosticsEnabled())
+-            g_message("WebSocket outbound: type=binary bytes=%zu", data.size());
++        logCloudWebSocketPayload(m_connection.get(), "outbound", "binary", data.size());
+         soup_websocket_connection_send_binary(m_connection.get(), data.data(), data.size());
+     }
+     callback();
+@@ -313,7 +333,7 @@
+         return;
+ 
+     if (cloudWebSocketDiagnosticsEnabled())
+-        g_message("WebSocket local close requested: code=%d reason_bytes=%zu connected=%d", code, reason.sizeInBytes(), !!m_connection);
++        g_message("WebSocket local close requested: code=%d reason_bytes=%u connected=%d", code, reason.sizeInBytes(), !!m_connection);
+ 
+     if (!m_connection) {

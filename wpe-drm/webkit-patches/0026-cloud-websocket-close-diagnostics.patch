@@ -1,0 +1,20 @@
+diff --git a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+--- a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+@@ -210,6 +210,7 @@
+         return;
+ 
+     std::span data = span(message);
++    g_message("WebSocket message: type=%u bytes=%zu", static_cast<unsigned>(dataType), data.size());
+     switch (dataType) {
+     case SOUP_WEBSOCKET_DATA_TEXT:
+         protect(task->m_channel)->didReceiveText(String::fromUTF8(data));
+@@ -264,7 +265,9 @@
+         // The connection was closed but close frame was not received or sent.
+         code = SOUP_WEBSOCKET_CLOSE_ABNORMAL;
+     }
+-    task->didClose(code, String::fromUTF8(soup_websocket_connection_get_close_data(task->m_connection.get())));
++    auto reason = String::fromUTF8(soup_websocket_connection_get_close_data(task->m_connection.get()));
++    g_message("WebSocket closed: code=%u reason=%s", code, reason.utf8().data());
++    task->didClose(code, WTF::move(reason));
+ }

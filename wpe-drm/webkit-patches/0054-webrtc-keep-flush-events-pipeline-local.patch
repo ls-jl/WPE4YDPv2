@@ -1,0 +1,18 @@
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp b/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp
+--- a/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp
+@@ -301,6 +301,14 @@ GstPadProbeReturn RealtimeIncomingSourceGStreamer::handleDownstreamEvent(GRefPtr
+     case GST_EVENT_CAPS:
+     case GST_EVENT_SEGMENT:
+     case GST_EVENT_STREAM_COLLECTION:
++        return GST_PAD_PROBE_OK;
++    case GST_EVENT_FLUSH_START:
++    case GST_EVENT_FLUSH_STOP:
++        // Flush events belong to the endpoint pipeline. Forwarding them
++        // synchronously into a MediaPlayer appsrc can deadlock while both
++        // pipelines are changing state during RTCPeerConnection::close().
++        GST_INFO_OBJECT(m_sink.get(), "Keeping pipeline-local %s event out of client appsrc pipelines",
++            GST_EVENT_TYPE_NAME(event.get()));
+         return GST_PAD_PROBE_OK;
+     case GST_EVENT_LATENCY: {
+         GstClockTime minLatency, maxLatency;

@@ -1,0 +1,84 @@
+From: WPE4YDPv2 maintainers
+Subject: [PATCH] WebRTC: reparse NAL-aligned H.264 before the player decoder
+
+The deferred WebRTC decode path forwards rtph264depay output through a
+MediaStream appsrc. The Rockchip MPP plugin advertises only parsed=true and
+does not constrain alignment, so decodebin3 links NAL-aligned H.264 directly
+to mppvideodec. In practice this old decoder expects complete access units:
+the player remains pending PLAYING, appsrc stops consuming after its initial
+NALs, and the RTP receive queue eventually overruns.
+
+Add an embedded-runtime diagnostic switch which marks incoming H.264 samples
+as parsed=false at the final MediaStream appsrc boundary. This makes
+decodebin3 insert h264parse, allowing it to aggregate NAL buffers into access
+units before MPP. The switch affects only incoming video consumed by a player
+and leaves normal media playback and the early WebRTC decode path unchanged.
+
+---
+ .../gstreamer/GStreamerMediaStreamSource.cpp       | 31 ++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+@@ -81,6 +81,12 @@ static bool retimestampIncomingMedia()
+     return value && !g_strcmp0(value, "1");
+ }
+ 
++static bool reparseIncomingH264()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_REPARSE_H264");
++    return value && !g_strcmp0(value, "1");
++}
++
+ [[nodiscard]] GRefPtr<GstTagList> mediaStreamTrackPrivateGetTags(const RefPtr<MediaStreamTrackPrivate>& track)
+ {
+     auto tagList = adoptGRef(gst_tag_list_new_empty());
+@@ -387,6 +393,28 @@ private:
+             }
+         }
+ 
++        if (m_reparseIncomingH264) {
++            auto* caps = gst_sample_get_caps(sampleToPush.get());
++            if (caps && doCapsHaveType(caps, "video/x-h264"_s)) {
++                auto parserInputCaps = adoptGRef(gst_caps_copy(caps));
++                for (unsigned i = 0; i < gst_caps_get_size(parserInputCaps.get()); ++i)
++                    gst_structure_set(gst_caps_get_structure(parserInputCaps.get(), i), "parsed", G_TYPE_BOOLEAN, FALSE, nullptr);
++
++                auto* currentBuffer = gst_sample_get_buffer(sampleToPush.get());
++                const auto* currentInfo = gst_sample_get_info(sampleToPush.get());
++                sampleToPush = adoptGRef(gst_sample_new(currentBuffer, parserInputCaps.get(),
++                    gst_sample_get_segment(sampleToPush.get()),
++                    currentInfo ? gst_structure_copy(currentInfo) : nullptr));
++
++                static std::once_flag logged;
++                std::call_once(logged, [this, caps] {
++                    GST_WARNING_OBJECT(m_src.get(),
++                        "Forcing incoming H.264 reparse before player decoder; input caps: %" GST_PTR_FORMAT,
++                        caps);
++                });
++            }
++        }
++
+         bool drop = m_enoughData && !m_useLeakyIncomingVideoQueue;
+         auto buffer = gst_sample_get_buffer(sampleToPush.get());
+ 
+@@ -611,6 +639,8 @@ private:
+         m_retimestampIncomingMedia = m_consumerIsVideoPlayer
+             && (m_isIncomingVideoSource || trackSource.isIncomingAudioSource())
+             && retimestampIncomingMedia();
++        m_reparseIncomingH264 = m_consumerIsVideoPlayer && m_isIncomingVideoSource
++            && reparseIncomingH264();
+ 
+         ASCIILiteral namePrefix;
+         if (trackSource.isIncomingAudioSource() || m_isIncomingVideoSource)
+@@ -892,6 +922,7 @@ private:
+     bool m_enoughData { false };
+     bool m_useLeakyIncomingVideoQueue { false };
+     bool m_retimestampIncomingMedia { false };
++    bool m_reparseIncomingH264 { false };
+     bool m_needsDiscont { false };
+     String m_padName;
+     bool m_isObserving { false };
+-- 
+2.39.5

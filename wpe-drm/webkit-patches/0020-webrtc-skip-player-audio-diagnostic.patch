@@ -1,0 +1,47 @@
+From: WPE4YDPv2 maintainers
+Subject: [PATCH] WebRTC: fully skip player audio for delayed-track diagnosis
+
+The existing WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO switch clears playbin's
+audio flag but still exposes an audio appsrc. If the remote audio track has no
+sample yet, uridecodebin3 cannot discover its caps and the combined
+MediaStream player remains pending PAUSED, so its ready video track never
+reaches the final sink.
+
+When the diagnostic switch is enabled, do not add audio tracks to the
+MediaStream playback source. The WebRTC receiver and DataChannel remain
+untouched. This makes the switch an actual video-only diagnostic and is
+reversible independently of normal playback.
+
+---
+ .../gstreamer/GStreamerMediaStreamSource.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+@@ -82,6 +82,12 @@ static bool reparseIncomingH264()
+     return value && !g_strcmp0(value, "1");
+ }
+ 
++static bool disableMediaStreamPlayerAudio()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO");
++    return value && !g_strcmp0(value, "1");
++}
++
+ [[nodiscard]] GRefPtr<GstTagList> mediaStreamTrackPrivateGetTags(const RefPtr<MediaStreamTrackPrivate>& track)
+ {
+     auto tagList = adoptGRef(gst_tag_list_new_empty());
+@@ -1551,6 +1557,10 @@ void webkitMediaStreamSrcSetStream(WebKitMediaStreamSrc* self, MediaStreamPrivat
+     for (auto& track : tracks) {
+         if (!isVideoPlayer && track->isVideo())
+             continue;
++        if (isVideoPlayer && track->isAudio() && disableMediaStreamPlayerAudio()) {
++            GST_WARNING_OBJECT(self, "Skipping MediaStream player audio source for delayed-track diagnosis");
++            continue;
++        }
+         webkitMediaStreamSrcAddTrack(self, track.ptr(), isVideoPlayer);
+     }
+ 
+-- 
+2.39.5

@@ -123,15 +123,15 @@ static bool test_linear_scanout(struct gbm_device *gbm, int drm_fd)
     }
 
     struct gbm_bo *bo = create_with_modifiers2(
-        gbm, width, height, DRM_FORMAT_XRGB8888, &linear_modifier, 1,
+        gbm, width, height, DRM_FORMAT_ARGB8888, &linear_modifier, 1,
         GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
     if (!bo) {
-        bo = gbm_bo_create(gbm, width, height, DRM_FORMAT_XRGB8888,
+        bo = gbm_bo_create(gbm, width, height, DRM_FORMAT_ARGB8888,
                            GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT |
                                GBM_BO_USE_LINEAR);
     }
     if (!bo) {
-        fprintf(stderr, "gpu_probe: linear XRGB8888 GBM allocation failed\n");
+        fprintf(stderr, "gpu_probe: linear ARGB8888 GBM allocation failed\n");
         return false;
     }
 
@@ -168,7 +168,7 @@ static bool test_linear_scanout(struct gbm_device *gbm, int drm_fd)
             .width = width,
             .height = height,
             .stride = pitch,
-            .format = DRM_FORMAT_XRGB8888,
+            .format = DRM_FORMAT_ARGB8888,
         };
         struct gbm_bo *imported = gbm_bo_import(
             gbm, GBM_BO_IMPORT_FD, &import_data,
@@ -211,7 +211,7 @@ static bool test_linear_scanout(struct gbm_device *gbm, int drm_fd)
     uint32_t pitches[4] = { pitch, 0, 0, 0 };
     uint32_t offsets[4] = { 0, 0, 0, 0 };
     uint32_t framebuffer = 0;
-    if (drmModeAddFB2(drm_fd, width, height, DRM_FORMAT_XRGB8888,
+    if (drmModeAddFB2(drm_fd, width, height, DRM_FORMAT_ARGB8888,
                       handles, pitches, offsets, &framebuffer, 0) != 0) {
         fprintf(stderr, "gpu_probe: drmModeAddFB2 failed errno=%d\n", errno);
     } else {

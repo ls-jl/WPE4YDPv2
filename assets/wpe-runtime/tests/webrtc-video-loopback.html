@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebRTC Video Loopback Starting</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #101214;
+      color: #f5f7fa;
+      font: 14px sans-serif;
+    }
+
+    main {
+      box-sizing: border-box;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      width: 100%;
+      height: 100%;
+      padding: 8px;
+    }
+
+    canvas,
+    video {
+      width: 100%;
+      min-height: 0;
+      background: #000;
+      object-fit: contain;
+    }
+
+    pre {
+      grid-column: 1 / -1;
+      height: 56px;
+      margin: 0;
+      overflow: hidden;
+      color: #55b9ff;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <canvas id="source" width="320" height="180"></canvas>
+    <video id="remote" autoplay muted playsinline></video>
+    <pre id="status">starting</pre>
+  </main>
+  <script>
+    const canvas = document.querySelector('#source');
+    const context = canvas.getContext('2d');
+    const remoteVideo = document.querySelector('#remote');
+    const status = document.querySelector('#status');
+    const senderPeer = new RTCPeerConnection();
+    const receiverPeer = new RTCPeerConnection();
+    let animationFrame = 0;
+    let connected = false;
+    let decodedFrames = 0;
+    let packetsReceived = 0;
+    let lastVideoTime = 0;
+
+    function log(message) {
+      console.log(`WEBRTC_VIDEO_TEST ${message}`);
+      status.textContent = message;
+    }
+
+    function fail(error) {
+      const message = error && (error.stack || error.message) || String(error);
+      document.title = 'FAIL WebRTC Video Loopback';
+      log(`FAIL ${message}`);
+    }
+
+    function draw() {
+      const phase = animationFrame++ % canvas.width;
+      context.fillStyle = '#071018';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = '#168cff';
+      context.fillRect(phase, 0, 24, canvas.height);
+      context.fillStyle = '#f4d03f';
+      context.fillRect(canvas.width - phase, 45, 18, 90);
+      context.fillStyle = '#ffffff';
+      context.font = '24px sans-serif';
+      context.fillText(`frame ${animationFrame}`, 12, 34);
+      requestAnimationFrame(draw);
+    }
+
+    function preferH264(transceiver) {
+      if (!transceiver.setCodecPreferences || !window.RTCRtpReceiver)
+        return;
+      const capabilities = RTCRtpReceiver.getCapabilities('video');
+      if (!capabilities || !capabilities.codecs)
+        return;
+      const codecs = capabilities.codecs.filter(codec => {
+        const mimeType = codec.mimeType.toLowerCase();
+        return mimeType === 'video/h264' || mimeType === 'video/rtx';
+      });
+      if (codecs.some(codec => codec.mimeType.toLowerCase() === 'video/h264')) {
+        transceiver.setCodecPreferences(codecs);
+        log(`H264 codecs=${codecs.length}`);
+      }
+    }
+
+    async function updateStats() {
+      const reports = await receiverPeer.getStats();
+      reports.forEach(report => {
+        if (report.type !== 'inbound-rtp' || report.kind !== 'video')
+          return;
+        decodedFrames = report.framesDecoded || 0;
+        packetsReceived = report.packetsReceived || 0;
+      });
+
+      const progressed = remoteVideo.currentTime > lastVideoTime + 0.05;
+      lastVideoTime = Math.max(lastVideoTime, remoteVideo.currentTime);
+      log(`connected=${connected} packets=${packetsReceived} decoded=${decodedFrames} time=${remoteVideo.currentTime.toFixed(2)}`);
+
+      if (connected && packetsReceived > 5 && (decodedFrames > 2 || progressed)) {
+        document.title = 'PASS WebRTC H264 Video Loopback';
+        log(`PASS packets=${packetsReceived} decoded=${decodedFrames} time=${remoteVideo.currentTime.toFixed(2)}`);
+      }
+    }
+
+    senderPeer.onicecandidate = event => {
+      if (event.candidate)
+        receiverPeer.addIceCandidate(event.candidate).catch(fail);
+    };
+    receiverPeer.onicecandidate = event => {
+      if (event.candidate)
+        senderPeer.addIceCandidate(event.candidate).catch(fail);
+    };
+    receiverPeer.ontrack = event => {
+      remoteVideo.srcObject = event.streams[0];
+      remoteVideo.play().catch(fail);
+      log('remote track attached');
+    };
+
+    for (const peer of [senderPeer, receiverPeer]) {
+      peer.onconnectionstatechange = () => {
+        connected = connected || peer.connectionState === 'connected';
+        log(`connection=${peer.connectionState}`);
+      };
+    }
+
+    (async () => {
+      if (!canvas.captureStream)
+        throw new Error('canvas.captureStream unavailable');
+
+      draw();
+      const stream = canvas.captureStream(30);
+      const track = stream.getVideoTracks()[0];
+      if (!track)
+        throw new Error('canvas video track unavailable');
+
+      senderPeer.addTrack(track, stream);
+      preferH264(senderPeer.getTransceivers()[0]);
+
+      const offer = await senderPeer.createOffer();
+      await senderPeer.setLocalDescription(offer);
+      await receiverPeer.setRemoteDescription(offer);
+      const answer = await receiverPeer.createAnswer();
+      await receiverPeer.setLocalDescription(answer);
+      await senderPeer.setRemoteDescription(answer);
+      log('offer/answer complete');
+
+      setInterval(() => updateStats().catch(fail), 1000);
+      setTimeout(() => {
+        if (!document.title.startsWith('PASS'))
+          fail(new Error(`timeout packets=${packetsReceived} decoded=${decodedFrames}`));
+      }, 15000);
+    })().catch(fail);
+  </script>
+</body>
+</html>

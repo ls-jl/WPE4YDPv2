@@ -1,0 +1,64 @@
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp
+@@ -49,6 +49,13 @@
+ #define DC_MEMDUMP(...) GST_MEMDUMP(__VA_ARGS__)
+ #endif
+ 
++// Keep cloud-game diagnostics payload-free. This is deliberately opt-in so
++// normal data-channel traffic is not promoted to warning-level logging.
++#define DC_CLOUD_DIAGNOSTIC(...) do { \
++    if (!g_strcmp0(g_getenv("WEBKIT_CLOUD_DATACHANNEL_DIAGNOSTICS"), "1")) \
++        GST_WARNING(__VA_ARGS__); \
++} while (0)
++
+ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(GStreamerDataChannelHandler);
+@@ -103,6 +110,7 @@
+         Locker locker { m_clientLock };
+         checkState();
+     }
++    DC_CLOUD_DIAGNOSTIC("DataChannel created id=%s", m_channelId.ascii().data());
+ 
+     m_signalHandlers.append(g_signal_connect_data(m_channel.get(), "notify::ready-state", G_CALLBACK(+[](GstWebRTCDataChannel*, GParamSpec*, DataChannelNotifier* notifier) {
+         notifier->m_handler.readyStateChanged();
+@@ -263,6 +271,7 @@
+ 
+     GstWebRTCDataChannelState channelState;
+     g_object_get(m_channel.get(), "ready-state", &channelState, nullptr);
++    DC_CLOUD_DIAGNOSTIC("DataChannel state id=%s state=%d", m_channelId.ascii().data(), static_cast<int>(channelState));
+     if (!channelState) {
+         DC_DEBUG("Data-channel ready-state hasn't been set yet.");
+         return false;
+@@ -355,6 +364,7 @@
+ 
+ void GStreamerDataChannelHandler::onMessageData(GBytes* bytes)
+ {
++    DC_CLOUD_DIAGNOSTIC("DataChannel received binary id=%s bytes=%zu", m_channelId.ascii().data(), g_bytes_get_size(bytes));
+     DC_DEBUG("Incoming data of size: %zu", g_bytes_get_size(bytes));
+     Locker locker { m_clientLock };
+ 
+@@ -379,6 +389,7 @@
+ 
+ void GStreamerDataChannelHandler::onMessageString(CStringView message)
+ {
++    DC_CLOUD_DIAGNOSTIC("DataChannel received string id=%s bytes=%zu", m_channelId.ascii().data(), message.lengthInBytes());
+     Locker locker { m_clientLock };
+ 
+     DC_TRACE("Incoming string: %s", message.utf8());
+@@ -421,6 +432,7 @@
+ 
+ void GStreamerDataChannelHandler::onClose()
+ {
++    DC_CLOUD_DIAGNOSTIC("DataChannel closed id=%s", m_channelId.ascii().data());
+     Locker locker { m_clientLock };
+     DC_DEBUG("Channel %p closed!", m_channel.get());
+     checkState();
+@@ -437,6 +449,7 @@
+     ScriptExecutionContext::postTaskTo(*m_contextIdentifier, WTF::move(function));
+ }
+ 
++#undef DC_CLOUD_DIAGNOSTIC
+ #undef GST_CAT_DEFAULT
+ 
+ } // namespace WebCore

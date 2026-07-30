@@ -1,0 +1,46 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -273,27 +273,30 @@
+             return createParser();
+ 
+         GST_WARNING_OBJECT(m_bin.get(), "Using static rtpopusdepay -> opusdec WebRTC audio chain");
+-        GRefPtr<GstElement> processor = adoptGRef(gst_bin_new("webkit-opus-decoder"));
+-        GRefPtr<GstElement> depayloader = makeGStreamerElement("rtpopusdepay"_s);
+-        GRefPtr<GstElement> decoder = makeGStreamerElement("opusdec"_s);
+-        GRefPtr<GstElement> converter = makeGStreamerElement("audioconvert"_s);
+-        GRefPtr<GstElement> resampler = makeGStreamerElement("audioresample"_s);
++        auto* processor = gst_bin_new("webkit-opus-decoder");
++        gst_object_ref_sink(processor);
++        auto* depayloader = gst_element_factory_make("rtpopusdepay", nullptr);
++        auto* decoder = gst_element_factory_make("opusdec", nullptr);
++        auto* converter = gst_element_factory_make("audioconvert", nullptr);
++        auto* resampler = gst_element_factory_make("audioresample", nullptr);
+ 
+-        configureMediaStreamAudioDecoder(decoder.get());
+-        gst_bin_add_many(GST_BIN_CAST(processor.get()), depayloader.get(), decoder.get(), converter.get(), resampler.get(), nullptr);
+-        if (!gst_element_link_many(depayloader.get(), decoder.get(), converter.get(), resampler.get(), nullptr)) {
++        RELEASE_ASSERT(depayloader && decoder && converter && resampler);
++        configureMediaStreamAudioDecoder(decoder);
++        gst_bin_add_many(GST_BIN_CAST(processor), depayloader, decoder, converter, resampler, nullptr);
++        if (!gst_element_link_many(depayloader, decoder, converter, resampler, nullptr)) {
+             GST_ERROR_OBJECT(m_bin.get(), "Failed to link static WebRTC Opus decoder chain");
++            gst_object_unref(processor);
+             return createParser();
+         }
+ 
+-        auto depayloaderSinkPad = adoptGRef(gst_element_get_static_pad(depayloader.get(), "sink"));
++        auto depayloaderSinkPad = adoptGRef(gst_element_get_static_pad(depayloader, "sink"));
+         installRtpBufferPadProbe(depayloaderSinkPad);
+-        gst_element_add_pad(processor.get(), gst_ghost_pad_new("sink", depayloaderSinkPad.get()));
++        gst_element_add_pad(processor, gst_ghost_pad_new("sink", depayloaderSinkPad.get()));
+ 
+-        auto resamplerSrcPad = adoptGRef(gst_element_get_static_pad(resampler.get(), "src"));
+-        gst_element_add_pad(processor.get(), gst_ghost_pad_new("src", resamplerSrcPad.get()));
++        auto resamplerSrcPad = adoptGRef(gst_element_get_static_pad(resampler, "src"));
++        gst_element_add_pad(processor, gst_ghost_pad_new("src", resamplerSrcPad.get()));
+         m_isDecoding = true;
+-        return processor;
++        return adoptGRef(processor);
+     }
+ 
+     if (m_data.type == RealtimeMediaSource::Type::Video) {

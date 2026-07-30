@@ -21,7 +21,21 @@ typedef struct {
     char *home_url;
     char *site_profile;
     BrowserCookiePolicy cookie_policy;
+    char *search_engine;
+    char *custom_search_template;
+    double page_zoom;
+    guint default_font_size;
+    gboolean javascript_enabled;
+    gboolean autoplay_requires_gesture;
+    gboolean smooth_scrolling;
+    gboolean block_popups;
+    gboolean restore_tabs;
 } BrowserProfile;
+
+typedef struct {
+    char theme[8];
+    gboolean toolbar_auto_hide;
+} BrowserGlobalSettings;
 
 typedef struct {
     guint logical_id;
@@ -74,6 +88,14 @@ gboolean browser_profile_store_set_site_profile(BrowserProfileStore *store, int6
                                                 const char *site_profile, GError **error);
 gboolean browser_profile_store_set_cookie_policy(BrowserProfileStore *store, int64_t profile_id,
                                                  BrowserCookiePolicy policy, GError **error);
+gboolean browser_profile_store_save_preferences(BrowserProfileStore *store,
+                                                const BrowserProfile *profile,
+                                                GError **error);
+void browser_profile_store_get_global_settings(BrowserProfileStore *store,
+                                               BrowserGlobalSettings *settings);
+gboolean browser_profile_store_save_global_settings(BrowserProfileStore *store,
+                                                    const BrowserGlobalSettings *settings,
+                                                    GError **error);
 const char *browser_cookie_policy_name(BrowserCookiePolicy policy);
 
 GPtrArray *browser_profile_store_load_tabs(BrowserProfileStore *store, int64_t profile_id,

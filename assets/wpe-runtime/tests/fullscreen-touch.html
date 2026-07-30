@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Fullscreen Touch Test</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #101820;
+      color: #fff;
+      font: 22px sans-serif;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    button {
+      min-width: 300px;
+      min-height: 92px;
+      border: 0;
+      border-radius: 12px;
+      background: #1683ff;
+      color: #fff;
+      font: inherit;
+    }
+    :fullscreen {
+      background: #087f5b;
+    }
+  </style>
+</head>
+<body>
+  <button id="toggle">ENTER FULLSCREEN</button>
+  <script>
+    const button = document.getElementById('toggle');
+    button.addEventListener('click', async () => {
+      if (document.fullscreenElement)
+        await document.exitFullscreen();
+      else
+        await document.documentElement.requestFullscreen();
+    });
+    document.addEventListener('fullscreenchange', () => {
+      const active = Boolean(document.fullscreenElement);
+      button.textContent = active ? 'EXIT FULLSCREEN' : 'ENTER FULLSCREEN';
+      console.log(`FULLSCREEN_TEST active=${active}`);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,167 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -42,6 +42,31 @@
+     return value && !g_strcmp0(value, "1");
+ }
+ 
++static bool useDirectRemoteAudioSink()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static void configureLeakyAudioQueue(GstElement* queue)
++{
++    g_object_set(queue,
++        "max-size-buffers", guint(4),
++        "max-size-bytes", guint(0),
++        "max-size-time", guint64(0),
++        "leaky", gint(2),
++        "silent", TRUE,
++        nullptr);
++}
++
++static void discardFloatingElement(GstElement* element)
++{
++    if (!element)
++        return;
++    gst_object_ref_sink(element);
++    gst_object_unref(element);
++}
++
+ static void constrainH264ParserToAccessUnits(GstElement* parser)
+ {
+     if (!requireRockchipMppH264AccessUnits()
+@@ -175,18 +200,66 @@
+     GST_INFO_OBJECT(m_sink.get(), "Intermediate incoming-track clock synchronization: %s, async state changes: %s",
+         synchronizeIncomingSamples ? "enabled" : "disabled", asynchronousStateChanges ? "enabled" : "disabled");
+ 
++    auto trackProcessor = incomingTrackProcessor();
+     auto queue = gst_element_factory_make("queue", "queue");
++    bool directRemoteAudio = m_data.type == RealtimeMediaSource::Type::Audio
++        && m_isDecoding && useDirectRemoteAudioSink();
++    GstElement* tee = nullptr;
++    GstElement* directAudioQueue = nullptr;
++    GstElement* directAudioSink = nullptr;
++    bool trackProcessorLinked = false;
+ 
+-    auto trackProcessor = incomingTrackProcessor();
++    if (directRemoteAudio) {
++        tee = gst_element_factory_make("tee", "direct-remote-audio-tee");
++        directAudioQueue = gst_element_factory_make("queue", "direct-remote-audio-queue");
++        if (tee && directAudioQueue)
++            directAudioSink = createPlatformAudioSink("video"_s);
++        if (!tee || !directAudioQueue || !directAudioSink) {
++            GST_ERROR_OBJECT(m_bin.get(), "Direct remote audio elements unavailable; using MediaStream player audio");
++            discardFloatingElement(tee);
++            discardFloatingElement(directAudioQueue);
++            discardFloatingElement(directAudioSink);
++            tee = nullptr;
++            directAudioQueue = nullptr;
++            directAudioSink = nullptr;
++            directRemoteAudio = false;
++        }
++    }
+ 
+-    gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), queue, m_sink.get(), nullptr);
+-    gst_element_link(queue, m_sink.get());
++    if (directRemoteAudio) {
++        configureLeakyAudioQueue(queue);
++        configureLeakyAudioQueue(directAudioQueue);
++        g_object_set(m_sink.get(), "sync", FALSE, "async", FALSE, nullptr);
++        if (gstObjectHasProperty(directAudioSink, "sync"_s))
++            g_object_set(directAudioSink, "sync", FALSE, nullptr);
++        if (gstObjectHasProperty(directAudioSink, "async"_s))
++            g_object_set(directAudioSink, "async", FALSE, nullptr);
++
++        gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), tee, queue, m_sink.get(),
++            directAudioQueue, directAudioSink, nullptr);
++        bool linked = gst_element_link(trackProcessor.get(), tee)
++            && gst_element_link(tee, queue)
++            && gst_element_link(queue, m_sink.get())
++            && gst_element_link(tee, directAudioQueue)
++            && gst_element_link(directAudioQueue, directAudioSink);
++        RELEASE_ASSERT(linked);
++        trackProcessorLinked = true;
++        GST_WARNING_OBJECT(m_bin.get(), "Using direct remote audio sink with isolated leaky branches");
++    } else {
++        gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), queue, m_sink.get(), nullptr);
++        gst_element_link(queue, m_sink.get());
++    }
+ 
+     auto trackProcessorSrcPad = adoptGRef(gst_element_get_static_pad(trackProcessor.get(), "src"));
+     if (trackProcessorSrcPad) {
+-        auto queueSinkPad = adoptGRef(gst_element_get_static_pad(queue, "sink"));
+-        if (gst_pad_link(trackProcessorSrcPad.get(), queueSinkPad.get()) != GST_PAD_LINK_OK)
++        if (!trackProcessorLinked) {
++            auto queueSinkPad = adoptGRef(gst_element_get_static_pad(queue, "sink"));
++            trackProcessorLinked = gst_pad_link(trackProcessorSrcPad.get(), queueSinkPad.get()) == GST_PAD_LINK_OK;
++        }
++        if (!trackProcessorLinked)
+             GST_ERROR_OBJECT(m_bin.get(), "Failed to link static incoming track processor to queue");
++        else if (directRemoteAudio)
++            GST_INFO_OBJECT(m_bin.get(), "Direct remote audio stays in the endpoint pipeline and is not exposed to RealtimeIncomingSource");
+         else if (m_data.type == RealtimeMediaSource::Type::Audio && m_isDecoding
+             && g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_DEFER_STATIC_AUDIO_READY"), "0")) {
+             /*
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+@@ -85,6 +85,10 @@
+ static bool disableMediaStreamPlayerAudio()
+ {
+     const char* value = g_getenv("WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO");
++    if (value && !g_strcmp0(value, "1"))
++        return true;
++
++    value = g_getenv("WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO");
+     return value && !g_strcmp0(value, "1");
+ }
+ 
+@@ -149,6 +153,7 @@
+ 
+     void ref() const final { RefCounted::ref(); }
+     void deref() const final { RefCounted::deref(); }
++    void setConsumerIsVideoPlayer(bool value) { m_consumerIsVideoPlayer = value; }
+ 
+     void characteristicsChanged() final
+     {
+@@ -166,7 +171,13 @@
+         if (!src)
+             return;
+ 
+-        webkitMediaStreamSrcAddTrack(WEBKIT_MEDIA_STREAM_SRC_CAST(src.get()), &track);
++        auto* mediaStreamSrc = WEBKIT_MEDIA_STREAM_SRC_CAST(src.get());
++        if (m_consumerIsVideoPlayer && track.isAudio() && disableMediaStreamPlayerAudio()) {
++            GST_WARNING_OBJECT(mediaStreamSrc, "Skipping dynamically added MediaStream player audio source because audio is handled outside the player pipeline");
++            return;
++        }
++
++        webkitMediaStreamSrcAddTrack(mediaStreamSrc, &track, m_consumerIsVideoPlayer);
+     }
+ 
+     void didRemoveTrack(MediaStreamTrackPrivate&) final;
+@@ -178,6 +189,7 @@
+     }
+ 
+     GThreadSafeWeakPtr<GstElement> m_src;
++    bool m_consumerIsVideoPlayer { false };
+ };
+ 
+ static void webkitMediaStreamSrcEnsureStreamCollectionPosted(WebKitMediaStreamSrc*, bool isEmpty = false);
+@@ -1630,6 +1642,7 @@
+ {
+     ASSERT(WEBKIT_IS_MEDIA_STREAM_SRC(self));
+     ASSERT(!self->priv->stream);
++    self->priv->mediaStreamObserver->setConsumerIsVideoPlayer(isVideoPlayer);
+     self->priv->stream = stream;
+ 
+     GST_DEBUG_OBJECT(self, "Associating with MediaStream");
+@@ -1647,7 +1660,7 @@
+         if (!isVideoPlayer && track->isVideo())
+             continue;
+         if (isVideoPlayer && track->isAudio() && disableMediaStreamPlayerAudio()) {
+-            GST_WARNING_OBJECT(self, "Skipping MediaStream player audio source for delayed-track diagnosis");
++            GST_WARNING_OBJECT(self, "Skipping MediaStream player audio source because audio is handled outside the player pipeline");
+             continue;
+         }
+         if (shouldDeferPlayerAudio && track->isAudio()) {

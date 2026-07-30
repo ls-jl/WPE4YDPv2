@@ -1,0 +1,39 @@
+diff --git a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+@@ -451,22 +451,32 @@ static void logCloudGameSDPSummary(GstElement* pipeline, const GstSDPMessage* mes
+         return;
+ 
+     auto mediaCount = gst_sdp_message_medias_len(message);
+-    bool hasBundle = !!gst_sdp_message_get_attribute_val(message, "group");
+-    GST_WARNING_OBJECT(pipeline, "Cloud SDP: phase=%s mlines=%u bundle=%d", phase, mediaCount, hasBundle);
++    const char* bundleGroup = gst_sdp_message_get_attribute_val(message, "group");
++    GST_WARNING_OBJECT(pipeline, "Cloud SDP: phase=%s mlines=%u bundle=%s", phase, mediaCount, bundleGroup ? bundleGroup : "(none)");
+     for (unsigned index = 0; index < mediaCount; ++index) {
+         const auto* media = gst_sdp_message_get_media(message, index);
+         bool hasRtcpMux = false;
+         const char* direction = "sendrecv";
++        const char* mid = "(none)";
++        const char* setup = "(none)";
++        const char* sctpPort = "(none)";
+         unsigned attributeCount = gst_sdp_media_attributes_len(media);
+         for (unsigned attributeIndex = 0; attributeIndex < attributeCount; ++attributeIndex) {
+             const auto* attribute = gst_sdp_media_get_attribute(media, attributeIndex);
+             if (!g_strcmp0(attribute->key, "rtcp-mux"))
+                 hasRtcpMux = true;
++            else if (!g_strcmp0(attribute->key, "mid"))
++                mid = attribute->value;
++            else if (!g_strcmp0(attribute->key, "setup"))
++                setup = attribute->value;
++            else if (!g_strcmp0(attribute->key, "sctp-port"))
++                sctpPort = attribute->value;
+             else if (!g_strcmp0(attribute->key, "sendonly") || !g_strcmp0(attribute->key, "recvonly") || !g_strcmp0(attribute->key, "inactive") || !g_strcmp0(attribute->key, "sendrecv"))
+                 direction = attribute->key;
+         }
+-        GST_WARNING_OBJECT(pipeline, "Cloud SDP media=%u type=%s formats=%u direction=%s rtcp_mux=%d",
+-            index, gst_sdp_media_get_media(media), gst_sdp_media_formats_len(media), direction, hasRtcpMux);
++        GST_WARNING_OBJECT(pipeline, "Cloud SDP media=%u type=%s proto=%s port=%u formats=%u mid=%s setup=%s sctp_port=%s direction=%s rtcp_mux=%d",
++            index, gst_sdp_media_get_media(media), gst_sdp_media_get_proto(media), gst_sdp_media_get_port(media),
++            gst_sdp_media_formats_len(media), mid, setup, sctpPort, direction, hasRtcpMux);
+     }
+ }

@@ -63,7 +63,26 @@ if [ -s "$GST_PLUGIN_SET_FILE" ]; then
         echo "WPE GStreamer: plugin set changed; registry reset"
     fi
 fi
-export GST_DEBUG="${GST_DEBUG:-2,decodebin:4,uridecodebin:4,webkit*:3}"
+export WEBKIT_CLOUD_FORCE_ICE_CONTROLLER="${WEBKIT_CLOUD_FORCE_ICE_CONTROLLER:-1}"
+export WPE_CLOUD_DIAGNOSTICS="${WPE_CLOUD_DIAGNOSTICS:-0}"
+export WPE_START_URL_OVERRIDE="${WPE_START_URL_OVERRIDE:-0}"
+if [ "$WPE_CLOUD_DIAGNOSTICS" = "1" ]; then
+    export WEBKIT_CLOUD_DATACHANNEL_DIAGNOSTICS=1
+    export WEBKIT_CLOUD_WEBSOCKET_DIAGNOSTICS=1
+    export WEBKIT_CLOUD_SDP_DIAGNOSTICS=1
+    export GST_DEBUG="${GST_DEBUG:-2,decodebin:4,uridecodebin:4,webkit*:3,webrtcbin:4,webrtcdatachannel:6,sctp*:6,dtlsconnection:4,dtlssrtp*:4,webrtctransport*:5}"
+else
+    export GST_DEBUG="${GST_DEBUG:-1,webkit*:2}"
+fi
+if [ "${WPE_GST_DOT:-0}" = "1" ]; then
+    GST_DOT_DIR="${WPE_GST_DOT_DIR:-$VAR_DIR/gst-dot}"
+    mkdir -p "$GST_DOT_DIR"
+    chmod 700 "$GST_DOT_DIR" 2>/dev/null || true
+    export GST_DEBUG_DUMP_DOT_DIR="$GST_DOT_DIR"
+    echo "WPE GStreamer: gst_dot=enabled dir=$GST_DOT_DIR"
+else
+    unset GST_DEBUG_DUMP_DOT_DIR
+fi
 export WEBKIT_GST_DISABLE_GL_SINK="${WEBKIT_GST_DISABLE_GL_SINK:-1}"
 export WEBKIT_WEBGL_DISABLE_GBM="${WEBKIT_WEBGL_DISABLE_GBM:-1}"
 export WEBKIT_DISABLE_DMABUF_ATLAS="${WEBKIT_DISABLE_DMABUF_ATLAS:-1}"
@@ -104,19 +123,32 @@ export WPE_CLOUDGAME_ALLOW_EXPIRED_TLS="${WPE_CLOUDGAME_ALLOW_EXPIRED_TLS:-1}"
 # WPE_VIDEO_OVERLAY=0 一键回退纯软件视频路径。
 if [ "${WPE_VIDEO_OVERLAY:-1}" = "1" ]; then
     export WEBKIT_GST_HOLE_PUNCH_QUIRK="${WEBKIT_GST_HOLE_PUNCH_QUIRK:-rockchip}"
+    export WEBKIT_GST_HOLE_PUNCH_MEDIASTREAM_EARLY="${WEBKIT_GST_HOLE_PUNCH_MEDIASTREAM_EARLY:-1}"
     export WPE_VIDEO_OVERLAY_SOCKET="${WPE_VIDEO_OVERLAY_SOCKET:-$VAR_DIR/wpe-video-overlay.sock}"
+    export WPE_VIDEO_OVERLAY_ROTATION="${WPE_VIDEO_OVERLAY_ROTATION:-${WPE_DRM_ROTATION:-${WPE_PANEL_ROTATION:-0}}}"
+    export WPE_VIDEO_OVERLAY_FIT="${WPE_VIDEO_OVERLAY_FIT:-contain}"
 fi
 
-# 单任务内存倾斜：浏览器是前台唯一任务，把内存尽量让给它。
-# - oom_score_adj -600：内核 OOM 时优先杀其他进程（子进程继承）
-# - drop_caches：启动前释放系统攒的页缓存
-# - swappiness 100：把后台进程冷页压进 swap，物理内存留给浏览器（退出恢复）
-echo -600 > /proc/self/oom_score_adj 2>/dev/null || true
-sync 2>/dev/null || true
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-WPE_SAVED_SWAPPINESS="$(cat /proc/sys/vm/swappiness 2>/dev/null)"
-if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
-    echo 100 > /proc/sys/vm/swappiness 2>/dev/null || WPE_SAVED_SWAPPINESS=""
+# MiniApp 是 WPE 的生命周期宿主，OOM 时必须优先保住 MiniApp。WPE 退出后可由
+# watchdog 返回启动页或重新启动；MiniApp 被杀会让整套框架重启。
+WPE_OOM_SCORE_ADJ="${WPE_OOM_SCORE_ADJ:-200}"
+case "$WPE_OOM_SCORE_ADJ" in
+    -[0-9]*|[0-9]*) echo "$WPE_OOM_SCORE_ADJ" > /proc/self/oom_score_adj 2>/dev/null || true ;;
+    *) echo "WPE warn: invalid WPE_OOM_SCORE_ADJ=$WPE_OOM_SCORE_ADJ; keeping system default" ;;
+esac
+
+# 全局 VM 调优默认关闭。高 swappiness 在 512MB swap 已满的设备上会放大交互
+# 延迟；drop_caches 也会让浏览器首屏重新产生大量 I/O。仅保留显式诊断开关。
+if [ "${WPE_DROP_CACHES:-0}" = "1" ]; then
+    sync 2>/dev/null || true
+    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+fi
+WPE_SAVED_SWAPPINESS=""
+if [ -n "${WPE_SWAPPINESS:-}" ]; then
+    WPE_SAVED_SWAPPINESS="$(cat /proc/sys/vm/swappiness 2>/dev/null)"
+    if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
+        echo "$WPE_SWAPPINESS" > /proc/sys/vm/swappiness 2>/dev/null || WPE_SAVED_SWAPPINESS=""
+    fi
 fi
 restore_swappiness() {
     if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
@@ -138,7 +170,9 @@ export WPE_CHROME_RENDER_STATE="${WPE_CHROME_RENDER_STATE:-$VAR_DIR/chrome-rende
 export WPE_BROWSER_DB="${WPE_BROWSER_DB:-$VAR_DIR/browser.sqlite3}"
 export WPE_PROFILES_DIR="${WPE_PROFILES_DIR:-$VAR_DIR/profiles}"
 export WPE_PROFILE_SWITCH_FILE="${WPE_PROFILE_SWITCH_FILE:-$VAR_DIR/profile-switch.request}"
-export WPE_CHROME_FONT="${WPE_CHROME_FONT:-$DIR/assets/fonts/miniapp/NotoSansSC-Regular.otf}"
+export WPE_CHROME_FONT="${WPE_CHROME_FONT:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Regular.ttf}"
+export WPE_CHROME_FONT_MEDIUM="${WPE_CHROME_FONT_MEDIUM:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Medium.ttf}"
+export WPE_CHROME_FONT_BOLD="${WPE_CHROME_FONT_BOLD:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Bold.ttf}"
 export WPE_PANEL_SIZE="${WPE_PANEL_SIZE:-${WPE_VIEWPORT:-960x266}}"
 export WPE_VIEWPORT="${WPE_VIEWPORT:-$WPE_PANEL_SIZE}"
 export WPE_DRM_MODE="${WPE_DRM_MODE:-$WPE_PANEL_SIZE}"
@@ -236,6 +270,24 @@ export XKB_CONFIG_ROOT="$DIR/share/X11/xkb"
 export LIBINPUT_QUIRKS_DIR="$DIR/share/libinput"
 export WEBKIT_EXEC_PATH="$DIR/libexec/wpe-webkit-2.0"
 export WEBKIT_INJECTED_BUNDLE_PATH="$DIR/lib/wpe-webkit-2.0/injected-bundle"
+# Cloud gaming uses the early H.264/Mpp path so encoded access units reach the
+# hardware decoder without blocking the final MediaStream player. Audio is
+# attached only after video preroll; disabling it remains an explicit rollback.
+export WEBKIT_GST_WEBRTC_FORCE_EARLY_VIDEO_DECODING="${WEBKIT_GST_WEBRTC_FORCE_EARLY_VIDEO_DECODING:-1}"
+export WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO="${WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO:-0}"
+export WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO="${WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO:-1}"
+export WPE_WEB_PROCESS_MEMORY_LIMIT_MB="${WPE_WEB_PROCESS_MEMORY_LIMIT_MB:-448}"
+export WEBKIT_GST_WEBRTC_DEFER_PLAYER_AUDIO="${WEBKIT_GST_WEBRTC_DEFER_PLAYER_AUDIO:-0}"
+export WEBKIT_GST_WEBRTC_ALLOW_EARLY_AUDIO="${WEBKIT_GST_WEBRTC_ALLOW_EARLY_AUDIO:-1}"
+export WEBKIT_GST_MEDIASTREAM_DIRECT_AUDIO_SINK="${WEBKIT_GST_MEDIASTREAM_DIRECT_AUDIO_SINK:-1}"
+export WEBKIT_GST_WEBRTC_FORCE_EARLY_AUDIO_DECODING="${WEBKIT_GST_WEBRTC_FORCE_EARLY_AUDIO_DECODING:-1}"
+export WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC="${WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC:-1}"
+export WEBKIT_GST_WEBRTC_LEAKY_RAW_VIDEO="${WEBKIT_GST_WEBRTC_LEAKY_RAW_VIDEO:-1}"
+export WEBKIT_GST_WEBRTC_COALESCE_INCOMING_VIDEO="${WEBKIT_GST_WEBRTC_COALESCE_INCOMING_VIDEO:-1}"
+export WEBKIT_GST_WEBRTC_RETIMESTAMP_INCOMING="${WEBKIT_GST_WEBRTC_RETIMESTAMP_INCOMING:-1}"
+export WEBKIT_GST_WEBRTC_COPY_DECODED_VIDEO="${WEBKIT_GST_WEBRTC_COPY_DECODED_VIDEO:-0}"
+export WEBKIT_GST_WEBRTC_REPARSE_H264="${WEBKIT_GST_WEBRTC_REPARSE_H264:-1}"
+export WEBKIT_GST_MPP_REQUIRE_H264_AU="${WEBKIT_GST_MPP_REQUIRE_H264_AU:-1}"
 # The device has no usable GPU, but dma-heap direct scanout is still much
 # faster than SHM dumb-buffer copies. Set WPE_DRM_FORCE_SHM=1 only for fallback
 # diagnostics on kernels without a working dma-heap scanout path.
@@ -247,9 +299,11 @@ export WPE_RAW_TOUCH="${WPE_RAW_TOUCH:-1}"
 export WPE_TOUCH_DEVICE="${WPE_TOUCH_DEVICE:-/dev/input/by-path/hyn_ts}"
 export WPE_TOUCH_OFFSET_X="${WPE_TOUCH_OFFSET_X:-0}"
 export WPE_TOUCH_OFFSET_Y="${WPE_TOUCH_OFFSET_Y:-0}"
-export WPE_SEND_TOUCH_EVENTS="${WPE_SEND_TOUCH_EVENTS:-0}"
+export WPE_SEND_TOUCH_EVENTS="${WPE_SEND_TOUCH_EVENTS:-1}"
 export WPE_SYNTHESIZE_POINTER_TAP="${WPE_SYNTHESIZE_POINTER_TAP:-1}"
-export WPE_TOUCH_SCROLL_FALLBACK="${WPE_TOUCH_SCROLL_FALLBACK:-1}"
+export WPE_GAME_POINTER_TAP_FALLBACK="${WPE_GAME_POINTER_TAP_FALLBACK:-0}"
+export WPE_GAME_MEDIA_IMMERSIVE="${WPE_GAME_MEDIA_IMMERSIVE:-1}"
+export WPE_TOUCH_SCROLL_FALLBACK="${WPE_TOUCH_SCROLL_FALLBACK:-0}"
 export WPE_TOUCH_NATIVE_SCROLL="${WPE_TOUCH_NATIVE_SCROLL:-1}"
 export WPE_TOUCH_JS_SCROLL="${WPE_TOUCH_JS_SCROLL:-0}"
 export WPE_TOUCH_SCROLL_INVERT_Y="${WPE_TOUCH_SCROLL_INVERT_Y:-0}"
@@ -261,6 +315,7 @@ export WPE_TOUCH_SCROLL_INTERVAL_MS="${WPE_TOUCH_SCROLL_INTERVAL_MS:-16}"
 export WPE_TOUCH_SCROLL_STOP_DELAY_MS="${WPE_TOUCH_SCROLL_STOP_DELAY_MS:-80}"
 export WPE_INPUT_PROFILE="${WPE_INPUT_PROFILE:-auto}"
 export WPE_GAME_HOSTS="${WPE_GAME_HOSTS:-ys.mihoyo.com,cloudgame.mihoyo.com}"
+export WPE_CLOUD_AUTOSTART="${WPE_CLOUD_AUTOSTART:-1}"
 export WPE_DEFAULT_URL="${WPE_DEFAULT_URL:-https://m.baidu.com/}"
 URL="${1:-$WPE_DEFAULT_URL}"
 DRM="${2:-/dev/dri/card0}"
@@ -466,7 +521,9 @@ configure_gpu_profile() {
     export WEBKIT_DISABLE_DMABUF_ATLAS=0
     export WPE_DRM_BUFFER_PATH=auto
     export WPE_DRM_FORCE_SHM=0
-    export WPE_DMABUF_BUFFER_FORMAT=XR24:0:scanout
+    # The Rockchip video overlay sits below the WPE primary plane. Keep the
+    # primary ARGB-capable so WebKit's hole-punch pixels remain transparent.
+    export WPE_DMABUF_BUFFER_FORMAT=AR24:0:scanout
     export WEBKIT_SKIA_USE_LINEAR_TILE_TEXTURES=1
 }
 
@@ -568,7 +625,7 @@ else
     configure_cpu_profile
 fi
 
-echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
+echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
 
 if command -v hal-screen >/dev/null 2>&1; then
     env -u LD_LIBRARY_PATH -u LD_PRELOAD hal-screen on >/dev/null 2>&1 || true
@@ -583,6 +640,10 @@ fi
 
 run_profile_switch_loop
 STATUS=$?
+if [ "$STATUS" -eq 74 ]; then
+    echo "WPE user shutdown completed"
+    exit 0
+fi
 if [ "$SELECTED_PROFILE" = gpu ] && [ "$TERMINATING" = 0 ] && \
    { [ "$STATUS" -eq 91 ] || [ ! -f "$GPU_READY_FILE" ]; }; then
     if [ "$GPU_MODE" = required ]; then
@@ -595,5 +656,9 @@ if [ "$SELECTED_PROFILE" = gpu ] && [ "$TERMINATING" = 0 ] && \
     SELECTED_PROFILE=cpu-fallback
     run_profile_switch_loop
     STATUS=$?
+fi
+if [ "$STATUS" -eq 74 ]; then
+    echo "WPE user shutdown completed"
+    STATUS=0
 fi
 exit "$STATUS"

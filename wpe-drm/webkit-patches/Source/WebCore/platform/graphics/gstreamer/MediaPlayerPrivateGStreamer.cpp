@@ -1620,6 +1620,16 @@ GstElement* MediaPlayerPrivateGStreamer::createAudioSink()
         return nullptr;
 
 #if ENABLE(WEB_AUDIO)
+    const char* directMediaStreamAudio = g_getenv("WEBKIT_GST_MEDIASTREAM_DIRECT_AUDIO_SINK");
+    bool useDirectAudioSink = directMediaStreamAudio
+        ? g_strcmp0(directMediaStreamAudio, "0")
+        : isMediaStreamPlayer();
+    if (useDirectAudioSink) {
+        GST_WARNING_OBJECT(pipeline(), "Using direct platform audio sink for playback (forced=%d)",
+            !!directMediaStreamAudio);
+        return audioSink;
+    }
+
     GstElement* audioSinkBin = gst_bin_new("audio-sink");
     ensureAudioSourceProvider();
     m_audioSourceProvider->configureAudioBin(audioSinkBin, audioSink);
@@ -3620,7 +3630,8 @@ void MediaPlayerPrivateGStreamer::createGSTPlayBin(const URL& url)
             g_object_set(m_pipeline.get(), "audio-filter", scale, nullptr);
     }
 
-    managePlayerSuspend();
+    if (!isMediaStream)
+        managePlayerSuspend();
 #if ENABLE(MEDIA_TELEMETRY)
     MediaTelemetryReport::singleton().reportDrmInfo(getDrm());
     MediaTelemetryReport::singleton().reportPlaybackState(MediaTelemetryReport::AVPipelineState::Create);
@@ -4175,7 +4186,7 @@ void MediaPlayerPrivateGStreamer::managePlayerSuspend()
     // this using an environment variable, set from the webkitpy glib port sub-classes.
     auto allowPlaybackOfInvisibleVideos = CStringView::unsafeFromUTF8(g_getenv("WEBKIT_GST_ALLOW_PLAYBACK_OF_INVISIBLE_VIDEOS"));
     bool muted = isMuted();
-    bool shouldBeSuspended = (player && player->isVideoPlayer()) && muted && !m_isVisibleInViewport && allowPlaybackOfInvisibleVideos != "1"_s;
+    bool shouldBeSuspended = !isMediaStreamPlayer() && (player && player->isVideoPlayer()) && muted && !m_isVisibleInViewport && allowPlaybackOfInvisibleVideos != "1"_s;
     GST_INFO_OBJECT(m_pipeline.get(), "%s %s player %svisible in viewport", muted ? "Muted" : "Un-muted", (player && player->isVideoPlayer()) ? "video" : "audio", m_isVisibleInViewport ? "" : "not ");
 
     if (shouldBeSuspended && !isSuspended()) {
@@ -4360,8 +4371,17 @@ bool MediaPlayerPrivateGStreamer::isHolePunchRenderingEnabled() const
 #if ENABLE(MEDIA_STREAM)
     if (m_streamPrivate) {
         auto* videoTrack = m_streamPrivate->activeVideoTrack();
-        if (!videoTrack)
-            return false;
+        if (!videoTrack) {
+            /*
+             * Remote WebRTC tracks are registered after playbin asks for its
+             * sink. Without this opt-in the initial sink is permanently the
+             * software WebKitAppSink, even though the video track becomes
+             * eligible for hole-punch rendering a moment later.
+             */
+            const char* earlyHolePunch = g_getenv("WEBKIT_GST_HOLE_PUNCH_MEDIASTREAM_EARLY");
+            return earlyHolePunch && !g_strcmp0(earlyHolePunch, "1")
+                && GStreamerQuirksManager::singleton().supportsVideoHolePunchRendering();
+        }
 
         return videoTrack->deviceType() != CaptureDevice::DeviceType::Canvas && GStreamerQuirksManager::singleton().supportsVideoHolePunchRendering();
     }

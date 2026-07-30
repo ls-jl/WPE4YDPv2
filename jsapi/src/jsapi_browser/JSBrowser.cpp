@@ -45,6 +45,33 @@ static std::string joinPath(const std::string& base, const std::string& name)
     return base + "/" + name;
 }
 
+static void closeInheritedFileDescriptors()
+{
+    DIR* directory = opendir("/proc/self/fd");
+    if (directory) {
+        const int directoryFd = dirfd(directory);
+        std::vector<int> descriptors;
+        while (dirent* entry = readdir(directory)) {
+            char* end = nullptr;
+            long value = std::strtol(entry->d_name, &end, 10);
+            if (!end || *end || value <= STDERR_FILENO || value == directoryFd)
+                continue;
+            descriptors.push_back(static_cast<int>(value));
+        }
+        closedir(directory);
+        for (int descriptor : descriptors)
+            close(descriptor);
+        return;
+    }
+
+    long maximum = sysconf(_SC_OPEN_MAX);
+    if (maximum < 0)
+        maximum = 1024;
+    maximum = std::min(maximum, 65536L);
+    for (int descriptor = STDERR_FILENO + 1; descriptor < maximum; ++descriptor)
+        close(descriptor);
+}
+
 static bool pathExists(const std::string& path)
 {
     struct stat st;
@@ -531,6 +558,7 @@ static bool ensurePackagedRuntimeReady(const std::string& runtimeDir, std::strin
         "libexec/wpe-webkit-2.0/WPEGPUProcess",
         "libexec/gstreamer-1.0/gst-plugin-scanner",
         "libexec/gstreamer-1.0/gst-ptp-helper",
+        "libexec/wpe-gpu-probe",
     };
     for (const std::string& file : executableFiles) {
         const std::string path = joinPath(runtimeDir, file);
@@ -794,7 +822,9 @@ public:
             setenv("WPE_BROWSER_DB", joinPath(workdir, "browser.sqlite3").c_str(), 1);
             setenv("WPE_PROFILES_DIR", joinPath(workdir, "profiles").c_str(), 1);
             setenv("WPE_PROFILE_SWITCH_FILE", joinPath(workdir, "profile-switch.request").c_str(), 1);
-            setenv("WPE_CHROME_FONT", joinPath(runtimePath, "assets/fonts/miniapp/NotoSansSC-Regular.otf").c_str(), 1);
+            setenv("WPE_CHROME_FONT", joinPath(runtimePath, "assets/fonts/miniapp/HarmonyOS_Sans_SC_Regular.ttf").c_str(), 1);
+            setenv("WPE_CHROME_FONT_MEDIUM", joinPath(runtimePath, "assets/fonts/miniapp/HarmonyOS_Sans_SC_Medium.ttf").c_str(), 1);
+            setenv("WPE_CHROME_FONT_BOLD", joinPath(runtimePath, "assets/fonts/miniapp/HarmonyOS_Sans_SC_Bold.ttf").c_str(), 1);
             setenv("WPE_KEYBOARD_DIR", keyboardDirForWorkdir(workdir).c_str(), 1);
             setenv("WPE_DRM_RUNTIME_DIR", joinPath(workdir, "runtime-tmp").c_str(), 1);
             setenv("WPE_DRM_SKIP_MASTER", "1", 0);
@@ -837,6 +867,7 @@ public:
             std::vector<char*> argv;
             for (std::string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
             argv.push_back(nullptr);
+            closeInheritedFileDescriptors();
             execv(launcher.c_str(), argv.data());
             _exit(127);
         }

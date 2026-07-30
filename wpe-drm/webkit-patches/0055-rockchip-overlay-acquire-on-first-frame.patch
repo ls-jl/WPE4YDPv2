@@ -1,0 +1,215 @@
+--- a/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
++++ b/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
+@@ -67,7 +67,13 @@
+ // UI 进程 NONBLOCK commit 后旧帧可能还有一个 vblank 在屏上，多押两级；
+ // 解码器缓冲池通常 16+ 个 buffer，扣 4 个不会饿到解码。
+ static constexpr size_t retainedSampleCount = 4;
++static constexpr gint64 staleOwnerTimeoutUS = 750 * 1000;
+ 
++struct RockchipVideoOverlaySinkContext {
++    Lock lock;
++    IntRect rect;
++};
++
+ class RockchipVideoOverlayChannel {
+ public:
+     static RockchipVideoOverlayChannel& singleton()
+@@ -76,27 +82,24 @@
+         return channel;
+     }
+ 
+-    bool tryAcquire()
++    void release(RockchipVideoOverlaySinkContext* owner)
+     {
+         Locker locker { m_lock };
+-        if (m_acquired)
+-            return false;
+-        m_acquired = true;
+-        return true;
+-    }
+-
+-    void release()
+-    {
+-        Locker locker { m_lock };
++        if (m_owner != owner)
++            return;
+         sendSimpleMessageLocked(VideoOverlayMessageHide);
+         m_retainedSamples.clear();
+         closeLocked();
+-        m_acquired = false;
++        m_owner = nullptr;
++        m_lastFrameUS = 0;
++        g_message("Rockchip video overlay: owner released");
+     }
+ 
+-    void setRectangle(const IntRect& rect)
++    void setRectangle(RockchipVideoOverlaySinkContext* owner, const IntRect& rect)
+     {
+         Locker locker { m_lock };
++        if (m_owner != owner)
++            return;
+         if (m_rect == rect)
+             return;
+         m_rect = rect;
+@@ -108,23 +111,21 @@
+         sendLocked(message, -1);
+     }
+ 
+-    void sendFrame(GstSample* sample)
++    void sendFrame(RockchipVideoOverlaySinkContext* owner, const IntRect& rect, GstSample* sample)
+     {
+-        Locker locker { m_lock };
+-        if (!ensureConnectedLocked())
+-            return;
+-
+         auto* buffer = gst_sample_get_buffer(sample);
+         auto* caps = gst_sample_get_caps(sample);
+         if (!buffer || !caps)
+             return;
+ 
+         if (gst_buffer_n_memory(buffer) != 1) {
++            Locker locker { m_lock };
+             warnOnceLocked("multi-memory buffers not supported");
+             return;
+         }
+         auto* memory = gst_buffer_peek_memory(buffer, 0);
+         if (!gst_is_dmabuf_memory(memory)) {
++            Locker locker { m_lock };
+             warnOnceLocked("non-dmabuf frame, video overlay inactive");
+             return;
+         }
+@@ -133,6 +134,26 @@
+         if (!gst_video_info_from_caps(&info, caps) || GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12)
+             return;
+ 
++        Locker locker { m_lock };
++        auto now = g_get_monotonic_time();
++        if (m_owner != owner) {
++            if (m_owner && now - m_lastFrameUS <= staleOwnerTimeoutUS)
++                return;
++            if (m_owner) {
++                sendSimpleMessageLocked(VideoOverlayMessageHide);
++                m_retainedSamples.clear();
++                g_message("Rockchip video overlay: stale owner replaced after %.1f ms", (now - m_lastFrameUS) / 1000.0);
++            } else
++                g_message("Rockchip video overlay: owner acquired on first NV12 DMA-BUF frame");
++            m_owner = owner;
++            m_rect = rect;
++        } else if (m_rect != rect)
++            m_rect = rect;
++        m_lastFrameUS = now;
++
++        if (!ensureConnectedLocked())
++            return;
++
+         VideoOverlayWireMessage message = { };
+         message.type = VideoOverlayMessageFrame;
+         message.fourcc = DRM_FORMAT_NV12;
+@@ -255,45 +276,50 @@
+ 
+     Lock m_lock;
+     int m_socket { -1 };
+-    bool m_acquired { false };
++    RockchipVideoOverlaySinkContext* m_owner { nullptr };
+     bool m_warned { false };
+     gint64 m_lastConnectAttemptUS { 0 };
++    gint64 m_lastFrameUS { 0 };
+     IntRect m_rect;
+     Vector<GRefPtr<GstSample>> m_retainedSamples;
+ };
+ 
+-static GstFlowReturn rockchipOverlayNewPreroll(GstAppSink* appsink, gpointer)
++static IntRect rockchipOverlayRectangle(RockchipVideoOverlaySinkContext* context)
++{
++    Locker locker { context->lock };
++    return context->rect;
++}
++
++static GstFlowReturn rockchipOverlayNewPreroll(GstAppSink* appsink, gpointer userData)
+ {
+     auto sample = adoptGRef(gst_app_sink_pull_preroll(appsink));
+     if (sample)
+-        RockchipVideoOverlayChannel::singleton().sendFrame(sample.get());
++        RockchipVideoOverlayChannel::singleton().sendFrame(
++            static_cast<RockchipVideoOverlaySinkContext*>(userData),
++            rockchipOverlayRectangle(static_cast<RockchipVideoOverlaySinkContext*>(userData)),
++            sample.get());
+     return GST_FLOW_OK;
+ }
+ 
+-static GstFlowReturn rockchipOverlayNewSample(GstAppSink* appsink, gpointer)
++static GstFlowReturn rockchipOverlayNewSample(GstAppSink* appsink, gpointer userData)
+ {
+     auto sample = adoptGRef(gst_app_sink_pull_sample(appsink));
+     if (sample)
+-        RockchipVideoOverlayChannel::singleton().sendFrame(sample.get());
++        RockchipVideoOverlayChannel::singleton().sendFrame(
++            static_cast<RockchipVideoOverlaySinkContext*>(userData),
++            rockchipOverlayRectangle(static_cast<RockchipVideoOverlaySinkContext*>(userData)),
++            sample.get());
+     return GST_FLOW_OK;
+ }
+ 
+ GstElement* GStreamerHolePunchQuirkRockchip::createHolePunchVideoSink(bool, const MediaPlayer*)
+ {
+-    auto& channel = RockchipVideoOverlayChannel::singleton();
+-    // 单路直出：已有播放器占用 overlay 时返回 null，其余管线自动回退软件路径。
+-    if (!channel.tryAcquire()) {
+-        GST_WARNING("Rockchip hole-punch sink unavailable: overlay channel already acquired");
+-        return nullptr;
+-    }
+-
+     auto* sink = makeGStreamerElement("appsink"_s);
+-    if (!sink) {
+-        GST_WARNING("Rockchip hole-punch sink unavailable: appsink factory missing");
+-        channel.release();
++    if (!sink)
+         return nullptr;
+-    }
+ 
++    auto* context = new RockchipVideoOverlaySinkContext;
++
+     // 不声明 memory:DMABuf caps feature：rockchip mppvideodec 不一定在 caps
+     // 上标注 feature，但底层分配的就是 dmabuf，运行期用 gst_is_dmabuf_memory 判断。
+     auto caps = adoptGRef(gst_caps_from_string("video/x-raw(memory:DMABuf), format=(string)NV12; video/x-raw, format=(string)NV12"));
+@@ -311,7 +337,12 @@
+ #endif
+         { nullptr }
+     };
+-    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, nullptr, nullptr);
++    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, context, [](gpointer userData) {
++        auto* context = static_cast<RockchipVideoOverlaySinkContext*>(userData);
++        RockchipVideoOverlayChannel::singleton().release(context);
++        delete context;
++    });
++    g_object_set_data(G_OBJECT(sink), "wpe-rockchip-overlay-context", context);
+ 
+     // 面板旋转角：MediaPlayerPrivateGStreamer::configureElement 检测到本管线
+     // 挂了 hole-punch sink 时，把它设给 mppvideodec 的 rotation（RGA 预旋转）。
+@@ -321,17 +352,20 @@
+     if (rotation && *rotation && g_strcmp0(rotation, "0"))
+         g_object_set_data_full(G_OBJECT(sink), "wpe-holepunch-rotation", g_strdup(rotation), g_free);
+ 
+-    g_object_weak_ref(G_OBJECT(sink), [](gpointer, GObject*) {
+-        RockchipVideoOverlayChannel::singleton().release();
+-    }, nullptr);
+-
+-    GST_WARNING("Rockchip hole-punch sink created: appsink");
++    g_message("Rockchip hole-punch sink created; overlay ownership deferred until first frame");
+     return sink;
+ }
+ 
+-bool GStreamerHolePunchQuirkRockchip::setHolePunchVideoRectangle(GstElement*, const IntRect& rect)
++bool GStreamerHolePunchQuirkRockchip::setHolePunchVideoRectangle(GstElement* sink, const IntRect& rect)
+ {
+-    RockchipVideoOverlayChannel::singleton().setRectangle(rect);
++    auto* context = static_cast<RockchipVideoOverlaySinkContext*>(g_object_get_data(G_OBJECT(sink), "wpe-rockchip-overlay-context"));
++    if (!context)
++        return false;
++    {
++        Locker locker { context->lock };
++        context->rect = rect;
++    }
++    RockchipVideoOverlayChannel::singleton().setRectangle(context, rect);
+     return true;
+ }

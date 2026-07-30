@@ -1,0 +1,53 @@
+From: WPE4YDPv2 maintainers
+Subject: [PATCH] GStreamer: terminate encoded H.264 allocation queries
+
+After parsebin negotiates H.264 access units, the appsrc streaming task can
+remain blocked in an allocation query while decodebin3 is concurrently
+creating the MPP decoder. The incoming appsrc queue then grows, while the
+decoder receives only STREAM_START and no CAPS, SEGMENT, or buffers.
+
+Encoded H.264 does not need a downstream raw-video buffer pool. Handle this
+allocation query at the same opt-in h264parse autoplug-query boundary used
+for AU caps negotiation. This prevents the source task from waiting on a
+decoder that is still being reconfigured.
+
+---
+ .../gstreamer/MediaPlayerPrivateGStreamer.cpp | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -2665,11 +2665,29 @@ void MediaPlayerPrivateGStreamer::configureParsebin(GstElement* parsebin)
+ 
+     g_signal_connect(parsebin, "autoplug-query",
+         G_CALLBACK(+[](GstElement*, GstPad*, GstElement* childElement, GstQuery* query, MediaPlayerPrivateGStreamer* player) -> gboolean {
+-            if (!player->isMediaStreamPlayer() || !requireRockchipMppH264AccessUnits() || GST_QUERY_TYPE(query) != GST_QUERY_CAPS)
++            if (!player->isMediaStreamPlayer() || !requireRockchipMppH264AccessUnits())
+                 return FALSE;
+ 
+             auto* factory = gst_element_get_factory(childElement);
+             if (!factory || g_strcmp0(GST_OBJECT_NAME(factory), "h264parse"))
++                return FALSE;
++
++            if (GST_QUERY_TYPE(query) == GST_QUERY_ALLOCATION) {
++                GstCaps* caps = nullptr;
++                gboolean needPool = FALSE;
++                gst_query_parse_allocation(query, &caps, &needPool);
++                if (!caps || !doCapsHaveType(caps, "video/x-h264"_s))
++                    return FALSE;
++
++                if (!g_object_get_data(G_OBJECT(childElement), "webkit-mpp-h264-au-allocation-logged")) {
++                    g_object_set_data(G_OBJECT(childElement), "webkit-mpp-h264-au-allocation-logged", GINT_TO_POINTER(1));
++                    GST_WARNING_OBJECT(childElement, "Handling encoded H.264 allocation without a downstream pool (need-pool=%s): %" GST_PTR_FORMAT,
++                        boolForPrinting(needPool), caps);
++                }
++                return TRUE;
++            }
++
++            if (GST_QUERY_TYPE(query) != GST_QUERY_CAPS)
+                 return FALSE;
+ 
+             GstCaps* filter = nullptr;
+-- 
+2.39.5

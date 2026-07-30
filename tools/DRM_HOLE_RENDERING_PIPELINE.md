@@ -1069,6 +1069,14 @@ WebRTC 默认由包内 GStreamer backend 提供，`WPE_WEBRTC=1`，本地采集�
 DMA-BUF 后，hole-punch sink 通过 unix socket 交给 UI 进程并提交到独立 Esmart
 视频 plane。云原神主机在 `WPE_INPUT_PROFILE=auto` 下使用 `game`，raw touch 的
 down/move/up 按 slot 原样发给 WebKit，不生成浏览器 scroll 或 synthetic tap。
+云游戏视频进入 `playing` 后，`WPE_GAME_MEDIA_IMMERSIVE=1` 会自动隐藏 native
+toolbar；此时顶部热区仍可手动唤回 toolbar。网页随后通过 Fullscreen API
+进入严格全屏时，launcher 会关闭 toolbar 和所有顶部唤出热区；退出全屏后恢复
+toolbar。
+视频采用 `WPE_VIDEO_OVERLAY_FIT=contain` 时，WPEViewDRM 会发布可见视频矩形。
+只有落在该矩形内的 panel-native 触摸才反算到 DOM 视频坐标；留黑区域和网页
+覆盖控件保持原始坐标，避免全屏按钮被夹到游戏画面边缘。raw 坐标边界固定映射
+到 `0..width-1`、`0..height-1`。
 
 基础链路测试：
 

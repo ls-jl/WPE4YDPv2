@@ -1,0 +1,48 @@
+diff --git a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+index e2e584af0000..ae3d56570000 100644
+--- a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+@@ -34,6 +34,7 @@
+ #include <WebCore/ResourceRequest.h>
+ #include <WebCore/ResourceResponse.h>
+ #include <WebCore/ThreadableWebSocketChannel.h>
++#include <cstring>
+ #include <wtf/RunLoop.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/glib/GSpanExtras.h>
+@@ -107,6 +108,16 @@ void WebSocketTask::connect(std::optional<WebCore::CookieRequestHeaderFieldProxy
+                 GUri* uri = message ? soup_message_get_uri(message) : nullptr;
+                 unsigned status = message ? soup_message_get_status(message) : 0;
+                 const char* reason = message ? soup_message_get_reason_phrase(message) : nullptr;
++                SoupMessageHeaders* requestHeaders = message ? soup_message_get_request_headers(message) : nullptr;
++                SoupMessageHeaders* responseHeaders = message ? soup_message_get_response_headers(message) : nullptr;
++                const char* origin = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Origin") : nullptr;
++                const char* requestedProtocol = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Sec-WebSocket-Protocol") : nullptr;
++                const char* userAgent = requestHeaders ? soup_message_headers_get_one(requestHeaders, "User-Agent") : nullptr;
++                const char* cookie = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Cookie") : nullptr;
++                const char* authorization = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Authorization") : nullptr;
++                const char* server = responseHeaders ? soup_message_headers_get_one(responseHeaders, "Server") : nullptr;
++                const char* contentType = responseHeaders ? soup_message_headers_get_content_type(responseHeaders, nullptr) : nullptr;
++                const char* setCookie = responseHeaders ? soup_message_headers_get_one(responseHeaders, "Set-Cookie") : nullptr;
+                 g_warning("WebSocket handshake failed: host=%s port=%d status=%u reason=%s error-domain=%s error-code=%d error=%s",
+                     uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
+                     uri ? g_uri_get_port(uri) : -1,
+@@ -115,6 +126,18 @@ void WebSocketTask::connect(std::optional<WebCore::CookieRequestHeaderFieldProxy
+                     error.get() ? g_quark_to_string(error->domain) : "(none)",
+                     error.get() ? error->code : 0,
+                     error.get() ? error->message : "(none)");
++                g_warning("WebSocket handshake request metadata: origin=%s protocol=%s user-agent=%s cookie-present=%d cookie-bytes=%zu authorization-present=%d",
++                    origin ? origin : "(none)",
++                    requestedProtocol ? requestedProtocol : "(none)",
++                    userAgent ? userAgent : "(none)",
++                    !!cookie,
++                    cookie ? strlen(cookie) : 0,
++                    !!authorization);
++                g_warning("WebSocket handshake response metadata: server=%s content-type=%s content-length=%" G_GOFFSET_FORMAT " set-cookie-present=%d",
++                    server ? server : "(none)",
++                    contentType ? contentType : "(none)",
++                    responseHeaders ? soup_message_headers_get_content_length(responseHeaders) : static_cast<goffset>(-1),
++                    !!setCookie);
+                 task->didFail(String::fromUTF8(error->message));
+             }
+         }, this);

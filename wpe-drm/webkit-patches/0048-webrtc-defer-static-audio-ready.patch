@@ -1,0 +1,38 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -184,10 +184,32 @@
+     auto trackProcessorSrcPad = adoptGRef(gst_element_get_static_pad(trackProcessor.get(), "src"));
+     if (trackProcessorSrcPad) {
+         auto queueSinkPad = adoptGRef(gst_element_get_static_pad(queue, "sink"));
+-        if (gst_pad_link(trackProcessorSrcPad.get(), queueSinkPad.get()) == GST_PAD_LINK_OK)
+-            trackReady();
+-        else
++        if (gst_pad_link(trackProcessorSrcPad.get(), queueSinkPad.get()) != GST_PAD_LINK_OK)
+             GST_ERROR_OBJECT(m_bin.get(), "Failed to link static incoming track processor to queue");
++        else if (m_data.type == RealtimeMediaSource::Type::Audio && m_isDecoding
++            && g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_DEFER_STATIC_AUDIO_READY"), "0")) {
++            /*
++             * configure() runs before GStreamerMediaEndpoint::connectPad() adds
++             * this bin to the WebRTC pipeline, links the external pad and sets
++             * PAUSED. Calling trackReady() synchronously here lets
++             * connectIncomingTrack()->setBin() race those state transitions.
++             * Wait for the first decoded sample, which proves the full bin is
++             * linked and running, then hand the track to the main thread.
++             */
++            gst_pad_add_probe(trackProcessorSrcPad.get(), GST_PAD_PROBE_TYPE_BUFFER,
++                +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
++                    RefPtr self = reinterpret_cast<ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor>*>(userData)->get();
++                    if (!self)
++                        return GST_PAD_PROBE_REMOVE;
++                    GST_INFO_OBJECT(self->m_bin.get(), "First decoded static audio sample received; marking track ready");
++                    self->trackReady();
++                    return GST_PAD_PROBE_REMOVE;
++                }, new ThreadSafeWeakPtr { *this }, reinterpret_cast<GDestroyNotify>(+[](gpointer data) {
++                    delete static_cast<ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor>*>(data);
++                }));
++            GST_INFO_OBJECT(m_bin.get(), "Deferring static decoded audio track ready until first sample");
++        } else
++            trackReady();
+     }
+ 
+     auto sinkPad = adoptGRef(gst_element_get_static_pad(trackProcessor.get(), "sink"));
