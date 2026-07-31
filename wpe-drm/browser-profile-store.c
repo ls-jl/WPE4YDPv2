@@ -1014,6 +1014,7 @@ void browser_profile_store_get_global_settings(BrowserProfileStore *store,
     memset(settings, 0, sizeof(*settings));
     g_strlcpy(settings->theme, "light", sizeof(settings->theme));
     settings->toolbar_auto_hide = TRUE;
+    settings->gpu_acceleration = TRUE;
     if (!store)
         return;
 
@@ -1029,6 +1030,16 @@ void browser_profile_store_get_global_settings(BrowserProfileStore *store,
             || !g_ascii_strcasecmp(auto_hide, "on");
     }
     g_free(auto_hide);
+    char *gpu_acceleration = get_meta(store, "gpu_acceleration");
+    if (gpu_acceleration) {
+        settings->gpu_acceleration =
+            !g_ascii_strcasecmp(gpu_acceleration, "1")
+            || !g_ascii_strcasecmp(gpu_acceleration, "true")
+            || !g_ascii_strcasecmp(gpu_acceleration, "yes")
+            || !g_ascii_strcasecmp(gpu_acceleration, "on")
+            || !g_ascii_strcasecmp(gpu_acceleration, "auto");
+    }
+    g_free(gpu_acceleration);
 }
 
 gboolean browser_profile_store_save_global_settings(BrowserProfileStore *store,
@@ -1039,7 +1050,9 @@ gboolean browser_profile_store_save_global_settings(BrowserProfileStore *store,
     return set_meta(store, "ui_theme",
                     !g_ascii_strcasecmp(settings->theme, "dark") ? "dark" : "light", error)
         && set_meta(store, "toolbar_auto_hide",
-                    settings->toolbar_auto_hide ? "1" : "0", error);
+                    settings->toolbar_auto_hide ? "1" : "0", error)
+        && set_meta(store, "gpu_acceleration",
+                    settings->gpu_acceleration ? "1" : "0", error);
 }
 
 static gboolean insert_navigation(sqlite3 *database, int64_t tab_id, int kind,

@@ -71,6 +71,7 @@ Writable data lives under `$dataDir/browser/`: `wpe-drm.log`, `browser.sqlite3` 
 | `WPE_CHROME_LAYOUT` | `inset` | How the toolbar makes room; `resize` is for debugging only |
 | `WPE_USE_SYSTEM_GST` | `0` | When `1`, appends the system GStreamer plugin directory (for debugging) |
 | `WPE_GPU_MODE` | `auto` | `auto` falls back to CPU, `off` forces CPU, `required` fails if GPU is unavailable |
+| `WPE_GPU_MODE_FILE` | `$WPE_VAR_DIR/gpu-mode` | Pre-launch mirror for the Settings GPU toggle: `auto` enables it and `off` disables it |
 | `WPE_WEBRTC` | `1` | Enables the GStreamer WebRTC backend |
 | `WPE_WEBRTC_CAPTURE` | `deny` | Local capture policy; production must keep this at `deny` |
 | `WPE_INPUT_PROFILE` | `auto` | Selects `browser/game` by host; game mode never converts drags to scrolls |

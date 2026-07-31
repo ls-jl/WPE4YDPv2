@@ -76,6 +76,7 @@ WebKit 内核与 `wpe-drm-minimal` 在 arm64 交叉编译服务器上构建（cm
 | `WPE_CHROME_LAYOUT` | `inset` | 工具栏让位方式，`resize` 仅调试 |
 | `WPE_USE_SYSTEM_GST` | `0` | `1` 时附加系统 GStreamer 插件目录（调试用） |
 | `WPE_GPU_MODE` | `auto` | `auto` 探测失败回 CPU；`off` 强制 CPU；`required` GPU 失败即退出 |
+| `WPE_GPU_MODE_FILE` | `$WPE_VAR_DIR/gpu-mode` | 设置页 GPU 开关的启动前镜像；`auto` 开启，`off` 关闭 |
 | `WPE_WEBRTC` | `1` | 启用 GStreamer WebRTC backend |
 | `WPE_WEBRTC_CAPTURE` | `deny` | 本地音视频采集策略；产品模式必须保持 `deny` |
 | `WPE_INPUT_PROFILE` | `auto` | `auto` 按域名选择 `browser/game`；`game` 不把拖动转换成滚动 |

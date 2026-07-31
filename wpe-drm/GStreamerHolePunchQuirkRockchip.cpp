@@ -67,11 +67,11 @@ struct VideoOverlayWireMessage {
 // UI 进程 NONBLOCK commit 后旧帧可能还有一个 vblank 在屏上，多押两级；
 // 解码器缓冲池通常 16+ 个 buffer，扣 4 个不会饿到解码。
 static constexpr size_t retainedSampleCount = 4;
-static constexpr gint64 staleOwnerTimeoutUS = 750 * 1000;
 
 struct RockchipVideoOverlaySinkContext {
     Lock lock;
     IntRect rect;
+    bool loggedOwnerBusy { false };
 };
 
 class RockchipVideoOverlayChannel {
@@ -91,8 +91,7 @@ public:
         m_retainedSamples.clear();
         closeLocked();
         m_owner = nullptr;
-        m_lastFrameUS = 0;
-        g_message("Rockchip video overlay: owner released");
+        g_message("Rockchip video overlay: owner=%p released", owner);
     }
 
     void setRectangle(RockchipVideoOverlaySinkContext* owner, const IntRect& rect)
@@ -135,21 +134,21 @@ public:
             return;
 
         Locker locker { m_lock };
-        auto now = g_get_monotonic_time();
         if (m_owner != owner) {
-            if (m_owner && now - m_lastFrameUS <= staleOwnerTimeoutUS)
-                return;
             if (m_owner) {
-                sendSimpleMessageLocked(VideoOverlayMessageHide);
-                m_retainedSamples.clear();
-                g_message("Rockchip video overlay: stale owner replaced after %.1f ms", (now - m_lastFrameUS) / 1000.0);
-            } else
-                g_message("Rockchip video overlay: owner acquired on first NV12 DMA-BUF frame");
+                if (!owner->loggedOwnerBusy) {
+                    owner->loggedOwnerBusy = true;
+                    g_message("Rockchip video overlay: contender=%p blocked by owner=%p", owner, m_owner);
+                }
+                return;
+            }
+            g_message("Rockchip video overlay: owner=%p acquired frame=%ux%u rect=%dx%d+%d+%d",
+                owner, GST_VIDEO_INFO_WIDTH(&info), GST_VIDEO_INFO_HEIGHT(&info),
+                rect.width(), rect.height(), rect.x(), rect.y());
             m_owner = owner;
             m_rect = rect;
         } else if (m_rect != rect)
             m_rect = rect;
-        m_lastFrameUS = now;
 
         if (!ensureConnectedLocked())
             return;
@@ -279,7 +278,6 @@ private:
     RockchipVideoOverlaySinkContext* m_owner { nullptr };
     bool m_warned { false };
     gint64 m_lastConnectAttemptUS { 0 };
-    gint64 m_lastFrameUS { 0 };
     IntRect m_rect;
     Vector<GRefPtr<GstSample>> m_retainedSamples;
 };

@@ -301,7 +301,8 @@ export WPE_TOUCH_OFFSET_X="${WPE_TOUCH_OFFSET_X:-0}"
 export WPE_TOUCH_OFFSET_Y="${WPE_TOUCH_OFFSET_Y:-0}"
 export WPE_SEND_TOUCH_EVENTS="${WPE_SEND_TOUCH_EVENTS:-1}"
 export WPE_SYNTHESIZE_POINTER_TAP="${WPE_SYNTHESIZE_POINTER_TAP:-1}"
-export WPE_GAME_POINTER_TAP_FALLBACK="${WPE_GAME_POINTER_TAP_FALLBACK:-0}"
+export WPE_GAME_GESTURE_DRAG_PX="${WPE_GAME_GESTURE_DRAG_PX:-8}"
+export WPE_GAME_GESTURE_HOLD_MS="${WPE_GAME_GESTURE_HOLD_MS:-80}"
 export WPE_GAME_MEDIA_IMMERSIVE="${WPE_GAME_MEDIA_IMMERSIVE:-1}"
 export WPE_TOUCH_SCROLL_FALLBACK="${WPE_TOUCH_SCROLL_FALLBACK:-0}"
 export WPE_TOUCH_NATIVE_SCROLL="${WPE_TOUCH_NATIVE_SCROLL:-1}"
@@ -360,6 +361,7 @@ GPU_MODULE_DIR="$DIR/gpu/modules/5.10.160"
 GPU_PROBE="$DIR/libexec/wpe-gpu-probe"
 GPU_SHIM="$MALI_LIB/libwpe-mali-gbm-compat.so"
 GPU_MODE="${WPE_GPU_MODE:-auto}"
+GPU_MODE_FILE="${WPE_GPU_MODE_FILE:-$VAR_DIR/gpu-mode}"
 GPU_OWN_HELPER=0
 GPU_OWN_KBASE=0
 GPU_READY_FILE="$VAR_DIR/gpu-first-frame.ready"
@@ -367,16 +369,33 @@ BROWSER_PID=
 KEEP_PID=
 TERMINATING=0
 PROFILE_SWITCH_COUNT=0
+GPU_RESTART_COUNT=0
 rm -f "$WPE_PROFILE_SWITCH_FILE"
 
-case "$GPU_MODE" in
-    auto|off|required) ;;
-    *)
-        echo "WPE warning: invalid WPE_GPU_MODE=$GPU_MODE, using auto"
-        GPU_MODE=auto
-        ;;
-esac
-export WPE_GPU_MODE="$GPU_MODE"
+load_gpu_mode_preference() {
+    if [ -r "$GPU_MODE_FILE" ]; then
+        GPU_MODE_PREFERENCE=$(sed -n '1p' "$GPU_MODE_FILE" 2>/dev/null || true)
+        case "$GPU_MODE_PREFERENCE" in
+            auto|off|required)
+                GPU_MODE="$GPU_MODE_PREFERENCE"
+                ;;
+            *)
+                echo "WPE warning: invalid GPU mode preference in $GPU_MODE_FILE"
+                ;;
+        esac
+    fi
+    case "$GPU_MODE" in
+        auto|off|required) ;;
+        *)
+            echo "WPE warning: invalid WPE_GPU_MODE=$GPU_MODE, using auto"
+            GPU_MODE=auto
+            ;;
+    esac
+    export WPE_GPU_MODE="$GPU_MODE"
+    export WPE_GPU_MODE_FILE="$GPU_MODE_FILE"
+}
+
+load_gpu_mode_preference
 
 module_loaded() {
     grep -q "^$1 " /proc/modules 2>/dev/null
@@ -521,7 +540,9 @@ configure_gpu_profile() {
     export WEBKIT_DISABLE_DMABUF_ATLAS=0
     export WPE_DRM_BUFFER_PATH=auto
     export WPE_DRM_FORCE_SHM=0
-    export WPE_DMABUF_BUFFER_FORMAT=XR24:0:scanout
+    # The Rockchip video overlay sits below the WPE primary plane. Keep the
+    # primary ARGB-capable so WebKit's hole-punch pixels remain transparent.
+    export WPE_DMABUF_BUFFER_FORMAT=AR24:0:scanout
     export WEBKIT_SKIA_USE_LINEAR_TILE_TEXTURES=1
 }
 
@@ -548,6 +569,27 @@ probe_gpu() {
     echo "WPE GPU probe: result=failed status=$GPU_PROBE_STATUS"
     cleanup_gpu_modules
     return 1
+}
+
+select_render_profile() {
+    SELECTED_PROFILE=cpu
+    if [ "$GPU_MODE" != off ] && probe_gpu; then
+        SELECTED_PROFILE=gpu
+        export WPE_GPU_STATUS=active
+        return 0
+    fi
+    cleanup_gpu_modules
+    if [ "$GPU_MODE" = required ]; then
+        echo "WPE fatal: required Mali GPU profile is unavailable"
+        return 90
+    fi
+    configure_cpu_profile
+    if [ "$GPU_MODE" = off ]; then
+        export WPE_GPU_STATUS=off
+    else
+        export WPE_GPU_STATUS=unavailable
+    fi
+    return 0
 }
 
 cleanup_runtime() {
@@ -611,20 +653,6 @@ trap cleanup_runtime EXIT
 trap on_terminate INT TERM
 printf '%s\n' "$ROTATION" >"$WPE_DRM_ROTATION_FILE" 2>/dev/null || true
 
-SELECTED_PROFILE=cpu
-if [ "$GPU_MODE" != off ] && probe_gpu; then
-    SELECTED_PROFILE=gpu
-else
-    cleanup_gpu_modules
-    if [ "$GPU_MODE" = required ]; then
-        echo "WPE fatal: required Mali GPU profile is unavailable"
-        exit 90
-    fi
-    configure_cpu_profile
-fi
-
-echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
-
 if command -v hal-screen >/dev/null 2>&1; then
     env -u LD_LIBRARY_PATH -u LD_PRELOAD hal-screen on >/dev/null 2>&1 || true
     (
@@ -636,25 +664,48 @@ if command -v hal-screen >/dev/null 2>&1; then
     KEEP_PID=$!
 fi
 
-run_profile_switch_loop
-STATUS=$?
-if [ "$STATUS" -eq 74 ]; then
-    echo "WPE user shutdown completed"
-    exit 0
-fi
-if [ "$SELECTED_PROFILE" = gpu ] && [ "$TERMINATING" = 0 ] && \
-   { [ "$STATUS" -eq 91 ] || [ ! -f "$GPU_READY_FILE" ]; }; then
-    if [ "$GPU_MODE" = required ]; then
-        echo "WPE fatal: required GPU launch failed status=$STATUS ready=0"
-        exit "$STATUS"
+while :; do
+    load_gpu_mode_preference
+    select_render_profile
+    SELECT_STATUS=$?
+    if [ "$SELECT_STATUS" -ne 0 ]; then
+        exit "$SELECT_STATUS"
     fi
-    echo "WPE GPU runtime failed before first frame status=$STATUS; restarting once with CPU profile"
-    cleanup_gpu_modules
-    configure_cpu_profile
-    SELECTED_PROFILE=cpu-fallback
+
+    echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE gpu_status=$WPE_GPU_STATUS compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
+
     run_profile_switch_loop
     STATUS=$?
-fi
+    if [ "$SELECTED_PROFILE" = gpu ] && [ "$TERMINATING" = 0 ] && \
+       [ "$STATUS" -ne 73 ] && [ "$STATUS" -ne 74 ] && \
+       { [ "$STATUS" -eq 91 ] || [ ! -f "$GPU_READY_FILE" ]; }; then
+        if [ "$GPU_MODE" = required ]; then
+            echo "WPE fatal: required GPU launch failed status=$STATUS ready=0"
+            exit "$STATUS"
+        fi
+        echo "WPE GPU runtime failed before first frame status=$STATUS; restarting once with CPU profile"
+        cleanup_gpu_modules
+        configure_cpu_profile
+        SELECTED_PROFILE=cpu-fallback
+        export WPE_GPU_STATUS=fallback
+        run_profile_switch_loop
+        STATUS=$?
+    fi
+
+    if [ "$STATUS" -ne 73 ]; then
+        break
+    fi
+    GPU_RESTART_COUNT=$((GPU_RESTART_COUNT + 1))
+    if [ "$GPU_RESTART_COUNT" -gt 8 ]; then
+        echo "WPE GPU mode restart aborted: restart limit exceeded"
+        STATUS=76
+        break
+    fi
+    cleanup_gpu_modules
+    load_gpu_mode_preference
+    echo "WPE GPU mode restart: mode=$GPU_MODE count=$GPU_RESTART_COUNT"
+done
+
 if [ "$STATUS" -eq 74 ]; then
     echo "WPE user shutdown completed"
     STATUS=0

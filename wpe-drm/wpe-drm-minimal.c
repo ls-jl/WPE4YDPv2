@@ -76,6 +76,7 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 #define CHROME_MENU_ITEM_COUNT 6
 #define CHROME_LIST_HEADER_HEIGHT 32
 #define CHROME_LIST_ROW_HEIGHT 48
+#define CHROME_GPU_RESTART_CODE 73
 #define CHROME_USER_EXIT_CODE 74
 
 typedef enum {
@@ -106,6 +107,12 @@ typedef enum {
     CHROME_PANEL_GESTURE_LIST_VERTICAL,
 } ChromePanelGesture;
 
+typedef enum {
+    GAME_GESTURE_NONE = 0,
+    GAME_GESTURE_PENDING,
+    GAME_GESTURE_TOUCH,
+} GameGesture;
+
 typedef struct {
     gboolean active;
     gboolean just_down;
@@ -126,6 +133,20 @@ typedef struct {
     double panel_start_offset;
     double panel_velocity;
     guint32 panel_last_time_ms;
+    GameGesture game_gesture;
+    guint game_hold_source_id;
+    guint32 game_sequence_id;
+    guint32 game_down_time_ms;
+    gpointer game_state;
+    gboolean game_video_mapped;
+    int game_dom_x;
+    int game_dom_y;
+    int game_dom_width;
+    int game_dom_height;
+    int game_visible_x;
+    int game_visible_y;
+    int game_visible_width;
+    int game_visible_height;
 } TouchSlot;
 
 typedef struct {
@@ -235,9 +256,11 @@ typedef struct {
     gboolean touch_scroll_invert_y;
     gboolean send_touch_events;
     gboolean synthesize_pointer_tap;
-    gboolean game_pointer_tap_fallback;
     char input_profile[16];
     gboolean game_input_active;
+    guint32 next_touch_sequence;
+    double game_drag_threshold;
+    guint game_hold_delay_ms;
     gboolean native_scroll_scheduled;
     guint native_scroll_source_id;
     gboolean scroll_active;
@@ -302,6 +325,20 @@ static gboolean env_enabled(const char *name, gboolean default_value)
         !g_ascii_strcasecmp(value, "off") || !g_ascii_strcasecmp(value, "no"))
         return FALSE;
     return TRUE;
+}
+
+static const char *gpu_runtime_status_label(const BrowserGlobalSettings *settings)
+{
+    if (gpu_render_profile)
+        return "ACTIVE";
+    if (settings && !settings->gpu_acceleration)
+        return "OFF";
+    const char *status = g_getenv("WPE_GPU_STATUS");
+    if (!g_strcmp0(status, "unavailable"))
+        return "UNAVAILABLE";
+    if (!g_strcmp0(status, "fallback"))
+        return "CPU FALLBACK";
+    return "CPU FALLBACK";
 }
 
 static gboolean parse_viewport_string(const char *value, int *width, int *height)
@@ -1085,7 +1122,8 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         g_key_file_set_string(key_file, "panel", "line1", "TOOLBAR AUTO-HIDE");
         g_key_file_set_string(key_file, "panel", "line2", "PAGE ZOOM");
         g_key_file_set_string(key_file, "panel", "line3", "DEFAULT FONT");
-        line_count = 4;
+        g_key_file_set_string(key_file, "panel", "line4", "GPU ACCELERATION");
+        line_count = 5;
         chrome_set_line_style(key_file, 0, "choice",
                               !g_ascii_strcasecmp(chrome->global_settings.theme, "dark")
                                 ? "DARK" : "LIGHT", FALSE, "theme");
@@ -1093,6 +1131,9 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                               chrome->global_settings.toolbar_auto_hide, "toolbar");
         chrome_set_line_style(key_file, 2, "choice", zoom, FALSE, "zoom");
         chrome_set_line_style(key_file, 3, "choice", font, FALSE, "font");
+        chrome_set_line_style(key_file, 4, "toggle",
+                              gpu_runtime_status_label(&chrome->global_settings),
+                              chrome->global_settings.gpu_acceleration, "renderer");
     } else if (chrome->panel == CHROME_PANEL_WEB) {
         g_key_file_set_string(key_file, "panel", "line0", "SITE MODE");
         g_key_file_set_string(key_file, "panel", "line1", "JAVASCRIPT");
@@ -1159,7 +1200,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                                 ? profile_runtime.profile.name : "DEFAULT",
                               FALSE, "profiles");
         chrome_set_line_style(key_file, 3, "info",
-                              gpu_render_profile ? "MALI GPU" : "SKIA CPU",
+                              gpu_runtime_status_label(&chrome->global_settings),
                               FALSE, "renderer");
         chrome_set_line_style(key_file, 4, "info", display, FALSE, "display");
     } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
@@ -1374,6 +1415,10 @@ static void chrome_update_render_state(AppState *state)
                             ? "dark" : "light");
     g_key_file_set_boolean(key_file, "chrome", "toolbar_auto_hide",
                            chrome->global_settings.toolbar_auto_hide);
+    g_key_file_set_boolean(key_file, "chrome", "gpu_acceleration",
+                           chrome->global_settings.gpu_acceleration);
+    g_key_file_set_string(key_file, "chrome", "gpu_status",
+                          gpu_runtime_status_label(&chrome->global_settings));
     char *transition_us = g_strdup_printf("%" G_GINT64_FORMAT, chrome->transition_us);
     g_key_file_set_string(key_file, "chrome", "transition_us", transition_us);
     g_free(transition_us);
@@ -2905,6 +2950,81 @@ static gboolean chrome_write_profile_switch(const char *value)
     return success;
 }
 
+static gboolean chrome_write_gpu_mode(gboolean enabled)
+{
+    const char *path = g_getenv("WPE_GPU_MODE_FILE");
+    char *fallback = NULL;
+    if (!path || !path[0]) {
+        const char *var_dir = g_getenv("WPE_VAR_DIR");
+        fallback = g_build_filename(var_dir && var_dir[0] ? var_dir : "/tmp",
+                                    "gpu-mode", NULL);
+        path = fallback;
+    }
+    char *directory = g_path_get_dirname(path);
+    if (g_mkdir_with_parents(directory, 0700) && errno != EEXIST) {
+        g_warning("GPU mode directory create failed: %s", directory);
+        g_free(directory);
+        g_free(fallback);
+        return FALSE;
+    }
+    chmod(directory, 0700);
+    g_free(directory);
+
+    char *temporary = g_strdup_printf("%s.tmp.%ld", path, (long)getpid());
+    int fd = g_open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    const char *value = enabled ? "auto\n" : "off\n";
+    gsize length = strlen(value);
+    gsize written = 0;
+    gboolean success = fd >= 0;
+    while (success && written < length) {
+        ssize_t count = write(fd, value + written, length - written);
+        if (count > 0)
+            written += count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else
+            success = FALSE;
+    }
+    if (success)
+        success = fsync(fd) == 0;
+    if (fd >= 0)
+        close(fd);
+    if (success)
+        success = g_rename(temporary, path) == 0;
+    if (success)
+        chmod(path, 0600);
+    else {
+        g_warning("GPU mode file write failed: %s errno=%d (%s)",
+                  path, errno, strerror(errno));
+        g_unlink(temporary);
+    }
+    g_free(temporary);
+    g_free(fallback);
+    return success;
+}
+
+static void chrome_request_gpu_restart(AppState *state, gboolean enabled)
+{
+    if (!state)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    gboolean previous = chrome->global_settings.gpu_acceleration;
+    chrome->global_settings.gpu_acceleration = enabled;
+    if (!chrome_write_gpu_mode(enabled)) {
+        chrome->global_settings.gpu_acceleration = previous;
+        chrome_update_render_state(state);
+        chrome_request_frame(state);
+        return;
+    }
+    chrome_save_state(state);
+    runtime_exit_code = CHROME_GPU_RESTART_CODE;
+    g_print("GPU mode switch requested: enabled=%d mode=%s current=%s exit=%d\n",
+            enabled, enabled ? "auto" : "off",
+            gpu_render_profile ? "gpu" : "cpu", runtime_exit_code);
+    if (main_loop)
+        g_main_loop_quit(main_loop);
+}
+
 static void chrome_switch_profile(AppState *state, int64_t profile_id, gboolean guest)
 {
     if (!state)
@@ -3062,6 +3182,9 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             chrome_cycle_page_zoom(state);
         else if (row == 3)
             chrome_cycle_font_size(state);
+        else if (row == 4)
+            chrome_request_gpu_restart(
+                state, !chrome->global_settings.gpu_acceleration);
     } else if (chrome->panel == CHROME_PANEL_WEB) {
         if (row == 0)
             chrome_toggle_site_profile(state);
@@ -3681,7 +3804,7 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     }
     g_print("Chrome profile state: name=%s guest=%d home=%s site_profile=%s cookie_policy=%s "
             "search=%s zoom=%.2f font=%u js=%d autoplay_gesture=%d smooth=%d popups_blocked=%d "
-            "restore_tabs=%d theme=%s toolbar_auto_hide=%d tabs=%d active=%d\n",
+            "restore_tabs=%d theme=%s toolbar_auto_hide=%d gpu_acceleration=%d gpu_status=%s tabs=%d active=%d\n",
             profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
             profile_runtime.guest, chrome->home_url,
             chrome->site_profile, browser_cookie_policy_name(chrome->cookie_policy),
@@ -3689,6 +3812,8 @@ static void chrome_load_state(AppState *state, const char *initial_url)
             chrome->javascript_enabled, chrome->autoplay_requires_gesture,
             chrome->smooth_scrolling, chrome->block_popups, chrome->restore_tabs,
             chrome->global_settings.theme, chrome->global_settings.toolbar_auto_hide,
+            chrome->global_settings.gpu_acceleration,
+            gpu_runtime_status_label(&chrome->global_settings),
             chrome->tab_count, chrome->active);
     chrome_update_render_state(state);
 }
@@ -3800,9 +3925,13 @@ static void init_touch_slots(AppState *state)
 {
     state->current_slot = 0;
     for (int i = 0; i < MAX_TOUCH_SLOTS; ++i) {
+        if (state->slots[i].game_hold_source_id)
+            g_source_remove(state->slots[i].game_hold_source_id);
+        memset(&state->slots[i], 0, sizeof(state->slots[i]));
         state->slots[i].tracking_id = -1;
         state->slots[i].raw_x = -1;
         state->slots[i].raw_y = -1;
+        state->slots[i].game_state = state;
     }
 }
 
@@ -3964,6 +4093,64 @@ static gboolean transform_game_video_point(AppState *state, double *x, double *y
     return TRUE;
 }
 
+static void snapshot_game_video_mapping(AppState *state, TouchSlot *slot)
+{
+    slot->game_video_mapped = FALSE;
+    if (!state || !slot || !state->game_input_active || !state->view)
+        return;
+
+    const char *value = g_object_get_data(G_OBJECT(state->view),
+                                          "wpe-video-overlay-input-geometry");
+    int version = 0;
+    char fit[16] = { 0 };
+    if (!value || sscanf(value, "%d,%15[^,],%d,%d,%d,%d,%d,%d,%d,%d",
+            &version, fit,
+            &slot->game_dom_x, &slot->game_dom_y,
+            &slot->game_dom_width, &slot->game_dom_height,
+            &slot->game_visible_x, &slot->game_visible_y,
+            &slot->game_visible_width, &slot->game_visible_height) != 10
+        || version != 1 || g_strcmp0(fit, "contain")
+        || slot->game_dom_width <= 0 || slot->game_dom_height <= 0
+        || slot->game_visible_width <= 0 || slot->game_visible_height <= 0)
+        return;
+
+    double visible_max_x = slot->game_visible_x + slot->game_visible_width - 1;
+    double visible_max_y = slot->game_visible_y + slot->game_visible_height - 1;
+    slot->game_video_mapped =
+        slot->x >= slot->game_visible_x && slot->x <= visible_max_x
+        && slot->y >= slot->game_visible_y && slot->y <= visible_max_y;
+}
+
+static void map_game_slot_point(AppState *state, const TouchSlot *slot,
+                                double screen_x, double screen_y,
+                                double *view_x, double *view_y,
+                                gboolean *video_mapped)
+{
+    gboolean mapped = state && slot && state->game_input_active
+        && slot->game_video_mapped;
+    double x = screen_x;
+    double y = screen_y;
+    if (mapped) {
+        double normalized_x = (screen_x - slot->game_visible_x)
+            / MAX(1.0, (double)slot->game_visible_width - 1.0);
+        double normalized_y = (screen_y - slot->game_visible_y)
+            / MAX(1.0, (double)slot->game_visible_height - 1.0);
+        normalized_x = clamp_double(normalized_x, 0, 1);
+        normalized_y = clamp_double(normalized_y, 0, 1);
+        x = slot->game_dom_x
+            + normalized_x * MAX(0, slot->game_dom_width - 1);
+        y = slot->game_dom_y
+            + normalized_y * MAX(0, slot->game_dom_height - 1);
+    } else
+        y = web_event_y(state, screen_y);
+    if (view_x)
+        *view_x = x;
+    if (view_y)
+        *view_y = y;
+    if (video_mapped)
+        *video_mapped = mapped;
+}
+
 static gboolean uses_native_touch_events(AppState *state)
 {
     if (!state)
@@ -3992,17 +4179,36 @@ static void send_touch_event(AppState *state, WPEEventType type, guint32 sequenc
                 type, sequence_id, x, view_y, screen_x, screen_y, video_mapped, state->touch_event_count);
 }
 
-static void send_pointer_tap(AppState *state, double x, double y, guint32 time_ms)
+static void send_game_touch_event(AppState *state, WPEEventType type,
+                                  TouchSlot *slot, double screen_x,
+                                  double screen_y, guint32 time_ms)
 {
-    if (!state->synthesize_pointer_tap)
+    if (!state || !slot)
         return;
+    double x = 0;
+    double y = 0;
+    gboolean video_mapped = FALSE;
+    map_game_slot_point(state, slot, screen_x, screen_y, &x, &y,
+                        &video_mapped);
+    WPEEvent *event = wpe_event_touch_new(type, state->view,
+        WPE_INPUT_SOURCE_TOUCHSCREEN, time_ms, 0,
+        slot->game_sequence_id, x, y);
+    wpe_view_event(state->view, event);
+    wpe_event_unref(event);
+    state->touch_event_count++;
+    if (type == WPE_EVENT_TOUCH_DOWN || type == WPE_EVENT_TOUCH_UP
+        || state->touch_event_count <= 8 || !(state->touch_event_count % 80))
+        g_print("Game touch: type=%d seq=%u x=%.1f y=%.1f screen=%.1f,%.1f frozen_video_map=%d count=%" G_GUINT64_FORMAT "\n",
+                type, slot->game_sequence_id, x, y, screen_x, screen_y,
+                video_mapped, state->touch_event_count);
+}
 
+static void dispatch_pointer_tap(AppState *state, double x, double view_y,
+                                 double screen_x, double screen_y,
+                                 gboolean video_mapped, guint32 time_ms)
+{
     state->last_pointer_tap_us = g_get_monotonic_time();
     wpe_view_focus_in(state->view);
-    double screen_x = x;
-    double screen_y = y;
-    gboolean video_mapped = transform_game_video_point(state, &x, &y);
-    double view_y = video_mapped ? y : web_event_y(state, y);
 
     WPEEvent *move = wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, state->view,
                                                 WPE_INPUT_SOURCE_MOUSE, time_ms,
@@ -4031,6 +4237,34 @@ static void send_pointer_tap(AppState *state, double x, double y, guint32 time_m
 
     g_print("Pointer tap: x=%.1f y=%.1f screen=%.1f,%.1f video_mapped=%d\n",
             x, view_y, screen_x, screen_y, video_mapped);
+}
+
+static void send_pointer_tap(AppState *state, double x, double y, guint32 time_ms)
+{
+    if (!state->synthesize_pointer_tap)
+        return;
+
+    double screen_x = x;
+    double screen_y = y;
+    gboolean video_mapped = transform_game_video_point(state, &x, &y);
+    double view_y = video_mapped ? y : web_event_y(state, y);
+    dispatch_pointer_tap(state, x, view_y, screen_x, screen_y,
+                         video_mapped, time_ms);
+}
+
+static void send_game_pointer_tap(AppState *state, TouchSlot *slot,
+                                  double screen_x, double screen_y,
+                                  guint32 time_ms)
+{
+    if (!state->synthesize_pointer_tap)
+        return;
+    double x = 0;
+    double y = 0;
+    gboolean video_mapped = FALSE;
+    map_game_slot_point(state, slot, screen_x, screen_y, &x, &y,
+                        &video_mapped);
+    dispatch_pointer_tap(state, x, y, screen_x, screen_y,
+                         video_mapped, time_ms);
 }
 
 static void send_js_scroll_event(AppState *state, double x, double y, double delta_y)
@@ -4216,6 +4450,71 @@ static void queue_scroll_event(AppState *state, double x, double y, double delta
     schedule_native_scroll(state);
 }
 
+static void game_activate_touch_slot(AppState *state, TouchSlot *slot,
+                                     const char *reason, guint32 time_ms)
+{
+    if (!state || !slot || slot->game_gesture != GAME_GESTURE_PENDING
+        || slot->chrome_consumed)
+        return;
+    if (slot->game_hold_source_id) {
+        g_source_remove(slot->game_hold_source_id);
+        slot->game_hold_source_id = 0;
+    }
+    slot->game_gesture = GAME_GESTURE_TOUCH;
+    send_game_touch_event(state, WPE_EVENT_TOUCH_DOWN, slot,
+                          slot->down_x, slot->down_y,
+                          slot->game_down_time_ms);
+    g_print("Game gesture: gesture=%s seq=%u reason=%s frozen_video_map=%d down=%.1f,%.1f\n",
+            !g_strcmp0(reason, "multitouch") ? "multitouch" : "drag-touch",
+            slot->game_sequence_id, reason ? reason : "unknown",
+            slot->game_video_mapped, slot->down_x, slot->down_y);
+    (void)time_ms;
+}
+
+static gboolean game_hold_timeout_cb(gpointer user_data)
+{
+    TouchSlot *slot = (TouchSlot *)user_data;
+    if (!slot)
+        return G_SOURCE_REMOVE;
+    slot->game_hold_source_id = 0;
+    AppState *state = (AppState *)slot->game_state;
+    if (state && state->game_input_active && slot->active
+        && slot->game_gesture == GAME_GESTURE_PENDING)
+        game_activate_touch_slot(state, slot, "hold",
+                                 slot->game_down_time_ms
+                                     + state->game_hold_delay_ms);
+    return G_SOURCE_REMOVE;
+}
+
+static void game_flush_multitouch(AppState *state, guint32 time_ms)
+{
+    guint active_contacts = 0;
+    for (int i = 0; i < MAX_TOUCH_SLOTS; ++i) {
+        TouchSlot *slot = &state->slots[i];
+        if (slot->active && !slot->chrome_consumed
+            && slot->game_gesture != GAME_GESTURE_NONE)
+            active_contacts++;
+    }
+    if (active_contacts < 2)
+        return;
+    for (int i = 0; i < MAX_TOUCH_SLOTS; ++i) {
+        TouchSlot *slot = &state->slots[i];
+        if (slot->active && !slot->chrome_consumed
+            && slot->game_gesture == GAME_GESTURE_PENDING)
+            game_activate_touch_slot(state, slot, "multitouch", time_ms);
+    }
+}
+
+static void game_reset_touch_slot(TouchSlot *slot)
+{
+    if (slot->game_hold_source_id) {
+        g_source_remove(slot->game_hold_source_id);
+        slot->game_hold_source_id = 0;
+    }
+    slot->game_gesture = GAME_GESTURE_NONE;
+    slot->game_video_mapped = FALSE;
+}
+
 static void process_touch_syn(AppState *state, guint32 time_ms)
 {
     for (int i = 0; i < MAX_TOUCH_SLOTS; ++i) {
@@ -4322,18 +4621,58 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             g_print("Touch down: raw=%d,%d mapped=%.1f,%.1f chrome=%d visible=%d panel=%s\n",
                     slot->raw_x, slot->raw_y, slot->x, slot->y, slot->chrome_consumed,
                     state->chrome.visible, chrome_panel_name(state->chrome.panel));
-            if (!slot->chrome_consumed && native_touch)
+            if (!slot->chrome_consumed && state->game_input_active) {
+                state->next_touch_sequence++;
+                if (!state->next_touch_sequence)
+                    state->next_touch_sequence++;
+                slot->game_sequence_id = state->next_touch_sequence;
+                slot->game_down_time_ms = time_ms;
+                slot->game_gesture = GAME_GESTURE_PENDING;
+                snapshot_game_video_mapping(state, slot);
+                slot->game_hold_source_id = g_timeout_add(
+                    MAX(1, state->game_hold_delay_ms),
+                    game_hold_timeout_cb, slot);
+                game_flush_multitouch(state, time_ms);
+            } else if (!slot->chrome_consumed && native_touch)
                 send_touch_event(state, WPE_EVENT_TOUCH_DOWN, i, slot->x, slot->y, time_ms);
         } else if (slot->just_up) {
-            if (!slot->chrome_consumed && native_touch)
-                send_touch_event(state, WPE_EVENT_TOUCH_UP, i, slot->last_x, slot->last_y, time_ms);
+            gboolean handled_game_gesture =
+                !slot->chrome_consumed
+                && slot->game_gesture != GAME_GESTURE_NONE;
+            if (handled_game_gesture) {
+                if (slot->game_hold_source_id) {
+                    g_source_remove(slot->game_hold_source_id);
+                    slot->game_hold_source_id = 0;
+                }
+                if (slot->game_gesture == GAME_GESTURE_TOUCH) {
+                    send_game_touch_event(state, WPE_EVENT_TOUCH_UP, slot,
+                                          slot->last_x, slot->last_y,
+                                          time_ms);
+                    g_print("Game gesture end: gesture=touch seq=%u move=%.1f frozen_video_map=%d\n",
+                            slot->game_sequence_id, sqrt(slot->max_move_sq),
+                            slot->game_video_mapped);
+                } else {
+                    send_game_pointer_tap(state, slot, slot->last_x,
+                                          slot->last_y, time_ms);
+                    g_print("Game gesture end: gesture=tap-pointer seq=%u duration=%u move=%.1f frozen_video_map=%d\n",
+                            slot->game_sequence_id,
+                            time_ms - slot->game_down_time_ms,
+                            sqrt(slot->max_move_sq),
+                            slot->game_video_mapped);
+                }
+                game_reset_touch_slot(slot);
+            } else if (!slot->chrome_consumed && native_touch)
+                send_touch_event(state, WPE_EVENT_TOUCH_UP, i, slot->last_x,
+                                 slot->last_y, time_ms);
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
             if (slot->chrome_consumed) {
                 double chrome_tap_limit = env_double("WPE_CHROME_TAP_MAX_MOVE", 32);
                 if (chrome_tap_limit > tap_limit)
                     tap_limit = chrome_tap_limit;
             }
-            if (slot->chrome_consumed && slot->panel_gesture != CHROME_PANEL_GESTURE_NONE
+            if (handled_game_gesture) {
+                /* The game gesture has already emitted exactly one protocol. */
+            } else if (slot->chrome_consumed && slot->panel_gesture != CHROME_PANEL_GESTURE_NONE
                     && slot->scrolling) {
                 if (slot->panel_gesture == CHROME_PANEL_GESTURE_TABS_VERTICAL) {
                     chrome_clamp_tabs_scroll(state);
@@ -4352,7 +4691,7 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             } else if (!slot->scrolling && slot->max_move_sq <= tap_limit * tap_limit) {
                 if (slot->chrome_consumed)
                     chrome_handle_toolbar_tap(state, slot->last_x, slot->last_y);
-                else if (!native_touch || (state->game_input_active && state->game_pointer_tap_fallback))
+                else if (!native_touch)
                     send_pointer_tap(state, slot->last_x, slot->last_y, time_ms);
             }
             else {
@@ -4375,14 +4714,27 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             state->chrome.pressed_control = -1;
             chrome_publish_motion(state, FALSE);
         } else if (slot->active && (slot->x != slot->last_x || slot->y != slot->last_y)) {
-            if (!slot->chrome_consumed && native_touch)
-                send_touch_event(state, WPE_EVENT_TOUCH_MOVE, i, slot->x, slot->y, time_ms);
             double from_down_x = slot->x - slot->down_x;
             double from_down_y = slot->y - slot->down_y;
             double move_sq = from_down_x * from_down_x + from_down_y * from_down_y;
             if (move_sq > slot->max_move_sq)
                 slot->max_move_sq = move_sq;
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
+            if (!slot->chrome_consumed
+                && slot->game_gesture != GAME_GESTURE_NONE) {
+                double threshold = state->game_drag_threshold > 0
+                    ? state->game_drag_threshold : 8;
+                if (slot->game_gesture == GAME_GESTURE_PENDING
+                    && slot->max_move_sq > threshold * threshold)
+                    game_activate_touch_slot(state, slot, "movement", time_ms);
+                if (slot->game_gesture == GAME_GESTURE_TOUCH)
+                    send_game_touch_event(state, WPE_EVENT_TOUCH_MOVE, slot,
+                                          slot->x, slot->y, time_ms);
+            } else {
+                if (!slot->chrome_consumed && native_touch)
+                    send_touch_event(state, WPE_EVENT_TOUCH_MOVE, i,
+                                     slot->x, slot->y, time_ms);
+            }
             if (slot->chrome_consumed && slot->panel_gesture != CHROME_PANEL_GESTURE_NONE) {
                 double panel_drag_threshold = env_double("WPE_CHROME_PANEL_DRAG_PX", 8);
                 double delta_x = slot->x - slot->last_x;
@@ -4576,7 +4928,9 @@ static void setup_raw_touch(AppState *state)
      * 正常交互必须走 WPE 原生 touch event，不能只依赖鼠标轻点和滚动回退。 */
     state->send_touch_events = env_enabled("WPE_SEND_TOUCH_EVENTS", TRUE);
     state->synthesize_pointer_tap = env_enabled("WPE_SYNTHESIZE_POINTER_TAP", TRUE);
-    state->game_pointer_tap_fallback = env_enabled("WPE_GAME_POINTER_TAP_FALLBACK", FALSE);
+    state->game_drag_threshold = env_double("WPE_GAME_GESTURE_DRAG_PX", 8);
+    state->game_hold_delay_ms =
+        (guint)MAX(1, env_double("WPE_GAME_GESTURE_HOLD_MS", 80));
     state->touch_scroll_fallback = env_enabled("WPE_TOUCH_SCROLL_FALLBACK", FALSE);
     state->touch_native_scroll_fallback = env_enabled("WPE_TOUCH_NATIVE_SCROLL", TRUE);
     state->touch_js_scroll_fallback = env_enabled("WPE_TOUCH_JS_SCROLL", FALSE);
@@ -4591,7 +4945,7 @@ static void setup_raw_touch(AppState *state)
     init_touch_slots(state);
 
     state->touch_source_id = g_unix_fd_add(fd, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL, touch_io_cb, state);
-    g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d touch_rotation=%d touch_offset=%d,%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d game_pointer_tap=%d scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_invert_y=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
+    g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d touch_rotation=%d touch_offset=%d,%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d game_drag=%.1f game_hold=%ums scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_invert_y=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
             device, fd,
             state->panel_width, state->panel_height, state->panel_rotation,
             state->touch_rotation, state->touch_offset_x, state->touch_offset_y,
@@ -4605,7 +4959,7 @@ static void setup_raw_touch(AppState *state)
             state->touch_active_y_enabled ? state->touch_active_y_max : state->abs_y_max,
             state->touch_swap_xy, state->touch_invert_x, state->touch_invert_y,
             state->send_touch_events, state->synthesize_pointer_tap,
-            state->game_pointer_tap_fallback,
+            state->game_drag_threshold, state->game_hold_delay_ms,
             state->touch_scroll_fallback, state->touch_native_scroll_fallback,
             state->touch_js_scroll_fallback,
             state->touch_horizontal_scroll, state->touch_scroll_invert_y, state->touch_scroll_scale,
@@ -4951,6 +5305,16 @@ static void set_game_input_active(AppState *state, gboolean game_active,
     state->pending_native_scroll_x = 0;
     state->pending_native_scroll_y = 0;
     state->scroll_active = FALSE;
+    if (!game_active) {
+        guint32 time_ms = (guint32)(g_get_monotonic_time() / 1000);
+        for (int i = 0; i < MAX_TOUCH_SLOTS; ++i) {
+            TouchSlot *slot = &state->slots[i];
+            if (slot->game_gesture == GAME_GESTURE_TOUCH && slot->active)
+                send_game_touch_event(state, WPE_EVENT_TOUCH_UP, slot,
+                                      slot->last_x, slot->last_y, time_ms);
+            game_reset_touch_slot(slot);
+        }
+    }
     state->game_input_active = game_active;
 
     if (env_enabled("WPE_GAME_MEDIA_IMMERSIVE", TRUE)) {
@@ -6224,6 +6588,8 @@ int main(int argc, char **argv) {
     if (state) {
         if (state->scroll_stop_source_id)
             g_source_remove(state->scroll_stop_source_id);
+        for (int i = 0; i < MAX_TOUCH_SLOTS; ++i)
+            game_reset_touch_slot(&state->slots[i]);
         keyboard_clear_active(state);
         if (state->touch_source_id)
             g_source_remove(state->touch_source_id);

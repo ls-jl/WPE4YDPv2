@@ -594,11 +594,12 @@ Scroll fallback stop: ...
 
 最终兼容策略为：
 
-- 拖动和多点移动继续走 WPE touch event，保证游戏摇杆和连续操作；
-- 仅当移动距离小于 tap 阈值时补发 pointer tap，恢复 DOM 按钮；
-- `WPE_GAME_POINTER_TAP_FALLBACK=0` 可即时回滚；
-- 实机强制 game 模式点击云原神右上角“更多”后，日志同时出现 touch
-  down/up 和 pointer tap，菜单实际展开。
+- 每个触点在按下时冻结视频映射，跨过 contain 黑边时不切换坐标系；
+- `80ms` 内且移动不超过 `8px` 的短点击只发 pointer tap；
+- 超过阈值的拖动、长按和多点操作只发 WPE touch event；
+- 单个手势不再同时发送 pointer 与 touch，避免动作键重复或状态卡住；
+- 可用 `WPE_GAME_GESTURE_DRAG_PX` 和 `WPE_GAME_GESTURE_HOLD_MS`
+  调整分类阈值。
 
 对应 launcher SHA256 为：
 
