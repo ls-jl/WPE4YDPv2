@@ -49,8 +49,10 @@ validate_webkit_elf() {
 }
 
 require_file "$ROOT/wpe-drm/run.sh"
+require_file "$ROOT/wpe-drm/runtime/gpu-runtime.sh"
 require_file "$ROOT/libs/arm64-orange/libjsapi_browser.so"
 require_file "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
+require_file "$ROOT/assets/wpe-runtime/build-manifest.json"
 for runtime_file in \
   lib/libcrypto.so.3 \
   lib/libssl.so.3 \
@@ -75,6 +77,10 @@ validate_webkit_elf "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
 
 cp "$ROOT/wpe-drm/run.sh" "$ROOT/assets/wpe-runtime/run.sh"
 chmod +x "$ROOT/assets/wpe-runtime/run.sh"
+rm -rf "$ROOT/assets/wpe-runtime/runtime"
+mkdir -p "$ROOT/assets/wpe-runtime/runtime"
+cp "$ROOT"/wpe-drm/runtime/*.sh "$ROOT/assets/wpe-runtime/runtime/"
+chmod +x "$ROOT"/assets/wpe-runtime/runtime/*.sh
 
 PLUGIN_DIR="$ROOT/assets/wpe-runtime/lib/gstreamer-1.0"
 PLUGIN_FINGERPRINT="$ROOT/assets/wpe-runtime/share/gstreamer-plugin-set.sha256"

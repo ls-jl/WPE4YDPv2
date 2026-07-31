@@ -17,7 +17,7 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
 - **WebRTC cloud-gaming path**: WebKit uses the GStreamer PeerConnection backend with bundled ICE/DTLS/SRTP/SCTP/RTP/Opus support. Remote media and DataChannels are allowed while microphone, camera, and screen capture are denied. Cloud Genshin hosts automatically use native multi-touch `game` input.
 - **Kernel deeply customized per device model**: `-mcpu=cortex-a53` + ThinLTO + **PGO** (profile-use from real-device workload sampling on Douyin/Bilibili/Baidu, etc.); trimmed SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS and more.
 - **Low-memory self-protection**: memory limit dynamically set at 68% of physical RAM (673MB on 1GB devices, kill threshold 0.92); a crash circuit breaker automatically returns to the home page if the same URL is killed 3 times within 120 seconds; per-SourceBuffer MSE buffer caps.
-- **Single-task memory tilt**: browser `oom_score_adj=-600`, `drop_caches` at startup, `swappiness=100` during runtime (restored on exit), background process cold pages pressed into a 512MB swap.
+- **Low-risk memory policy**: global swappiness and `drop_caches` remain untouched by default. System-wide experiments are available only through explicit diagnostic switches.
 - **Mobile UA + per-site profiles**: defaults to an Android Chrome UA; supports switching between desktop/mobile profiles per site.
 - **Persistent user profiles and cookies**: up to eight persistent profiles plus Guest. Cookies, LocalStorage, IndexedDB, service workers, cache, tabs, history, bookmarks, and site mode are isolated. Browser metadata uses SQLite WAL; each profile has its own WebKit SQLite CookieJar.
 - Native toolbar `inset` layout (show/hide without resizing the WebView), Chrome-style overflow menu, direct address editing, horizontal scrolling, system keyboard bridge, and dual display modes (native/landscape rotation).
@@ -32,19 +32,22 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
   - `wpe-drm-minimal`: Direct DRM browser shell (chrome toolbar/profiles/tabs/history/bookmarks/cookies/keyboard bridge/crash circuit breaker).
   - `lib/libWPEWebKit-2.0.so.1.10.2`: customized WebKit (Git LFS). `lib/gstreamer-1.0/` contains decoding plugins copied in from the device.
   - `tests/webrtc-loopback.html`: encoder-free ICE/DataChannel and local-capture-denial smoke test.
-- `wpe-drm/`: **a local mirror of the corresponding files in the server-side WebKit tree** (changes must be synced both ways):
+- `wpe-drm/`: Direct WPE launcher, DRM platform sources, testable browser modules, supervisor modules, and the reproducible WebKit patch series:
   - `wpe-drm-minimal.c`, `run.sh`: application layer.
   - `WPEViewDRM.cpp` (including the VideoOverlay module), `WPEDisplayDRM.cpp/Private.h`, `WPEDRM.h/cpp`: the WPEPlatform DRM backend, corresponding to `Source/WebKit/WPEPlatform/wpe/drm/`.
   - `GStreamerHolePunchQuirkRockchip.{h,cpp}`: the WebProcess-side quirk for direct video output, corresponding to `Source/WebCore/platform/gstreamer/`.
-  - `webkit-patches/`: **source-level patches for other subsystems in the server-side WebKit tree** (mirrored under their original `Source/` paths); see `webkit-patches/README.md` for the list and rationale, including the dma-heap fallback and more.
-- `tools/`: documentation (`DRM_HOLE_RENDERING_PIPELINE.md` for the output pipeline, `KEYBOARD_INPUT.md`, `RUNTIME_SIZE_REPORT.md` for the size breakdown).
-- `debug/`: local debugging pages (not packaged).
+  - `browser-chrome-model.*`, `browser-navigation.*`, and `browser-profile-store.*`: independently testable native logic.
+  - `runtime/`: supervisor modules copied into the package at build time.
+  - `webkit-patches/{revision,series}`: four production patches replayed from an exact clean WebKit revision.
+- `tests/fixtures/web/`: local RAF, touch, audio, video, and page fixtures.
+- `tools/diagnostics/`: diagnostic C utilities with a shared Makefile.
 - `8001779591038449.1_0_0.amr`: the packaged build artifact (checked into Git LFS).
 
 ## Build & Packaging
 
 ```sh
 npm run build          # produces 8001779591038449.1_0_0.amr
+npm test               # JS/native/SQLite/shell/runtime/patch-series checks
 ```
 
 `scripts/sync_generated.sh` is run automatically before the build to sync single-source files. **If packaging reports an xkb-related ENOENT after changing assets, clear the cache first**:
@@ -53,7 +56,7 @@ npm run build          # produces 8001779591038449.1_0_0.amr
 rm -rf .falcon_ .falcon_tmp && npm run build
 ```
 
-The WebKit core and `wpe-drm-minimal` are built on an arm64 cross-compilation server (there are many details around cmake configuration, the PGO sampling/rebuild workflow, jsc shim, etc.; see the internal build server `~/wpe-lite2/stripped/...` documentation within the team).
+The WebKit core and `wpe-drm-minimal` are built on the ARM64 cross-compilation server. `scripts/build_webrtc_runtime_pve.sh` creates an isolated worktree at the recorded revision, replays `series`, and emits `build-manifest.json` with the revision, patch hash, build switches, and ELF SHA256 values. Do not patch a long-lived shared WebKit tree in place.
 
 ## Running
 
@@ -120,4 +123,4 @@ Proprietary Mali userspace blobs and kernel modules are local-only build inputs.
 ## Future Directions
 
 - Video overlay phase two: CPU NV12 rotation fallback for scenarios without RGA; in-fence sync when the plane is idle.
-- Runtime slimming: see `tools/RUNTIME_SIZE_REPORT.md`.
+- Runtime slimming baseline and whitelist policy: see `tools/RUNTIME_INVENTORY.md`.

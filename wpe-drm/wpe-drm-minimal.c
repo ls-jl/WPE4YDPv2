@@ -16,6 +16,8 @@
 #include <wpe/wpe-platform.h>
 #include <wpe/drm/wpe-drm.h>
 #include "ChromeMotionState.h"
+#include "browser-chrome-model.h"
+#include "browser-navigation.h"
 #include "browser-profile-store.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -78,27 +80,6 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 #define CHROME_LIST_ROW_HEIGHT 48
 #define CHROME_GPU_RESTART_CODE 73
 #define CHROME_USER_EXIT_CODE 74
-
-typedef enum {
-    CHROME_PANEL_NONE = 0,
-    CHROME_PANEL_TABS,
-    CHROME_PANEL_MENU,
-    CHROME_PANEL_SETTINGS,
-    CHROME_PANEL_APPEARANCE,
-    CHROME_PANEL_WEB,
-    CHROME_PANEL_STARTUP,
-    CHROME_PANEL_SETTINGS_PRIVACY,
-    CHROME_PANEL_ABOUT,
-    CHROME_PANEL_PRIVACY,
-    CHROME_PANEL_CLEAR_SITE_DATA,
-    CHROME_PANEL_PROFILES,
-    CHROME_PANEL_PROFILE_MANAGE,
-    CHROME_PANEL_PROFILE_DELETE,
-    CHROME_PANEL_HISTORY,
-    CHROME_PANEL_BOOKMARKS,
-    CHROME_PANEL_CLEAR_HISTORY,
-    CHROME_PANEL_COUNT
-} ChromePanel;
 
 typedef enum {
     CHROME_PANEL_GESTURE_NONE = 0,
@@ -314,7 +295,6 @@ typedef struct {
 static WebKitCookieAcceptPolicy webkit_cookie_policy(BrowserCookiePolicy policy);
 static void chrome_switch_profile(AppState *state, int64_t profile_id, gboolean guest);
 static void update_page_zoom_for_uri(AppState *state, const char *uri);
-static gboolean custom_search_template_is_valid(const char *value);
 
 static gboolean env_enabled(const char *name, gboolean default_value)
 {
@@ -439,140 +419,13 @@ static int normalize_rotation_degrees(int rotation)
     return 0;
 }
 
-static const char *chrome_panel_name(ChromePanel panel)
-{
-    switch (panel) {
-    case CHROME_PANEL_TABS: return "tabs";
-    case CHROME_PANEL_MENU: return "menu";
-    case CHROME_PANEL_SETTINGS: return "settings";
-    case CHROME_PANEL_APPEARANCE: return "appearance";
-    case CHROME_PANEL_WEB: return "web";
-    case CHROME_PANEL_STARTUP: return "startup & search";
-    case CHROME_PANEL_SETTINGS_PRIVACY: return "privacy & data";
-    case CHROME_PANEL_ABOUT: return "about";
-    case CHROME_PANEL_PRIVACY: return "privacy & cookies";
-    case CHROME_PANEL_CLEAR_SITE_DATA: return "clear site data?";
-    case CHROME_PANEL_PROFILES: return "profiles";
-    case CHROME_PANEL_PROFILE_MANAGE: return "profile";
-    case CHROME_PANEL_PROFILE_DELETE: return "delete profile?";
-    case CHROME_PANEL_HISTORY: return "history";
-    case CHROME_PANEL_BOOKMARKS: return "bookmarks";
-    case CHROME_PANEL_CLEAR_HISTORY: return "clear history?";
-    case CHROME_PANEL_NONE:
-    default:
-        return "none";
-    }
-}
-
-static ChromePanel chrome_panel_from_name(const char *name)
-{
-    if (!name)
-        return CHROME_PANEL_NONE;
-    if (!g_ascii_strcasecmp(name, "tabs"))
-        return CHROME_PANEL_TABS;
-    if (!g_ascii_strcasecmp(name, "menu"))
-        return CHROME_PANEL_MENU;
-    if (!g_ascii_strcasecmp(name, "settings"))
-        return CHROME_PANEL_SETTINGS;
-    if (!g_ascii_strcasecmp(name, "appearance"))
-        return CHROME_PANEL_APPEARANCE;
-    if (!g_ascii_strcasecmp(name, "web"))
-        return CHROME_PANEL_WEB;
-    if (!g_ascii_strcasecmp(name, "startup & search"))
-        return CHROME_PANEL_STARTUP;
-    if (!g_ascii_strcasecmp(name, "privacy & data"))
-        return CHROME_PANEL_SETTINGS_PRIVACY;
-    if (!g_ascii_strcasecmp(name, "about"))
-        return CHROME_PANEL_ABOUT;
-    if (!g_ascii_strcasecmp(name, "privacy & cookies"))
-        return CHROME_PANEL_PRIVACY;
-    if (!g_ascii_strcasecmp(name, "profiles"))
-        return CHROME_PANEL_PROFILES;
-    if (!g_ascii_strcasecmp(name, "profile"))
-        return CHROME_PANEL_PROFILE_MANAGE;
-    if (!g_ascii_strcasecmp(name, "history"))
-        return CHROME_PANEL_HISTORY;
-    if (!g_ascii_strcasecmp(name, "bookmarks"))
-        return CHROME_PANEL_BOOKMARKS;
-    return CHROME_PANEL_NONE;
-}
-
-static ChromePanel chrome_panel_parent(ChromePanel panel)
-{
-    switch (panel) {
-    case CHROME_PANEL_SETTINGS:
-    case CHROME_PANEL_PRIVACY:
-    case CHROME_PANEL_PROFILES:
-    case CHROME_PANEL_HISTORY:
-    case CHROME_PANEL_BOOKMARKS:
-        return CHROME_PANEL_MENU;
-    case CHROME_PANEL_APPEARANCE:
-    case CHROME_PANEL_WEB:
-    case CHROME_PANEL_STARTUP:
-    case CHROME_PANEL_SETTINGS_PRIVACY:
-    case CHROME_PANEL_ABOUT:
-        return CHROME_PANEL_SETTINGS;
-    case CHROME_PANEL_PROFILE_MANAGE:
-        return CHROME_PANEL_PROFILES;
-    case CHROME_PANEL_PROFILE_DELETE:
-        return CHROME_PANEL_PROFILE_MANAGE;
-    case CHROME_PANEL_CLEAR_HISTORY:
-        return CHROME_PANEL_HISTORY;
-    case CHROME_PANEL_CLEAR_SITE_DATA:
-        return CHROME_PANEL_PRIVACY;
-    case CHROME_PANEL_TABS:
-    case CHROME_PANEL_MENU:
-    case CHROME_PANEL_NONE:
-    default:
-        return CHROME_PANEL_NONE;
-    }
-}
-
-static gboolean chrome_panel_is_overflow_stack(ChromePanel panel)
-{
-    return panel != CHROME_PANEL_NONE && panel != CHROME_PANEL_TABS;
-}
-
-static gboolean chrome_panel_is_internal_list(ChromePanel panel)
-{
-    return chrome_panel_is_overflow_stack(panel) && panel != CHROME_PANEL_MENU;
-}
-
 static int chrome_panel_line_count(const AppState *state, ChromePanel panel)
 {
     const BrowserChrome *chrome = state ? &state->chrome : NULL;
-    switch (panel) {
-    case CHROME_PANEL_SETTINGS:
-        return 5;
-    case CHROME_PANEL_APPEARANCE:
-        return 4;
-    case CHROME_PANEL_WEB:
-        return 5;
-    case CHROME_PANEL_STARTUP:
-        return 4;
-    case CHROME_PANEL_SETTINGS_PRIVACY:
-        return 4;
-    case CHROME_PANEL_ABOUT:
-        return 5;
-    case CHROME_PANEL_PRIVACY:
-        return chrome && chrome->site_data_status[0] ? 3 : 2;
-    case CHROME_PANEL_PROFILES:
-        return 6;
-    case CHROME_PANEL_HISTORY:
-    case CHROME_PANEL_BOOKMARKS:
-        return 8;
-    case CHROME_PANEL_CLEAR_SITE_DATA:
-    case CHROME_PANEL_PROFILE_MANAGE:
-    case CHROME_PANEL_PROFILE_DELETE:
-    case CHROME_PANEL_CLEAR_HISTORY:
-        return 2;
-    case CHROME_PANEL_NONE:
-    case CHROME_PANEL_TABS:
-    case CHROME_PANEL_MENU:
-    case CHROME_PANEL_COUNT:
-    default:
-        return 0;
-    }
+    guint count = chrome_panel_default_line_count(panel);
+    if (panel == CHROME_PANEL_PRIVACY && chrome && chrome->site_data_status[0])
+        count++;
+    return (int)count;
 }
 
 static BrowserTab *chrome_active_tab(BrowserChrome *chrome)
@@ -1164,7 +1017,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         line_count = 4;
         chrome_set_line_style(key_file, 0, "choice", engine, FALSE, "search");
         chrome_set_line_style(key_file, 1, "navigation",
-                              custom_search_template_is_valid(chrome->custom_search_template)
+                              browser_navigation_custom_search_template_valid(chrome->custom_search_template)
                                 ? "SET" : "NOT SET", FALSE, "custom");
         chrome_set_line_style(key_file, 2, "navigation",
                               chrome->home_url ? chrome->home_url : default_home_url(),
@@ -1890,127 +1743,12 @@ static guint64 json_payload_sequence(const char *payload)
     return g_ascii_strtoull(position + 1, NULL, 10);
 }
 
-static char *uri_scheme_dup(const char *uri)
-{
-    if (!uri || !g_ascii_isalpha(uri[0]))
-        return NULL;
-
-    const char *p = uri + 1;
-    while (*p) {
-        if (*p == ':')
-            return g_ascii_strdown(uri, p - uri);
-        if (*p == '/' || *p == '?' || *p == '#' || g_ascii_isspace(*p))
-            return NULL;
-        if (!(g_ascii_isalnum(*p) || *p == '+' || *p == '-' || *p == '.'))
-            return NULL;
-        p++;
-    }
-    return NULL;
-}
-
-static gboolean browser_scheme_is_allowed(const char *scheme)
-{
-    if (!scheme || !scheme[0])
-        return TRUE;
-    return !g_ascii_strcasecmp(scheme, "http")
-        || !g_ascii_strcasecmp(scheme, "https")
-        || !g_ascii_strcasecmp(scheme, "about")
-        || !g_ascii_strcasecmp(scheme, "file");
-}
-
-static gboolean is_bvid_char(char c)
-{
-    return g_ascii_isalnum(c);
-}
-
-static char *bilibili_web_url_from_uri(const char *uri)
-{
-    if (!uri || !uri[0])
-        return NULL;
-
-    const char *bv = NULL;
-    for (const char *p = uri; *p; ++p) {
-        if (p[0] == 'B' && p[1] == 'V' && is_bvid_char(p[2])) {
-            bv = p;
-            break;
-        }
-    }
-    if (bv) {
-        const char *end = bv;
-        while (*end && is_bvid_char(*end) && end - bv < 32)
-            end++;
-        if (end - bv >= 4) {
-            char *bvid = g_strndup(bv, end - bv);
-            char *url = g_strdup_printf("https://www.bilibili.com/video/%s/", bvid);
-            g_free(bvid);
-            return url;
-        }
-    }
-
-    const char *prefix = "bilibili://video/";
-    if (!g_ascii_strncasecmp(uri, prefix, strlen(prefix))) {
-        const char *id = uri + strlen(prefix);
-        while (*id && !g_ascii_isdigit(*id))
-            id++;
-        const char *end = id;
-        while (*end && g_ascii_isdigit(*end))
-            end++;
-        if (end > id) {
-            char *avid = g_strndup(id, end - id);
-            char *url = g_strdup_printf("https://www.bilibili.com/video/av%s/", avid);
-            g_free(avid);
-            return url;
-        }
-    }
-
-    return NULL;
-}
-
-static gboolean custom_search_template_is_valid(const char *value)
-{
-    if (!value || !g_str_has_prefix(value, "https://"))
-        return FALSE;
-    const char *placeholder = strstr(value, "%s");
-    if (!placeholder || strstr(placeholder + 2, "%s"))
-        return FALSE;
-    if (strpbrk(value, "\r\n\t"))
-        return FALSE;
-
-    char *candidate = g_strdup_printf("%.*squery%s",
-        (int)(placeholder - value), value, placeholder + 2);
-    GError *error = NULL;
-    GUri *uri = g_uri_parse(candidate, G_URI_FLAGS_NONE, &error);
-    gboolean valid = uri && g_uri_get_scheme(uri)
-        && !g_ascii_strcasecmp(g_uri_get_scheme(uri), "https")
-        && g_uri_get_host(uri) && g_uri_get_host(uri)[0];
-    if (uri)
-        g_uri_unref(uri);
-    g_clear_error(&error);
-    g_free(candidate);
-    return valid;
-}
-
-static const char *search_template_for_chrome(const BrowserChrome *chrome)
-{
-    if (chrome && !g_strcmp0(chrome->search_engine, "bing"))
-        return "https://www.bing.com/search?q=%s";
-    if (chrome && !g_strcmp0(chrome->search_engine, "google"))
-        return "https://www.google.com/search?q=%s";
-    if (chrome && !g_strcmp0(chrome->search_engine, "custom")
-            && custom_search_template_is_valid(chrome->custom_search_template))
-        return chrome->custom_search_template;
-    return "https://m.baidu.com/s?word=%s";
-}
-
 static char *search_url_for_query(const BrowserChrome *chrome, const char *query)
 {
-    const char *format = search_template_for_chrome(chrome);
-    const char *placeholder = strstr(format, "%s");
-    char *escaped = g_uri_escape_string(query ? query : "", NULL, TRUE);
-    char *url = g_strdup_printf("%.*s%s%s",
-        (int)(placeholder - format), format, escaped ? escaped : "", placeholder + 2);
-    g_free(escaped);
-    return url;
+    return browser_navigation_search_url(
+        chrome ? chrome->search_engine : NULL,
+        chrome ? chrome->custom_search_template : NULL,
+        query);
 }
 
 static char *normalize_user_url(AppState *state, const char *raw)
@@ -2030,14 +1768,14 @@ static char *normalize_user_url(AppState *state, const char *raw)
         return g_strdup("https://www.bing.com/");
     }
 
-    char *scheme = uri_scheme_dup(value);
+    char *scheme = browser_navigation_uri_scheme(value);
     if (scheme) {
-        if (browser_scheme_is_allowed(scheme)) {
+        if (browser_navigation_scheme_allowed(scheme)) {
             g_free(scheme);
             return value;
         }
         if (!g_ascii_strcasecmp(scheme, "bilibili")) {
-            char *web_url = bilibili_web_url_from_uri(value);
+            char *web_url = browser_navigation_bilibili_web_url(value);
             if (web_url) {
                 g_print("Converted Bilibili user URL: raw=%s url=%s\n", value, web_url);
                 g_free(scheme);
@@ -2358,7 +2096,7 @@ static void keyboard_handle_response(AppState *state, gboolean confirmed, const 
         } else if (!g_strcmp0(state->keyboard_active_kind, "custom_search")) {
             char *candidate = g_strdup(final_text);
             g_strstrip(candidate);
-            if (custom_search_template_is_valid(candidate)) {
+            if (browser_navigation_custom_search_template_valid(candidate)) {
                 g_free(state->chrome.custom_search_template);
                 state->chrome.custom_search_template = candidate;
                 g_strlcpy(state->chrome.search_engine, "custom",
@@ -2912,7 +2650,7 @@ static void chrome_cycle_search_engine(AppState *state)
     else if (!g_strcmp0(chrome->search_engine, "bing"))
         g_strlcpy(chrome->search_engine, "google", sizeof(chrome->search_engine));
     else if (!g_strcmp0(chrome->search_engine, "google")) {
-        if (!custom_search_template_is_valid(chrome->custom_search_template)) {
+        if (!browser_navigation_custom_search_template_valid(chrome->custom_search_template)) {
             keyboard_request(state, "custom_search", "",
                              "HTTPS 搜索模板，使用一个 %s", "EnUSPreferred", 512, FALSE);
             return;
@@ -5747,7 +5485,7 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
     chrome->loading = load_event != WEBKIT_LOAD_FINISHED;
     chrome->load_progress = chrome->loading ? webkit_web_view_get_estimated_load_progress(web_view) : 1.0;
     if (load_event == WEBKIT_LOAD_COMMITTED && !profile_runtime.guest && uri) {
-        char *scheme = uri_scheme_dup(uri);
+        char *scheme = browser_navigation_uri_scheme(uri);
         gboolean record = scheme && (!g_ascii_strcasecmp(scheme, "http")
             || !g_ascii_strcasecmp(scheme, "https"));
         g_free(scheme);
@@ -5954,11 +5692,11 @@ static gboolean on_decide_policy(WebKitWebView *web_view,
     WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(navigation_decision);
     WebKitURIRequest *request = action ? webkit_navigation_action_get_request(action) : NULL;
     const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
-    char *scheme = uri_scheme_dup(uri);
+    char *scheme = browser_navigation_uri_scheme(uri);
     if (!scheme)
         return FALSE;
 
-    if (browser_scheme_is_allowed(scheme)) {
+    if (browser_navigation_scheme_allowed(scheme)) {
         if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION && uri && uri[0]) {
             g_print("Open new-window navigation in current view: uri=%s nav_type=%d user_gesture=%d frame=%s\n",
                     uri,
@@ -5975,7 +5713,7 @@ static gboolean on_decide_policy(WebKitWebView *web_view,
     }
 
     if (!g_ascii_strcasecmp(scheme, "bilibili")) {
-        char *web_url = bilibili_web_url_from_uri(uri);
+        char *web_url = browser_navigation_bilibili_web_url(uri);
         if (web_url) {
             g_print("Converted Bilibili navigation: uri=%s url=%s type=%d nav_type=%d user_gesture=%d\n",
                     uri ? uri : "(null)",

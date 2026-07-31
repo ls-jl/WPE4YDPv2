@@ -5,7 +5,10 @@ set -euo pipefail
 # GStreamer dependency prefix and the current WPE 2.53 DRM build.
 BASE="${BASE:-/home/pve/wpe_lite}"
 WPE_ROOT="${WPE_ROOT:-/home/pve/wpe-lite2/stripped}"
-WEBKIT_BUILD="${WEBKIT_BUILD:-$WPE_ROOT/build-drm-aarch64-deb12}"
+WEBKIT_BASE="${WEBKIT_BASE:-$WPE_ROOT/WebKit}"
+WEBKIT_WORKTREE="${WEBKIT_WORKTREE:-$WPE_ROOT/worktrees/webkit-production}"
+WEBKIT_SOURCE="$WEBKIT_WORKTREE"
+WEBKIT_BUILD="${WEBKIT_BUILD:-$WPE_ROOT/build-drm-aarch64-production}"
 FULL_PREFIX="${FULL_PREFIX:-$BASE/deps-aarch64-fullfat}"
 PREFIX="${WEBRTC_PREFIX:-$BASE/deps-aarch64-webrtc}"
 WORK="${WEBRTC_WORK:-$BASE/build/webrtc-runtime}"
@@ -21,6 +24,10 @@ DEVICE_CXX="/home/pve/toolchains/device-libstdcxx29/lib"
 CROSS_FILE="$BASE/build/clang-aarch64-buildroot-fullfat-stage.ini"
 
 mkdir -p "$PREFIX" "$WORK/bin" "$DOWNLOADS" "$STAGE"
+
+PROJECT_ROOT="$PROJECT_ROOT" WEBKIT_BASE="$WEBKIT_BASE" \
+  WEBKIT_WORKTREE="$WEBKIT_WORKTREE" \
+  "$PROJECT_ROOT/scripts/prepare_webkit_worktree.sh"
 
 cat >"$WORK/bin/aarch64-cc" <<EOF
 #!/bin/sh
@@ -60,87 +67,21 @@ download "https://github.com/cisco/libsrtp/archive/refs/tags/v2.8.0.tar.gz" \
 
 GST_BAD_SOURCE="$BASE/sources/gst-plugins-bad-1.22.12"
 GST_WEBRTC_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0001-webrtcbin-update-remote-offer-transceivers.patch"
-if ! patch -d "$GST_BAD_SOURCE" -p1 -R --dry-run <"$GST_WEBRTC_PATCH" >/dev/null 2>&1; then
-  patch -d "$GST_BAD_SOURCE" -p1 <"$GST_WEBRTC_PATCH"
-fi
 GST_ICE_ROLE_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0002-webrtcbin-preserve-ice-controller.patch"
-if ! patch -d "$GST_BAD_SOURCE" -p1 -R --dry-run <"$GST_ICE_ROLE_PATCH" >/dev/null 2>&1; then
-  patch -d "$GST_BAD_SOURCE" -p1 <"$GST_ICE_ROLE_PATCH"
-fi
 GST_DTLS_MTU_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0003-dtls-bio-query-mtu-1200.patch"
-if ! patch -d "$GST_BAD_SOURCE" -p1 -R --dry-run <"$GST_DTLS_MTU_PATCH" >/dev/null 2>&1; then
-  patch -d "$GST_BAD_SOURCE" -p1 <"$GST_DTLS_MTU_PATCH"
-fi
-WEBKIT_MPP_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0002-registry-scanner-classify-mpp-as-hardware.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_MPP_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_MPP_PATCH"
-fi
 
-WEBKIT_WS_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0025-cloud-websocket-lifecycle-diagnostics.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WS_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WS_DIAGNOSTIC_PATCH"
-fi
-WEBKIT_WS_CLOSE_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0026-cloud-websocket-close-diagnostics.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WS_CLOSE_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WS_CLOSE_DIAGNOSTIC_PATCH"
-fi
-WEBKIT_DATACHANNEL_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0027-cloud-datachannel-state-diagnostics.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_DATACHANNEL_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_DATACHANNEL_DIAGNOSTIC_PATCH"
-fi
-WEBKIT_WEBSOCKET_OUTBOUND_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0028-cloud-websocket-outbound-diagnostics.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WEBSOCKET_OUTBOUND_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WEBSOCKET_OUTBOUND_DIAGNOSTIC_PATCH"
-fi
-WEBKIT_WEBSOCKET_ENDPOINT_DIAGNOSTIC_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0029-cloud-websocket-endpoint-diagnostics.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WEBSOCKET_ENDPOINT_DIAGNOSTIC_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WEBSOCKET_ENDPOINT_DIAGNOSTIC_PATCH"
-fi
-WEBKIT_WEBSOCKET_REQUEST_METADATA_PATCH="$PROJECT_ROOT/wpe-drm/webkit-patches/0030-cloud-websocket-request-metadata.patch"
-if ! patch -d "$WPE_ROOT/WebKit" -p1 -R --dry-run <"$WEBKIT_WEBSOCKET_REQUEST_METADATA_PATCH" >/dev/null 2>&1; then
-  patch -d "$WPE_ROOT/WebKit" -p1 <"$WEBKIT_WEBSOCKET_REQUEST_METADATA_PATCH"
-fi
-
-WEBKIT_ENDPOINT_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp"
-WEBKIT_ENDPOINT_SOURCE="$WPE_ROOT/WebKit/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp"
-if [ ! -f "$WEBKIT_ENDPOINT_MIRROR" ]; then
-  echo "Missing WebKit WebRTC endpoint mirror: $WEBKIT_ENDPOINT_MIRROR" >&2
-  exit 1
-fi
-if ! cmp -s "$WEBKIT_ENDPOINT_MIRROR" "$WEBKIT_ENDPOINT_SOURCE"; then
-  install -m 0644 "$WEBKIT_ENDPOINT_MIRROR" "$WEBKIT_ENDPOINT_SOURCE"
-fi
-
-WEBKIT_DATACHANNEL_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp"
-WEBKIT_DATACHANNEL_SOURCE="$WPE_ROOT/WebKit/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp"
-if [ ! -f "$WEBKIT_DATACHANNEL_MIRROR" ]; then
-  echo "Missing WebKit DataChannel handler mirror: $WEBKIT_DATACHANNEL_MIRROR" >&2
-  exit 1
-fi
-if ! cmp -s "$WEBKIT_DATACHANNEL_MIRROR" "$WEBKIT_DATACHANNEL_SOURCE"; then
-  install -m 0644 "$WEBKIT_DATACHANNEL_MIRROR" "$WEBKIT_DATACHANNEL_SOURCE"
-fi
-
-WEBKIT_PLAYER_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp"
-WEBKIT_PLAYER_SOURCE="$WPE_ROOT/WebKit/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp"
-if [ ! -f "$WEBKIT_PLAYER_MIRROR" ]; then
-  echo "Missing WebKit media-player mirror: $WEBKIT_PLAYER_MIRROR" >&2
-  exit 1
-fi
-if ! cmp -s "$WEBKIT_PLAYER_MIRROR" "$WEBKIT_PLAYER_SOURCE"; then
-    install -m 0644 "$WEBKIT_PLAYER_MIRROR" "$WEBKIT_PLAYER_SOURCE"
-fi
-
-WEBKIT_WEBSOCKET_MIRROR="$PROJECT_ROOT/wpe-drm/webkit-patches/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp"
-WEBKIT_WEBSOCKET_SOURCE="$WPE_ROOT/WebKit/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp"
-if [ ! -f "$WEBKIT_WEBSOCKET_MIRROR" ]; then
-  echo "Missing WebKit WebSocket task mirror: $WEBKIT_WEBSOCKET_MIRROR" >&2
-  exit 1
-fi
-if ! cmp -s "$WEBKIT_WEBSOCKET_MIRROR" "$WEBKIT_WEBSOCKET_SOURCE"; then
-  install -m 0644 "$WEBKIT_WEBSOCKET_MIRROR" "$WEBKIT_WEBSOCKET_SOURCE"
-fi
-
+apply_patch_once() {
+  local source="$1" patch_file="$2"
+  if patch -d "$source" -p1 -R --dry-run <"$patch_file" >/dev/null 2>&1; then
+    return 0
+  fi
+  if patch -d "$source" -p1 --dry-run <"$patch_file" >/dev/null 2>&1; then
+    patch -d "$source" -p1 <"$patch_file"
+    return 0
+  fi
+  echo "Source does not match clean or fully patched state: $patch_file" >&2
+  return 1
+}
 if [ ! -f "$PREFIX/lib/libcrypto.so.3" ]; then
   rm -rf "$WORK/openssl-3.5.7"
   tar -xzf "$DOWNLOADS/openssl-3.5.7.tar.gz" -C "$WORK"
@@ -211,7 +152,10 @@ if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdtls.so" ] || \
   [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstsctp.so" ] || \
   [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstsrtp.so" ] || \
   [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstwebrtc.so" ] || \
-  [ "$GST_BAD_SOURCE/ext/webrtc/gstwebrtcbin.c" -nt "$PREFIX/lib/gstreamer-1.0/libgstwebrtc.so" ]; then
+  [ "${FORCE_REBUILD_GST_BAD:-0}" = 1 ]; then
+  apply_patch_once "$GST_BAD_SOURCE" "$GST_WEBRTC_PATCH"
+  apply_patch_once "$GST_BAD_SOURCE" "$GST_ICE_ROLE_PATCH"
+  apply_patch_once "$GST_BAD_SOURCE" "$GST_DTLS_MTU_PATCH"
   meson_build gst-bad "$GST_BAD_SOURCE" \
     -Ddtls=enabled -Dsctp=enabled -Dsrtp=enabled -Dwebrtc=enabled \
     -Dsctp-internal-usrsctp=enabled -Dexamples=disabled -Dtests=disabled
@@ -230,7 +174,7 @@ case "$C_FLAGS" in *"-I$PREFIX/include"*) ;; *) C_FLAGS="-I$PREFIX/include $C_FL
 case "$CXX_FLAGS" in *"-I$PREFIX/include"*) ;; *) CXX_FLAGS="-I$PREFIX/include $CXX_FLAGS" ;; esac
 
 if [ "${SKIP_WEBKIT_BUILD:-0}" != 1 ]; then
-  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cmake -S "$WPE_ROOT/WebKit" -B "$WEBKIT_BUILD" \
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cmake -S "$WEBKIT_SOURCE" -B "$WEBKIT_BUILD" \
     -DENABLE_WEB_RTC=ON \
     -DUSE_GSTREAMER_WEBRTC=ON \
     -DENABLE_MEDIA_STREAM=ON \
@@ -262,10 +206,12 @@ COMMON_LIBS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH" pkg-config --libs glib-2.0 gob
   -I"$WEBKIT_BUILD/DerivedSources/WPEPlatform" \
   -I"$WEBKIT_BUILD/JavaScriptCoreGLib/DerivedSources" \
   -I"$WEBKIT_BUILD/JavaScriptCoreGLib/Headers" \
-  -I"$WPE_ROOT/WebKit/Source/WebKit/UIProcess/API" \
-  -I"$WPE_ROOT/WebKit/Source/WebKit/WPEPlatform" \
+  -I"$WEBKIT_SOURCE/Source/WebKit/UIProcess/API" \
+  -I"$WEBKIT_SOURCE/Source/WebKit/WPEPlatform" \
   $COMMON_CFLAGS \
-  "$WPE_ROOT/wpe-drm-minimal.c" "$WPE_ROOT/browser-profile-store.c" \
+  "$WPE_ROOT/wpe-drm-minimal.c" "$WPE_ROOT/browser-chrome-model.c" \
+  "$WPE_ROOT/browser-navigation.c" \
+  "$WPE_ROOT/browser-profile-store.c" \
   -o "$WPE_ROOT/wpe-drm-minimal" \
   -L"$WEBKIT_BUILD/lib" -L"$FULL_PREFIX/lib" -L"$PREFIX/lib" \
   -L"$DEVICE_CXX" -Wl,-rpath-link,"$WEBKIT_BUILD/lib" \
@@ -303,6 +249,9 @@ cp -a "$WEBKIT_BUILD/lib/libWPEWebKit-2.0.so.1.10.2" "$STAGE/lib/"
 cp -a "$WEBKIT_BUILD/bin/WPEWebProcess" "$STAGE/libexec/wpe-webkit-2.0/"
 cp -a "$WEBKIT_BUILD/bin/WPENetworkProcess" "$STAGE/libexec/wpe-webkit-2.0/"
 cp -a "$WPE_ROOT/wpe-drm-minimal" "$STAGE/"
+
+PROJECT_ROOT="$PROJECT_ROOT" WEBRTC_STAGE="$STAGE" \
+  "$PROJECT_ROOT/scripts/generate_build_manifest.sh"
 
 find "$STAGE" -type f -exec chmod go-w {} +
 file "$STAGE/lib/libWPEWebKit-2.0.so.1.10.2" "$STAGE/wpe-drm-minimal"

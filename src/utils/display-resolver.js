@@ -378,7 +378,6 @@ export async function browserOptions(component, browserPlayer, options) {
   if (!runtimePath) {
     runtimePath = browserPlayer.prepareRuntime({
       workspace: workspacePath(component),
-      dataDir: dataRootPath(),
     })
   }
   const display = await resolveDisplayConfig(component, browserPlayer, options)

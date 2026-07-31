@@ -45,10 +45,6 @@ export default {
   },
   mounted() {
     this.ensureControllers()
-    if (this.isStopOnly()) {
-      this.browserLifecycle.stopOnlyAndReturn()
-      return
-    }
     this.keyboardBridge.setup()
     this.browserLifecycle.start()
   },
@@ -80,10 +76,6 @@ export default {
     },
     pageOptions() {
       return this.$page && this.$page.options ? this.$page.options : {}
-    },
-    isStopOnly() {
-      const options = this.pageOptions()
-      return options.stopOnly === 1 || options.stopOnly === '1' || options.stopOnly === true || options.stopOnly === 'true'
     },
     browserWorkdir() {
       const options = this.pageOptions()
@@ -124,7 +116,6 @@ export default {
       }, 15000)
     },
     onShow() {
-      if (this.isStopOnly()) return
       this.ensureControllers()
       this.pageVisible = true
       this.clearKeyboardHideTimer()

@@ -38,6 +38,9 @@ libs/libjsapi_browser_12345.so
 !assets/mesa/**
 !assets/wpe-runtime/
 !assets/wpe-runtime/**
+# Generated from wpe-drm/run.sh by scripts/sync_generated.sh.
+assets/wpe-runtime/run.sh
+assets/wpe-runtime/runtime/
 
 # Local-only proprietary Mali runtime. Keep source, staging logic and docs,
 # but never publish vendor blobs or device-specific kernel modules.

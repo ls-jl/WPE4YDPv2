@@ -117,7 +117,7 @@ import { browserPlayer } from 'browser'
 
 ### 3.1 `prepareRuntime()`
 
-当前 `prepareRuntime({ workspace, dataDir })` 不再把 runtime tar 解压到 `$dataDir`。它做的是：
+当前 `prepareRuntime({ workspace })` 不把 runtime tar 解压到 `$dataDir`。它只做：
 
 - 组合包内 runtime 路径：`$workspace/assets/wpe-runtime`
 - 校验 runtime 必要文件存在。

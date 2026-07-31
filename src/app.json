@@ -12,10 +12,5 @@
       }
     },
     "keyboard_backend": "auto"
-  },
-  "options": {
-      "style": {
-          "lessPaths": ["styles"]
-      }
   }
 }

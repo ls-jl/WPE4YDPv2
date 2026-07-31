@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "webkit_revision": "9effc8745be9b7b0fab96b29cc69716c9a5c4ae0",
+  "patch_series_sha256": "9dc2eb4719c87204f15fe8f11d1291d70c086064b336e9cb0958f97e8dbaf0b6",
+  "build_flags": {
+    "ENABLE_WEB_RTC": true,
+    "USE_GSTREAMER_WEBRTC": true,
+    "ENABLE_MEDIA_STREAM": true,
+    "ENABLE_VIDEO": true,
+    "ENABLE_WEBGL": true,
+    "USE_GBM": true,
+    "USE_SKIA": true,
+    "ENABLE_GPU_PROCESS": false
+  },
+  "artifacts": {
+    "lib/libWPEWebKit-2.0.so.1.10.2": "56010f51736aa9588b1aa49b5c4cca22e5f24dcd17467a32931be00b06f81636",
+    "wpe-drm-minimal": "21cf673a0a090dffad0487d7ad7387ed7035c97e600673cd759eef2066a56b77"
+  }
+}

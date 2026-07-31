@@ -19,7 +19,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 - **WebRTC 云游戏链路**：WebKit 使用 GStreamer PeerConnection backend，包内提供 ICE/DTLS/SRTP/SCTP/RTP/Opus；允许远端音视频和 DataChannel，默认拒绝麦克风、摄像头和屏幕采集。云原神域名自动切换到原生多点触摸 `game` 输入模式。
 - **内核按机型深度定制**：`-mcpu=cortex-a53` + ThinLTO + **PGO**（抖音/bilibili/百度等真机负载采样 profile-use）；裁剪 SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS 等。
 - **低内存自保**：内存上限按物理内存 68% 动态设定（1GB 机型 673MB，kill 阈值 0.92）；同一 URL 120 秒内被杀 3 次自动回主页的崩溃熔断；MSE 每 SourceBuffer 缓冲上限。
-- **单任务内存倾斜**：浏览器 oom_score_adj=-600、启动时 drop_caches、运行期 swappiness=100（退出恢复），后台进程冷页压进 512MB swap。
+- **低风险内存策略**：默认不改全局 swappiness、不执行 `drop_caches`；仅调整 WPE 自身 OOM 优先级，并通过显式诊断开关临时启用系统级实验。
 - **移动 UA + 站点档案**：默认 Android Chrome UA；支持按站点切换 desktop/mobile 档案。
 - **多用户 Profile 与 Cookie 持久化**：最多 8 个持久 Profile 和访客模式；Cookie、LocalStorage、IndexedDB、Service Worker、缓存、标签、历史、收藏和站点档案完全隔离。浏览器元数据使用 SQLite WAL，Cookie 使用 WebKit 独立 SQLite CookieJar。
 - **Chrome Material 原生界面**：浅色/深色主题、共享圆角卡片和 native 图标、按压态、开关/单选/危险操作样式；工具栏、Tabs、溢出菜单和内部设置页使用同一套 raster 组件。
@@ -37,19 +37,23 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `lib/libWPEWebKit-2.0.so.1.10.2`：定制 WebKit（Git LFS）。`lib/gstreamer-1.0/` 含设备拷入的解码插件。
   - `tests/webrtc-loopback.html`：无需本机编码器的 ICE + DataChannel + 本地采集拒绝自测页。
   - `gpu/`：本地可选 Mali 用户态库和 `5.10.160` KO；专有二进制不提交 Git，由 `scripts/stage_gpu_runtime.sh` 按 SHA256 组装。
-- `wpe-drm/`：**服务器 WebKit 树对应文件的本地镜像**（改动须双向同步）：
+- `wpe-drm/`：Direct WPE launcher、DRM 平台源码和可复现 WebKit 补丁：
   - `wpe-drm-minimal.c`、`run.sh`：应用层。
   - `WPEViewDRM.cpp`（含 VideoOverlay 模块）、`WPEDisplayDRM.cpp/Private.h`、`WPEDRM.h/cpp`：WPEPlatform DRM 后端，对应 `Source/WebKit/WPEPlatform/wpe/drm/`。
   - `GStreamerHolePunchQuirkRockchip.{h,cpp}`：视频直出 WebProcess 端 quirk，对应 `Source/WebCore/platform/gstreamer/`。
-  - `webkit-patches/`：**服务器 WebKit 树里其他子系统的源码级补丁**（按 `Source/` 原始路径镜像），清单和原因见 `webkit-patches/README.md`——包括 dma-heap 黑名单等。
-- `tools/`：文档（`DRM_HOLE_RENDERING_PIPELINE.md` 出屏链路、`CLOUD_GAME_WEBRTC_DEBUGGING.md` 云游戏排障、`KEYBOARD_INPUT.md`、`RUNTIME_SIZE_REPORT.md` 体积清单）。
-- `debug/`：本地调试页（不随包）。
+  - `browser-chrome-model.*`、`browser-navigation.*`、`browser-profile-store.*`：可独立测试的面板、导航和数据库模块。
+  - `runtime/`：由 `run.sh` 加载的 supervisor 子模块；构建时同步到包内。
+  - `webkit-patches/{revision,series}`：从固定 WebKit revision 重放的四组生产补丁，不再保存实验补丁和整文件镜像。
+- `tests/fixtures/web/`：本地网页、RAF、触摸、音视频 fixture，不随页面业务代码维护。
+- `tools/diagnostics/`：诊断 C 工具及统一 Makefile。
+- `tools/`：出屏、键盘、云游戏排障和 runtime 体积文档。
 - `8001779591038449.1_0_0.amr`：打包产物（Git LFS 入库）。
 
 ## 构建与打包
 
 ```sh
 npm run build          # 产出 8001779591038449.1_0_0.amr
+npm test               # 逻辑 fixture、SQLite、shell、runtime 与 patch series 检查
 ```
 
 构建前自动执行 `scripts/sync_generated.sh` 同步单源文件。**assets 变更后打包若报 xkb 相关 ENOENT，先清缓存**：
@@ -58,7 +62,7 @@ npm run build          # 产出 8001779591038449.1_0_0.amr
 rm -rf .falcon_ .falcon_tmp && npm run build
 ```
 
-WebKit 内核与 `wpe-drm-minimal` 在 arm64 交叉编译服务器上构建（cmake 配置、PGO 采样重编流程、jsc shim 等细节较多，团队内部见构建服务器 `~/wpe-lite2/stripped/...` 文档）。
+WebKit 内核与 `wpe-drm-minimal` 在 ARM64 交叉编译服务器上构建。`scripts/build_webrtc_runtime_pve.sh` 会从 `wpe-drm/webkit-patches/revision` 创建隔离 worktree，按 `series` 重放生产补丁，并输出记录 revision、series hash、编译开关和 ELF SHA256 的 `build-manifest.json`。禁止继续原地修改长期共享 WebKit 源码树。
 
 ## 运行
 
@@ -137,4 +141,4 @@ Mali 用户态 blob 与内核模块属于厂商专有内容，不由本仓库 MI
 ## 后续方向
 
 - 视频 overlay 二期：无 RGA 场景 CPU NV12 旋转兜底；plane 空闲时 in-fence 同步。
-- runtime 瘦身：见 `tools/RUNTIME_SIZE_REPORT.md`。
+- runtime 瘦身基线与白名单策略：见 `tools/RUNTIME_INVENTORY.md`。

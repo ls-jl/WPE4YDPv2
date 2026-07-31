@@ -246,17 +246,4 @@ export default {
   background-color: #79d66b;
 }
 
-.secondary-button {
-  margin-top: 10px;
-  margin-right: 8px;
-  width: 112px;
-  height: 36px;
-  line-height: 36px;
-  text-align: center;
-  border-radius: 6px;
-  font-size: 15px;
-  color: #d9e6f2;
-  background-color: #26323d;
-}
-
 </style>

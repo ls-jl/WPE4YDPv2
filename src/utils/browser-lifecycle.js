@@ -117,29 +117,6 @@ export class BrowserLifecycle {
     }
   }
 
-  stopOnlyAndReturn() {
-    const options = this.pageOptions()
-    this.state.leaving = true
-    console.warn('wpe stop-only frame')
-    let status = '浏览器已停止'
-    try {
-      this.stop()
-    } catch (err) {
-      status = err && err.message ? err.message : `${err}`
-      console.warn(`stop-only failed ${status}`)
-    }
-    setTimeout(() => {
-      try {
-        $falcon.navTo(options.returnPage || 'index', {
-          browserStatus: status,
-          browserMode: options.browserMode || DEFAULT_BROWSER_MODE,
-        })
-      } catch (err) {
-        console.warn(`stop-only nav index failed ${err}`)
-      }
-    }, 100)
-  }
-
   leaveFrame(reason) {
     if (this.state.leaving) return
     this.state.leaving = true

@@ -1,5 +1,6 @@
 #include "jqutil_v2/jqutil.h"
 #include "utils/log.h"
+#include "BrowserDisplayConfig.h"
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +32,11 @@ using namespace JQUTIL_NS;
 
 namespace browser {
 namespace {
+
+using display::currentDrmModeSpec;
+using display::normalizeRotationValue;
+using display::parseJsonIntField;
+using display::parseJsonStringField;
 
 const char* kTag = "miniapp-browser-launcher";
 const char* kRuntimeRelative = "assets/wpe-runtime";
@@ -501,24 +507,6 @@ static bool chmodIfExists(const std::string& path, mode_t mode)
     return chmod(path.c_str(), mode) == 0;
 }
 
-static void cleanupOldExtractedRuntime(const std::string& dataDir)
-{
-    if (dataDir.empty()) return;
-    const std::string browserDir = joinPath(dataDir, "browser");
-    removeRecursive(joinPath(browserDir, "runtime"));
-    removeRecursive(joinPath(browserDir, "runtime.old"));
-    unlink(joinPath(browserDir, ".installed.json").c_str());
-
-    DIR* dir = opendir(browserDir.c_str());
-    if (!dir) return;
-    struct dirent* entry = nullptr;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (!std::strncmp(entry->d_name, "runtime.tmp.", 12))
-            removeRecursive(joinPath(browserDir, entry->d_name));
-    }
-    closedir(dir);
-}
-
 static bool ensurePackagedRuntimeReady(const std::string& runtimeDir, std::string& error)
 {
     if (!dirExists(runtimeDir)) {
@@ -571,136 +559,6 @@ static bool ensurePackagedRuntimeReady(const std::string& runtimeDir, std::strin
     return true;
 }
 
-static bool parseDrmModeLine(const std::string& line, int& width, int& height)
-{
-    const char* mode = std::strstr(line.c_str(), "mode: \"");
-    if (!mode) return false;
-    int w = 0;
-    int h = 0;
-    if (std::sscanf(mode, "mode: \"%dx%d\"", &w, &h) != 2) return false;
-    if (w <= 0 || h <= 0) return false;
-    width = w;
-    height = h;
-    return true;
-}
-
-static bool parseSizeLine(const std::string& line, int& width, int& height)
-{
-    int w = 0;
-    int h = 0;
-    if (std::sscanf(line.c_str(), "%dx%d", &w, &h) != 2) return false;
-    if (w <= 0 || h <= 0) return false;
-    width = w;
-    height = h;
-    return true;
-}
-
-static bool parseJsonIntField(const std::string& text, const std::string& key, int& value)
-{
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = text.find(needle);
-    if (pos == std::string::npos) return false;
-    pos = text.find(':', pos + needle.size());
-    if (pos == std::string::npos) return false;
-    ++pos;
-    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
-    if (pos >= text.size()) return false;
-    char* end = nullptr;
-    errno = 0;
-    long parsed = std::strtol(text.c_str() + pos, &end, 10);
-    if (errno != 0 || end == text.c_str() + pos) return false;
-    value = static_cast<int>(parsed);
-    return true;
-}
-
-static std::string parseJsonStringField(const std::string& text, const std::string& key)
-{
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = text.find(needle);
-    if (pos == std::string::npos) return "";
-    pos = text.find(':', pos + needle.size());
-    if (pos == std::string::npos) return "";
-    ++pos;
-    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
-    if (pos >= text.size() || text[pos] != '"') return "";
-    ++pos;
-    std::string result;
-    while (pos < text.size()) {
-        char ch = text[pos++];
-        if (ch == '"') break;
-        if (ch == '\\' && pos < text.size()) {
-            char escaped = text[pos++];
-            switch (escaped) {
-            case '"': result += '"'; break;
-            case '\\': result += '\\'; break;
-            case '/': result += '/'; break;
-            case 'b': result += '\b'; break;
-            case 'f': result += '\f'; break;
-            case 'n': result += '\n'; break;
-            case 'r': result += '\r'; break;
-            case 't': result += '\t'; break;
-            default: result += escaped; break;
-            }
-            continue;
-        }
-        result += ch;
-    }
-    return result;
-}
-
-static int normalizeRotationValue(int value, int fallback)
-{
-    value %= 360;
-    if (value < 0) value += 360;
-    if (value == 0 || value == 90 || value == 180 || value == 270) return value;
-    return fallback;
-}
-
-static std::string currentDrmModeSpec()
-{
-    int width = 0;
-    int height = 0;
-    std::ifstream state("/sys/kernel/debug/dri/0/state");
-    if (state.good()) {
-        std::string line;
-        while (std::getline(state, line)) {
-            if (parseDrmModeLine(line, width, height))
-                return std::to_string(width) + "x" + std::to_string(height);
-        }
-    }
-
-    const std::vector<std::string> knownModeFiles = {
-        "/sys/class/drm/card0-DSI-1/modes",
-        "/sys/class/drm/card0-eDP-1/modes",
-        "/sys/class/drm/card0-LVDS-1/modes",
-        "/sys/class/drm/card0-HDMI-A-1/modes",
-    };
-    for (const std::string& path : knownModeFiles) {
-        std::ifstream modeFile(path.c_str());
-        std::string mode;
-        if (modeFile.good() && std::getline(modeFile, mode) && parseSizeLine(mode, width, height))
-            return std::to_string(width) + "x" + std::to_string(height);
-    }
-
-    DIR* dir = opendir("/sys/class/drm");
-    if (!dir) return "";
-    std::string result;
-    struct dirent* entry = nullptr;
-    while ((entry = readdir(dir)) != nullptr && result.empty()) {
-        const std::string name(entry->d_name);
-        if (name.find("card") != 0 || name.find('-') == std::string::npos) continue;
-        const std::string base = joinPath("/sys/class/drm", name);
-        const std::string status = readFile(joinPath(base, "status"));
-        if (!status.empty() && status.find("connected") == std::string::npos) continue;
-        std::ifstream modeFile(joinPath(base, "modes").c_str());
-        std::string mode;
-        if (modeFile.good() && std::getline(modeFile, mode) && parseSizeLine(mode, width, height))
-            result = std::to_string(width) + "x" + std::to_string(height);
-    }
-    closedir(dir);
-    return result;
-}
-
 class JSBrowserPlayer : public JQBaseObject {
 public:
     JSBrowserPlayer()
@@ -715,14 +573,10 @@ public:
         JSContext* ctx = info.GetContext();
         JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
         const std::string workspace = getStringProperty(ctx, options, "workspace", "");
-        const std::string dataDir = getStringProperty(ctx, options, "dataDir", "");
         if (workspace.empty()) {
             throwError(info, "workspace is empty");
             return;
         }
-
-        if (!dataDir.empty())
-            cleanupOldExtractedRuntime(dataDir);
 
         const std::string runtimeDir = joinPath(workspace, kRuntimeRelative);
         std::string error;
