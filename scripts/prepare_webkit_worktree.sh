@@ -26,5 +26,12 @@ while IFS= read -r patch; do
     git -C "$WEBKIT_WORKTREE" apply "$patch_path"
 done < "$PATCH_ROOT/series"
 
+angle_zlib="$WEBKIT_WORKTREE/Source/ThirdParty/ANGLE/third_party/zlib/google"
+mkdir -p "$angle_zlib"
+cp "$ROOT/wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.h" "$angle_zlib/"
+cp "$ROOT/wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.cc" "$angle_zlib/"
+cp "$ROOT/wpe-drm/ChromeMotionState.h" \
+    "$WEBKIT_WORKTREE/Source/WebKit/WPEPlatform/wpe/drm/ChromeMotionState.h"
+
 printf 'WebKit worktree ready: source=%s revision=%s\n' "$WEBKIT_WORKTREE" "$REVISION"
 git -C "$WEBKIT_WORKTREE" diff --stat

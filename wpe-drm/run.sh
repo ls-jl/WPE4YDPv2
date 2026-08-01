@@ -3,9 +3,22 @@ umask 077
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VAR_DIR="${WPE_VAR_DIR:-$DIR/var}"
 mkdir -p "$VAR_DIR"
+EXIT_STATUS_FILE="$VAR_DIR/browser-exit.json"
+rm -f "$EXIT_STATUS_FILE"
+
+write_exit_status() {
+    reason="$1"
+    code="$2"
+    tmp="$EXIT_STATUS_FILE.tmp.$$"
+    printf '{"reason":"%s","code":%s,"timestamp":%s}\n' \
+        "$reason" "$code" "$(date +%s 2>/dev/null || echo 0)" >"$tmp" || return 0
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$EXIT_STATUS_FILE" 2>/dev/null || rm -f "$tmp"
+}
 MESA="${WPE_MESA_DIR:-$DIR}"
 if [ ! -d "$MESA/lib" ]; then
     echo "WPE fatal: Mesa/runtime lib dir missing: $MESA/lib"
+    write_exit_status start_failed 84
     exit 84
 fi
 unset WPE_BACKEND_LIBRARY
@@ -47,6 +60,7 @@ export WEBKIT_TLS_CAFILE_PEM="${WEBKIT_TLS_CAFILE_PEM:-$G_TLS_CA_FILE}"
 export OPENSSL_MODULES="${OPENSSL_MODULES:-$DIR/lib/ossl-modules}"
 if [ ! -f "$G_TLS_CA_FILE" ]; then
     echo "WPE fatal: CA certificates missing: $G_TLS_CA_FILE"
+    write_exit_status start_failed 85
     exit 85
 fi
 export TZDIR="${TZDIR:-$DIR/share/zoneinfo}"
@@ -111,6 +125,14 @@ export WPE_TOUCH_HORIZONTAL_SCROLL="${WPE_TOUCH_HORIZONTAL_SCROLL:-1}"
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
 export WPE_DRM_FENCE_TIMEOUT_MS="${WPE_DRM_FENCE_TIMEOUT_MS:-2000}"
 export WPE_DRM_PARTIAL_COPY="${WPE_DRM_PARTIAL_COPY:-0}"
+# Use the packaged Rockchip RGA for rotated Mali frames. In auto mode any
+# import/rotation failure falls back to the existing CPU copy path.
+export WPE_DRM_RGA_ROTATION="${WPE_DRM_RGA_ROTATION:-auto}"
+if [ "$WPE_DRM_RGA_ROTATION" != "off" ] && [ "$WPE_DRM_RGA_ROTATION" != "0" ]; then
+    export WPE_DRM_RGA_LIBRARY="${WPE_DRM_RGA_LIBRARY:-$DIR/lib/librga.so.2}"
+else
+    unset WPE_DRM_RGA_LIBRARY
+fi
 export WPE_WEBRTC="${WPE_WEBRTC:-1}"
 export WPE_WEBRTC_CAPTURE="${WPE_WEBRTC_CAPTURE:-deny}"
 # 云原神的信令 WSS 当前在 *.mhystatic.com:5443 返回已过期证书。
@@ -227,6 +249,7 @@ if [ "$REBUILD_FONTCONFIG" = 1 ]; then
     rm -f "$FONT_DIRS_TMP"
     if [ ! -s "$FONT_DIRS_FILE" ]; then
         echo "WPE fatal: bundled fonts missing dir=$BUNDLED_FONT_ROOT"
+        write_exit_status start_failed 86
         exit 86
     fi
     CJK_FONT="$MINIAPP_FONT_DIR/NotoSansSC-Regular.otf"
@@ -366,6 +389,7 @@ rm -f "$WPE_PROFILE_SWITCH_FILE"
 GPU_RUNTIME_MODULE="$DIR/runtime/gpu-runtime.sh"
 if [ ! -r "$GPU_RUNTIME_MODULE" ]; then
     echo "WPE fatal: GPU runtime module missing: $GPU_RUNTIME_MODULE"
+    write_exit_status start_failed 87
     exit 87
 fi
 . "$GPU_RUNTIME_MODULE"
@@ -451,7 +475,7 @@ while :; do
         exit "$SELECT_STATUS"
     fi
 
-    echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE gpu_status=$WPE_GPU_STATUS compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
+    echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE gpu_status=$WPE_GPU_STATUS compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT rga_rotation=$WPE_DRM_RGA_ROTATION video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
 
     run_profile_switch_loop
     STATUS=$?
@@ -487,6 +511,13 @@ done
 
 if [ "$STATUS" -eq 74 ]; then
     echo "WPE user shutdown completed"
+    write_exit_status user_shutdown 74
     STATUS=0
+elif [ "$STATUS" -ne 0 ]; then
+    if [ -f "$GPU_READY_FILE" ]; then
+        write_exit_status crash "$STATUS"
+    else
+        write_exit_status start_failed "$STATUS"
+    fi
 fi
 exit "$STATUS"

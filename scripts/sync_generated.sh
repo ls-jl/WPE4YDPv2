@@ -46,12 +46,25 @@ validate_webkit_elf() {
     echo "error: WebKit runtime is unexpectedly small: $size bytes" >&2
     exit 1
   fi
+
+  if command -v readelf >/dev/null 2>&1; then
+    dynamic_info="$(readelf -d "$path")"
+  elif command -v objdump >/dev/null 2>&1; then
+    dynamic_info="$(objdump -p "$path")"
+  else
+    echo "error: readelf or objdump is required to validate WebKit SONAME" >&2
+    exit 1
+  fi
+  printf '%s\n' "$dynamic_info" | grep -q 'SONAME.*libWPEWebKit-2.0.so.1' || {
+    echo "error: WebKit SONAME is not libWPEWebKit-2.0.so.1" >&2
+    exit 1
+  }
 }
 
 require_file "$ROOT/wpe-drm/run.sh"
 require_file "$ROOT/wpe-drm/runtime/gpu-runtime.sh"
 require_file "$ROOT/libs/arm64-orange/libjsapi_browser.so"
-require_file "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
+require_file "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"
 require_file "$ROOT/assets/wpe-runtime/build-manifest.json"
 for runtime_file in \
   lib/libcrypto.so.3 \
@@ -61,6 +74,7 @@ for runtime_file in \
   lib/libgstsctp-1.0.so.0.2212.0 \
   lib/libgstwebrtc-1.0.so.0.2212.0 \
   lib/libgstwebrtcnice-1.0.so.0.2212.0 \
+  lib/librga.so.2 \
   lib/gstreamer-1.0/libgstnice.so \
   lib/gstreamer-1.0/libgstrtp.so \
   lib/gstreamer-1.0/libgstrtpmanager.so \
@@ -72,8 +86,17 @@ do
   require_file "$ROOT/assets/wpe-runtime/$runtime_file"
 done
 reject_lfs_pointer "$ROOT/libs/arm64-orange/libjsapi_browser.so"
-reject_lfs_pointer "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
-validate_webkit_elf "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
+reject_lfs_pointer "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"
+validate_webkit_elf "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"
+
+webkit_entries="$(find "$ROOT/assets/wpe-runtime/lib" -maxdepth 1 \
+  -name 'libWPEWebKit-2.0.so*' -print)"
+if [ "$webkit_entries" != "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1" ] \
+    || [ -L "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1" ]; then
+  echo "error: packaged runtime must contain exactly one regular libWPEWebKit-2.0.so.1" >&2
+  printf '%s\n' "$webkit_entries" >&2
+  exit 1
+fi
 
 cp "$ROOT/wpe-drm/run.sh" "$ROOT/assets/wpe-runtime/run.sh"
 chmod +x "$ROOT/assets/wpe-runtime/run.sh"

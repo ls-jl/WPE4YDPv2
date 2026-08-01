@@ -96,6 +96,7 @@ void browser_profile_clear(BrowserProfile *profile)
     g_free(profile->site_profile);
     g_free(profile->search_engine);
     g_free(profile->custom_search_template);
+    g_free(profile->language);
     memset(profile, 0, sizeof(*profile));
 }
 
@@ -322,6 +323,7 @@ static gboolean set_default_settings(BrowserProfileStore *store, int64_t profile
         && set_setting(store, profile_id, "cookie_policy", "all", error)
         && set_setting(store, profile_id, "search_engine", "baidu", error)
         && set_setting(store, profile_id, "custom_search_template", "", error)
+        && set_setting(store, profile_id, "language", "zh-CN", error)
         && set_setting(store, profile_id, "page_zoom", "1", error)
         && set_setting(store, profile_id, "default_font_size", "16", error)
         && set_setting(store, profile_id, "javascript_enabled", "1", error)
@@ -696,6 +698,12 @@ gboolean browser_profile_store_get_profile(BrowserProfileStore *store, int64_t p
     }
     profile->custom_search_template = get_setting(store, profile_id,
                                                   "custom_search_template", "");
+    profile->language = get_setting(store, profile_id, "language", "zh-CN");
+    if (g_ascii_strcasecmp(profile->language, "zh-CN")
+            && g_ascii_strcasecmp(profile->language, "en-US")) {
+        g_free(profile->language);
+        profile->language = g_strdup("zh-CN");
+    }
     profile->page_zoom = setting_double(store, profile_id, "page_zoom", 1.0, 0.75, 1.25);
     profile->default_font_size = setting_uint(store, profile_id,
                                               "default_font_size", 16, 14, 20);
@@ -989,6 +997,9 @@ gboolean browser_profile_store_save_preferences(BrowserProfileStore *store,
                     profile->search_engine ? profile->search_engine : "baidu", error)
         && set_setting(store, profile->id, "custom_search_template",
                        profile->custom_search_template ? profile->custom_search_template : "", error)
+        && set_setting(store, profile->id, "language",
+                       profile->language && !g_ascii_strcasecmp(profile->language, "en-US")
+                         ? "en-US" : "zh-CN", error)
         && set_setting(store, profile->id, "page_zoom", zoom, error)
         && set_setting(store, profile->id, "default_font_size", font_size, error)
         && set_setting(store, profile->id, "javascript_enabled",

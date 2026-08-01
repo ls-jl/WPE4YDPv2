@@ -24,9 +24,11 @@
 
 #include "GStreamerCommon.h"
 #include "IntRect.h"
+#include <algorithm>
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -43,10 +45,13 @@ enum : uint32_t {
     VideoOverlayMessageFrame = 1,
     VideoOverlayMessageRect = 2,
     VideoOverlayMessageHide = 3,
+    VideoOverlayMessageRelease = 4,
 };
 
 struct VideoOverlayWireMessage {
+    uint32_t version;
     uint32_t type;
+    uint64_t sequence;
     uint32_t fourcc;
     uint32_t width;
     uint32_t height;
@@ -60,13 +65,19 @@ struct VideoOverlayWireMessage {
     uint64_t modifier;
 };
 
+static constexpr uint32_t videoOverlayProtocolVersion = 2;
+
 #ifndef DRM_FORMAT_NV12
 #define DRM_FORMAT_NV12 0x3231564e // 'NV12' little-endian，避免引 drm_fourcc.h
 #endif
 
-// UI 进程 NONBLOCK commit 后旧帧可能还有一个 vblank 在屏上，多押两级；
-// 解码器缓冲池通常 16+ 个 buffer，扣 4 个不会饿到解码。
-static constexpr size_t retainedSampleCount = 4;
+static constexpr size_t maximumInFlightSamples = 4;
+
+struct VideoOverlayInFlightSample {
+    uint64_t sequence { 0 };
+    GRefPtr<GstSample> sample;
+    gint64 sentUS { 0 };
+};
 
 struct RockchipVideoOverlaySinkContext {
     Lock lock;
@@ -88,7 +99,8 @@ public:
         if (m_owner != owner)
             return;
         sendSimpleMessageLocked(VideoOverlayMessageHide);
-        m_retainedSamples.clear();
+        waitForReleaseAcksLocked(100);
+        m_inFlightSamples.clear();
         closeLocked();
         m_owner = nullptr;
         g_message("Rockchip video overlay: owner=%p released", owner);
@@ -105,6 +117,7 @@ public:
         if (m_socket < 0)
             return;
         VideoOverlayWireMessage message = { };
+        message.version = videoOverlayProtocolVersion;
         message.type = VideoOverlayMessageRect;
         fillRectLocked(message);
         sendLocked(message, -1);
@@ -152,9 +165,17 @@ public:
 
         if (!ensureConnectedLocked())
             return;
+        drainReleaseAcksLocked();
+        if (m_inFlightSamples.size() >= maximumInFlightSamples) {
+            m_droppedInFlight++;
+            logStatsLocked();
+            return;
+        }
 
         VideoOverlayWireMessage message = { };
+        message.version = videoOverlayProtocolVersion;
         message.type = VideoOverlayMessageFrame;
+        message.sequence = m_nextSequence++;
         message.fourcc = DRM_FORMAT_NV12;
         message.width = GST_VIDEO_INFO_WIDTH(&info);
         message.height = GST_VIDEO_INFO_HEIGHT(&info);
@@ -169,10 +190,13 @@ public:
         if (!sendLocked(message, gst_dmabuf_memory_get_fd(memory)))
             return;
 
-        // 押住样本，防止解码器在 VOP 还在扫描时复写这块 dmabuf。
-        if (m_retainedSamples.size() >= retainedSampleCount)
-            m_retainedSamples.removeAt(0);
-        m_retainedSamples.append(GRefPtr<GstSample>(sample));
+        VideoOverlayInFlightSample retained;
+        retained.sequence = message.sequence;
+        retained.sample = GRefPtr<GstSample>(sample);
+        retained.sentUS = g_get_monotonic_time();
+        m_inFlightSamples.append(WTF::move(retained));
+        m_sentFrames++;
+        logStatsLocked();
     }
 
 private:
@@ -258,9 +282,67 @@ private:
         return true;
     }
 
+    void drainReleaseAcksLocked()
+    {
+        if (m_socket < 0)
+            return;
+        while (true) {
+            VideoOverlayWireMessage message = { };
+            ssize_t received = recv(m_socket, &message, sizeof(message), MSG_DONTWAIT);
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                return;
+            if (received != sizeof(message)) {
+                if (!received)
+                    closeLocked();
+                return;
+            }
+            if (message.version != videoOverlayProtocolVersion
+                || message.type != VideoOverlayMessageRelease || !message.sequence)
+                continue;
+            for (size_t index = 0; index < m_inFlightSamples.size(); ++index) {
+                if (m_inFlightSamples[index].sequence != message.sequence)
+                    continue;
+                gint64 latencyUS = g_get_monotonic_time() - m_inFlightSamples[index].sentUS;
+                m_ackLatencyTotalUS += std::max<gint64>(0, latencyUS);
+                m_ackLatencyMaxUS = std::max(m_ackLatencyMaxUS, latencyUS);
+                m_inFlightSamples.removeAt(index);
+                m_ackedFrames++;
+                break;
+            }
+        }
+    }
+
+    void waitForReleaseAcksLocked(int timeoutMS)
+    {
+        if (m_socket < 0 || m_inFlightSamples.isEmpty())
+            return;
+        gint64 deadlineUS = g_get_monotonic_time() + timeoutMS * 1000;
+        while (!m_inFlightSamples.isEmpty() && g_get_monotonic_time() < deadlineUS) {
+            struct pollfd descriptor = { m_socket, POLLIN, 0 };
+            int remainingMS = std::max(1, static_cast<int>((deadlineUS - g_get_monotonic_time()) / 1000));
+            if (poll(&descriptor, 1, remainingMS) <= 0)
+                break;
+            drainReleaseAcksLocked();
+        }
+    }
+
+    void logStatsLocked()
+    {
+        if (m_sentFrames < m_nextStatsFrame)
+            return;
+        double averageACKMS = m_ackedFrames ? m_ackLatencyTotalUS / 1000. / m_ackedFrames : 0.;
+        g_message("Rockchip video overlay v2: sent=%" G_GUINT64_FORMAT
+            " acked=%" G_GUINT64_FORMAT " inflight=%zu dropped=%" G_GUINT64_FORMAT
+            " ack_avg_ms=%.2f ack_max_ms=%.2f",
+            m_sentFrames, m_ackedFrames, m_inFlightSamples.size(), m_droppedInFlight,
+            averageACKMS, m_ackLatencyMaxUS / 1000.);
+        m_nextStatsFrame += 120;
+    }
+
     void sendSimpleMessageLocked(uint32_t type)
     {
         VideoOverlayWireMessage message = { };
+        message.version = videoOverlayProtocolVersion;
         message.type = type;
         sendLocked(message, -1);
     }
@@ -271,6 +353,9 @@ private:
             close(m_socket);
             m_socket = -1;
         }
+        // No release ACK can arrive after disconnect. Clearing retained
+        // samples also gives a later connection a fresh in-flight window.
+        m_inFlightSamples.clear();
     }
 
     Lock m_lock;
@@ -279,7 +364,14 @@ private:
     bool m_warned { false };
     gint64 m_lastConnectAttemptUS { 0 };
     IntRect m_rect;
-    Vector<GRefPtr<GstSample>> m_retainedSamples;
+    Vector<VideoOverlayInFlightSample> m_inFlightSamples;
+    uint64_t m_nextSequence { 1 };
+    uint64_t m_sentFrames { 0 };
+    uint64_t m_ackedFrames { 0 };
+    uint64_t m_droppedInFlight { 0 };
+    uint64_t m_nextStatsFrame { 120 };
+    gint64 m_ackLatencyTotalUS { 0 };
+    gint64 m_ackLatencyMaxUS { 0 };
 };
 
 static IntRect rockchipOverlayRectangle(RockchipVideoOverlaySinkContext* context)

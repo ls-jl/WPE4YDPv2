@@ -23,6 +23,7 @@ typedef struct {
     BrowserCookiePolicy cookie_policy;
     char *search_engine;
     char *custom_search_template;
+    char *language;
     double page_zoom;
     guint default_font_size;
     gboolean javascript_enabled;

@@ -59,6 +59,7 @@ static void test_profile_store(void)
     g_assert_no_error(error);
     g_assert_cmpstr(active.home_url, ==, "https://legacy.example/");
     g_assert_cmpstr(active.site_profile, ==, "desktop");
+    g_assert_cmpstr(active.language, ==, "zh-CN");
 
     guint next_id = 0;
     GPtrArray *loaded = browser_profile_store_load_tabs(store, active.id, &next_id, &error);
@@ -80,6 +81,10 @@ static void test_profile_store(void)
     g_assert_no_error(error);
     g_assert_true(browser_profile_store_set_cookie_policy(store, second.id,
         BROWSER_COOKIE_NO_THIRD_PARTY, &error));
+    g_assert_no_error(error);
+    g_free(second.language);
+    second.language = g_strdup("en-US");
+    g_assert_true(browser_profile_store_save_preferences(store, &second, &error));
     g_assert_no_error(error);
 
     GPtrArray *tabs = g_ptr_array_new_with_free_func((GDestroyNotify)browser_stored_tab_free);
@@ -128,6 +133,7 @@ static void test_profile_store(void)
     g_assert_cmpint(restored.id, ==, second_id);
     g_assert_cmpstr(restored.name, ==, "第二用户");
     g_assert_cmpint(restored.cookie_policy, ==, BROWSER_COOKIE_NO_THIRD_PARTY);
+    g_assert_cmpstr(restored.language, ==, "en-US");
     browser_profile_clear(&restored);
 
     int64_t fallback_id = 0;

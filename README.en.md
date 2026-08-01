@@ -13,6 +13,7 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
 
 - **Fully self-contained in-package runtime**: WebKit, Mesa software rendering, GStreamer, OpenSSL, libnice, libsrtp, MPP decoding, ALSA, fonts, and CA certificates are bundled. Local builds may additionally stage the Mali G52 runtime and kernel modules.
 - **GPU auto-detection with strict CPU fallback**: `WPE_GPU_MODE=auto` validates Mali EGL/GLES, linear DMA-BUF export and mapping, and DRM framebuffer creation. Any failure falls back to Skia CPU plus dma-heap/SHM.
+- **RGA page-rotation fast path**: on rotated devices, the bundled `librga.so.2` writes WebKit DMABufs directly into DRM dumb scanout buffers, avoiding a per-frame CPU map/read/rotate of Mali buffers. The prior CPU path remains an automatic fallback.
 - **KMS overlay direct video output (hole-punch)**: `mppvideodec` VPU hardware decoding + RGA hardware pre-rotation output NV12 dmabuf, delivered to the UI process via a unix socket and placed on an idle Esmart overlay plane for direct scan-out.
 - **WebRTC cloud-gaming path**: WebKit uses the GStreamer PeerConnection backend with bundled ICE/DTLS/SRTP/SCTP/RTP/Opus support. Remote media and DataChannels are allowed while microphone, camera, and screen capture are denied. Cloud Genshin hosts automatically use native multi-touch `game` input.
 - **Kernel deeply customized per device model**: `-mcpu=cortex-a53` + ThinLTO + **PGO** (profile-use from real-device workload sampling on Douyin/Bilibili/Baidu, etc.); trimmed SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS and more.
@@ -30,7 +31,7 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
 - `assets/wpe-runtime/`: the in-package WPE runtime.
   - `run.sh`: startup script (synced from `wpe-drm/run.sh` by `scripts/sync_generated.sh` as the single source of truth), the sole place to maintain runtime tuning envs.
   - `wpe-drm-minimal`: Direct DRM browser shell (chrome toolbar/profiles/tabs/history/bookmarks/cookies/keyboard bridge/crash circuit breaker).
-  - `lib/libWPEWebKit-2.0.so.1.10.2`: customized WebKit (Git LFS). `lib/gstreamer-1.0/` contains decoding plugins copied in from the device.
+  - `lib/libWPEWebKit-2.0.so.1`: the only packaged runtime ELF for customized WebKit 2.53.3 (upstream file version 1.10.2, Git LFS). Packaging omits symlink aliases because Falcon expands them into full copies. `lib/gstreamer-1.0/` contains decoding plugins copied in from the device.
   - `tests/webrtc-loopback.html`: encoder-free ICE/DataChannel and local-capture-denial smoke test.
 - `wpe-drm/`: Direct WPE launcher, DRM platform sources, testable browser modules, supervisor modules, and the reproducible WebKit patch series:
   - `wpe-drm-minimal.c`, `run.sh`: application layer.
@@ -82,6 +83,7 @@ Writable data lives under `$dataDir/browser/`: `wpe-drm.log`, `browser.sqlite3` 
 | `WPE_BROWSER_DB` | `$WPE_VAR_DIR/browser.sqlite3` | Browser profile metadata database |
 | `WPE_DRM_FENCE_TIMEOUT_MS` | `2000` | Rendering-fence timeout before a CPU DMA-BUF read |
 | `WPE_DRM_PARTIAL_COPY` | `0` | Uses complete copies by default to prevent stale or incomplete regions |
+| `WPE_DRM_RGA_ROTATION` | `auto` | Prefers bundled RGA for rotated DMABufs; `off` forces CPU and `required` is diagnostic |
 | `WPE_TOUCH_HORIZONTAL_SCROLL` | `1` | Horizontal swiping on wide pages |
 | `WEBKIT_SKIA_ENABLE_CPU_RENDERING` | `1` | Native Skia CPU rasterization (avoid falling back to software GL emulation) |
 | `WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS` | `30` | Compositing frame rate cap |
@@ -98,13 +100,17 @@ adb shell "killall wpe-drm-minimal WPEWebProcess WPENetworkProcess"
 
 Open the bundled `tests/webrtc-loopback.html` from the address bar for the basic WebRTC check. A pass logs `PASS ICE + DataChannel`. Once a cloud stream starts, logs should also select `mppvideodec` and DRM state should contain an NV12 framebuffer. The smoke test intentionally sends no video because the product runtime does not bundle a local video encoder.
 
-A pitfall of hot-swapping core libs: **installing the amr materializes the lib symlinks into three full copies — `.so`, `.so.1`, `.so.1.10.2` — and the dynamic linker loads `.so.1` by soname**, so pushing only `.so.1.10.2` is not enough; all three must be replaced together.
+The package intentionally contains exactly one regular WebKit ELF named
+`libWPEWebKit-2.0.so.1`, matching its SONAME. Do not add `.so` or `.so.1.10.2`
+aliases: Falcon dereferences symlinks while packaging and would recreate full
+duplicate files. Hot replacement, when required for diagnostics, targets only
+the canonical `.so.1` file.
 
 Profile switching exits only `wpe-drm-minimal` with status `75`; `run.sh` restarts the child while preserving the MiniApp watchdog, DRM hole, and loaded GPU modules. Guest uses an ephemeral network session and removes its temporary directory on exit.
 
 ## Git / Large Files
 
-Git LFS manages oversized files: `assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2` and the `*.amr` build artifact. After cloning:
+Git LFS manages oversized files: `assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1` and the `*.amr` build artifact. After cloning:
 
 ```sh
 git lfs install && git lfs pull

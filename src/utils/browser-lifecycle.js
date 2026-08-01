@@ -98,7 +98,24 @@ export class BrowserLifecycle {
       return
     }
     this.state.running = false
-    this.leaveFrame('browser exited')
+    this.leaveFrame(this.consumeExitStatus())
+  }
+
+  consumeExitStatus() {
+    if (!this.browserPlayer.consumeBrowserExitStatus) return '浏览器已退出'
+    try {
+      const raw = this.browserPlayer.consumeBrowserExitStatus({ workdir: this.workdir() })
+      if (!raw) return '浏览器已退出'
+      const status = typeof raw === 'string' ? JSON.parse(raw) : raw
+      const code = Number(status.code)
+      if (status.reason === 'user_shutdown') return '浏览器已关闭'
+      if (status.reason === 'start_failed') return `浏览器启动失败（错误码 ${Number.isFinite(code) ? code : 'unknown'}）`
+      if (status.reason === 'crash') return `浏览器异常退出（错误码 ${Number.isFinite(code) ? code : 'unknown'}）`
+      return '浏览器已退出'
+    } catch (err) {
+      console.warn(`consume browser exit status failed ${err}`)
+      return '浏览器已退出'
+    }
   }
 
   stop() {

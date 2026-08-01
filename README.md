@@ -15,15 +15,16 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 
 - **包内自包含 runtime**：WebKit、Mesa 软渲染、GStreamer、OpenSSL、libnice、libsrtp、MPP 硬解、ALSA、字体和 CA 证书全部随包，安装后不依赖外部 runtime；本地构建可额外带 Mali G52 runtime/KO。
 - **GPU 自动探测与可靠回退**：`WPE_GPU_MODE=auto` 在 `/dev/mali0` 可用或 ARM64 `5.10.160` KO 成功加载后，继续验证 Mali EGL/GLES、linear DMA-BUF、CPU map 和 DRM framebuffer；任何一步失败都回到 Skia CPU + dma-heap/SHM。
-- **视频 KMS overlay 直出（hole-punch）**：`mppvideodec` VPU 硬解 + RGA 硬件预旋转输出 NV12 dmabuf，经 unix socket 送 UI 进程放到空闲 Esmart overlay plane 直接扫描输出。
+- **RGA 页面旋转快路径**：旋转设备上的 WebKit DMABuf 由包内 `librga.so.2` 直接写入 DRM dumb scanout，避免 CPU 每帧映射、读取和旋转 Mali buffer；RGA 不可用时自动回退原 CPU 路径。
+- **视频 KMS overlay 直出（hole-punch）**：`mppvideodec` VPU 硬解 + RGA 硬件预旋转输出 NV12 dmabuf，经 v2 unix socket 协议送 UI 进程放到空闲 Esmart overlay plane；解码样本在收到对应 sequence release ACK 前不会复用。
 - **WebRTC 云游戏链路**：WebKit 使用 GStreamer PeerConnection backend，包内提供 ICE/DTLS/SRTP/SCTP/RTP/Opus；允许远端音视频和 DataChannel，默认拒绝麦克风、摄像头和屏幕采集。云原神域名自动切换到原生多点触摸 `game` 输入模式。
 - **内核按机型深度定制**：`-mcpu=cortex-a53` + ThinLTO + **PGO**（抖音/bilibili/百度等真机负载采样 profile-use）；裁剪 SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS 等。
 - **低内存自保**：内存上限按物理内存 68% 动态设定（1GB 机型 673MB，kill 阈值 0.92）；同一 URL 120 秒内被杀 3 次自动回主页的崩溃熔断；MSE 每 SourceBuffer 缓冲上限。
 - **低风险内存策略**：默认不改全局 swappiness、不执行 `drop_caches`；仅调整 WPE 自身 OOM 优先级，并通过显式诊断开关临时启用系统级实验。
 - **移动 UA + 站点档案**：默认 Android Chrome UA；支持按站点切换 desktop/mobile 档案。
 - **多用户 Profile 与 Cookie 持久化**：最多 8 个持久 Profile 和访客模式；Cookie、LocalStorage、IndexedDB、Service Worker、缓存、标签、历史、收藏和站点档案完全隔离。浏览器元数据使用 SQLite WAL，Cookie 使用 WebKit 独立 SQLite CookieJar。
-- **Chrome Material 原生界面**：浅色/深色主题、共享圆角卡片和 native 图标、按压态、开关/单选/危险操作样式；工具栏、Tabs、溢出菜单和内部设置页使用同一套 raster 组件。
-- **分组设置**：外观、网页、启动与搜索、隐私与数据、关于。主题和工具栏自动隐藏全局保存；缩放、字体、网页能力、搜索引擎和启动行为按 Profile 隔离，Guest 网页设置只在当前会话生效。
+- **Chrome Material 原生界面**：浅色/深色主题、共享圆角卡片和 native 图标、按压态、开关/单选/危险操作样式；GPU 旋转路径缓存完整 CPU 底图，菜单动画只重画 chrome，不重复读取 Mali DMA-BUF。
+- **分组设置**：外观、网页、启动与搜索、隐私与数据、语言、关于。主题和工具栏自动隐藏全局保存；缩放、字体、网页能力、搜索引擎、语言和启动行为按 Profile 隔离，Guest 网页设置只在当前会话生效。语言同时控制 native 菜单、`Accept-Language` 和 `navigator.language(s)`。
 - 原生工具栏 `inset` 布局（显隐不 resize WebView）、Chrome 风格三点分层菜单、地址栏直接键盘编辑、横向滚动、系统键盘桥、双显示模式（原生/横屏旋转）。
 
 ## 目录结构
@@ -34,7 +35,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 - `assets/wpe-runtime/`：包内 WPE runtime。
   - `run.sh`：启动脚本（由 `scripts/sync_generated.sh` 从 `wpe-drm/run.sh` 单源同步），所有运行期调优 env 的唯一维护处。
   - `wpe-drm-minimal`：Direct DRM 浏览器壳（chrome 工具栏/Profile/多标签/历史/收藏/Cookie/键盘桥/崩溃熔断）。
-  - `lib/libWPEWebKit-2.0.so.1.10.2`：定制 WebKit（Git LFS）。`lib/gstreamer-1.0/` 含设备拷入的解码插件。
+  - `lib/libWPEWebKit-2.0.so.1`：定制 WebKit 2.53.3 的唯一运行时 ELF（上游文件版本 1.10.2，Git LFS）。包内不保留会被 Falcon 展开成完整副本的 `.so` 软链接。`lib/gstreamer-1.0/` 含设备拷入的解码插件。
   - `tests/webrtc-loopback.html`：无需本机编码器的 ICE + DataChannel + 本地采集拒绝自测页。
   - `gpu/`：本地可选 Mali 用户态库和 `5.10.160` KO；专有二进制不提交 Git，由 `scripts/stage_gpu_runtime.sh` 按 SHA256 组装。
 - `wpe-drm/`：Direct WPE launcher、DRM 平台源码和可复现 WebKit 补丁：
@@ -88,6 +89,7 @@ WebKit 内核与 `wpe-drm-minimal` 在 ARM64 交叉编译服务器上构建。`s
 | `WPE_BROWSER_DB` | `$WPE_VAR_DIR/browser.sqlite3` | 浏览器 Profile 元数据 SQLite |
 | `WPE_DRM_FENCE_TIMEOUT_MS` | `2000` | CPU 读取 DMA-BUF 前等待 rendering fence 的上限 |
 | `WPE_DRM_PARTIAL_COPY` | `0` | 默认整帧复制以避免丢帧后出现残缺块 |
+| `WPE_DRM_RGA_ROTATION` | `auto` | 旋转 DMABuf 优先使用包内 RGA；`off` 强制 CPU，`required` 用于诊断 |
 | `WPE_TOUCH_HORIZONTAL_SCROLL` | `1` | 宽页横向滑动 |
 | `WEBKIT_SKIA_ENABLE_CPU_RENDERING` | `1` | Skia 原生 CPU 光栅化（勿走软件 GL 模拟） |
 | `WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS` | `30` | 合成帧率上限 |
@@ -104,13 +106,15 @@ adb shell "killall wpe-drm-minimal WPEWebProcess WPENetworkProcess"
 
 WebRTC 基础验收可在地址栏打开包内 `tests/webrtc-loopback.html`。成功日志应包含 `PASS ICE + DataChannel`；云游戏开始推流后还应看到 `mppvideodec`，并在 DRM state 中出现 NV12 framebuffer。自测页不发送视频，因为产品 runtime 不打包本地视频编码器。
 
-热替换内核 lib 的坑：**amr 安装时会把 lib 符号链接实体化成 `.so`/`.so.1`/`.so.1.10.2` 三份完整拷贝，动态链接器按 soname 加载 `.so.1`**——只推 `.so.1.10.2` 不够，需三份同时替换。
+包内 WebKit 只保留与 ELF SONAME 一致的实体 `libWPEWebKit-2.0.so.1`。不要重新加入 `.so` 或 `.so.1.10.2` 软链接：Falcon 会解引用它们并在 AMR 与设备安装目录中生成完整重复副本。热替换时只替换 `.so.1`。
 
 Profile 切换由 `wpe-drm-minimal` 以退出码 `75` 请求，`run.sh` 只重启 WPE 子进程；MiniApp watchdog、DRM hole 和已加载的 GPU 模块保持不变。退出 Guest 后其 ephemeral NetworkSession 和临时目录会被删除。
 
+电源按钮退出码为 `74`。`run.sh` 原子写入 `$WPE_VAR_DIR/browser-exit.json`，MiniApp watchdog 消费后返回启动页并显示“浏览器已关闭”；异常退出会显示对应错误码。About 页展示的是实际渲染路径（`MALI-G52 GPU` 或明确的 Skia CPU 回退原因），不是 GPU 开关偏好值。
+
 ## Git / 大文件
 
-Git LFS 管理超大文件：`assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2`、`*.amr` 打包产物。
+Git LFS 管理超大文件：`assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1`、`*.amr` 打包产物。
 
 克隆前先装好 git-lfs 最省事，LFS 内容会随 `git clone` 自动下载：
 

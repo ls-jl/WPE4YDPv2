@@ -60,7 +60,7 @@ export default {
     }
   },
   mounted() {
-    this.applyPageOptions(this.pageOptions(), false)
+    this.applyPageOptions(this.pageOptions(), true)
   },
   onShow() {
     this.applyPageOptions(this.pageOptions(), true)

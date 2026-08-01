@@ -7,7 +7,7 @@ cd "$ROOT"
 AMR="8001779591038449.1_0_0.amr"
 JSAPI="libs/arm64-orange/libjsapi_browser.so"
 LAUNCHER="assets/wpe-runtime/wpe-drm-minimal"
-WEBKIT="assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1.10.2"
+WEBKIT="assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"
 RUNTIME_MANIFEST="assets/wpe-runtime/build-manifest.json"
 OUTPUT="release-manifest.json"
 

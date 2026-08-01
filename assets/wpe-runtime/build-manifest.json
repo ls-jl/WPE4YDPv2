@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "webkit_revision": "9effc8745be9b7b0fab96b29cc69716c9a5c4ae0",
-  "patch_series_sha256": "9dc2eb4719c87204f15fe8f11d1291d70c086064b336e9cb0958f97e8dbaf0b6",
+  "patch_series_sha256": "dab3fdb424bcbb2fc11dd2a5a170ff95bd2645894e230263efb78b0b9aad2a0e",
   "build_flags": {
     "ENABLE_WEB_RTC": true,
     "USE_GSTREAMER_WEBRTC": true,
@@ -13,7 +13,7 @@
     "ENABLE_GPU_PROCESS": false
   },
   "artifacts": {
-    "lib/libWPEWebKit-2.0.so.1.10.2": "56010f51736aa9588b1aa49b5c4cca22e5f24dcd17467a32931be00b06f81636",
-    "wpe-drm-minimal": "21cf673a0a090dffad0487d7ad7387ed7035c97e600673cd759eef2066a56b77"
+    "lib/libWPEWebKit-2.0.so.1": "f4d5555e12bb89df1d61ed1b54cb54ca822fdafc6e0c926c151e01bb419c4316",
+    "wpe-drm-minimal": "4f3fbf1db08e679900f477096f1a511ce4f858a689dae3f9be712d7695024131"
   }
 }

@@ -346,6 +346,11 @@ static std::string keyboardBackendPath(const std::string& workdir)
     return joinPath(keyboardDirForWorkdir(workdir), "backend.json");
 }
 
+static std::string browserExitStatusPath(const std::string& workdir)
+{
+    return joinPath(workdir, "browser-exit.json");
+}
+
 static int waitForProcessExit(pid_t pid, int timeoutMs)
 {
     if (pid <= 1) return 0;
@@ -463,21 +468,60 @@ static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const 
     for (pid_t pid : pids) signalProcessTree(pid, SIGKILL);
 }
 
-static bool directoryHasFilePrefix(const std::string& path, const std::string& prefix)
+static bool regularFileNoFollow(const std::string& path, struct stat* result = nullptr)
 {
-    DIR* dir = opendir(path.c_str());
-    if (!dir) return false;
-    bool found = false;
-    struct dirent* entry = nullptr;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
-        if (!std::strncmp(entry->d_name, prefix.c_str(), prefix.size())) {
-            found = true;
-            break;
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (result) *result = st;
+    return true;
+}
+
+static bool normalizePackagedWebKitLibrary(const std::string& runtimeDir, std::string& error)
+{
+    const std::string libDir = joinPath(runtimeDir, "lib");
+    const std::string canonical = joinPath(libDir, "libWPEWebKit-2.0.so.1");
+    const std::string legacyLinkerName = joinPath(libDir, "libWPEWebKit-2.0.so");
+    const std::string legacyVersioned = joinPath(libDir, "libWPEWebKit-2.0.so.1.10.2");
+
+    struct stat canonicalStat;
+    if (!regularFileNoFollow(canonical, &canonicalStat)) {
+        struct stat rawStat;
+        const bool canonicalIsSymlink = lstat(canonical.c_str(), &rawStat) == 0 && S_ISLNK(rawStat.st_mode);
+        if (!regularFileNoFollow(legacyVersioned)) {
+            error = "runtime WebKit library missing: " + canonical;
+            return false;
         }
+        if (canonicalIsSymlink && unlink(canonical.c_str()) != 0) {
+            error = "runtime WebKit legacy symlink cleanup failed: " + canonical + ": " + std::strerror(errno);
+            return false;
+        }
+        if (rename(legacyVersioned.c_str(), canonical.c_str()) != 0) {
+            error = "runtime WebKit canonical rename failed: " + std::string(std::strerror(errno));
+            return false;
+        }
+        if (!regularFileNoFollow(canonical, &canonicalStat)) {
+            error = "runtime WebKit canonical file invalid: " + canonical;
+            return false;
+        }
+        LOGI("%s migrated legacy WebKit runtime to %s", kTag, canonical.c_str());
     }
-    closedir(dir);
-    return found;
+
+    const off_t minimumSize = static_cast<off_t>(90) * 1024 * 1024;
+    if (canonicalStat.st_size < minimumSize) {
+        error = "runtime WebKit library unexpectedly small: " + std::to_string(static_cast<long long>(canonicalStat.st_size));
+        return false;
+    }
+
+    const std::vector<std::string> obsoleteAliases = { legacyLinkerName, legacyVersioned };
+    for (const std::string& alias : obsoleteAliases) {
+        struct stat st;
+        if (lstat(alias.c_str(), &st) != 0) continue;
+        if (unlink(alias.c_str()) == 0)
+            LOGI("%s removed duplicate WebKit runtime %s", kTag, alias.c_str());
+        else
+            LOGI("%s warning: could not remove duplicate WebKit runtime %s: %s", kTag, alias.c_str(), std::strerror(errno));
+    }
+    return true;
 }
 
 static bool directoryHasFontFile(const std::string& path)
@@ -529,10 +573,7 @@ static bool ensurePackagedRuntimeReady(const std::string& runtimeDir, std::strin
         }
     }
 
-    if (!directoryHasFilePrefix(joinPath(runtimeDir, "lib"), "libWPEWebKit-2.0.so")) {
-        error = "runtime WebKit library missing: " + joinPath(runtimeDir, "lib");
-        return false;
-    }
+    if (!normalizePackagedWebKitLibrary(runtimeDir, error)) return false;
     if (!directoryHasFontFile(joinPath(runtimeDir, "assets/fonts/dejavu"))) {
         error = "runtime fonts missing: " + joinPath(runtimeDir, "assets/fonts/dejavu");
         return false;
@@ -647,6 +688,7 @@ public:
         const std::string pidFile = joinPath(workdir, "browser.pid");
         stopBrowserByPath(pidFile);
         cleanupScopedBrowserProcesses(runtimePath, workdir);
+        unlink(browserExitStatusPath(workdir).c_str());
 
         pid_t pid = fork();
         if (pid < 0) {
@@ -794,6 +836,36 @@ public:
         }
         if (pid <= 1) pid = readPidFile(pidFile);
         info.GetReturnValue().Set(processExists(pid));
+    }
+
+    void consumeBrowserExitStatus(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
+        if (workdir.empty()) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+
+        const std::string path = browserExitStatusPath(workdir);
+        struct stat st;
+        if (lstat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 4096) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+
+        const std::string value = readFile(path);
+        if (value.empty()) {
+            info.GetReturnValue().Set("");
+            return;
+        }
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+            throwError(info, std::string("browser exit status consume failed: ") + path + ": " + std::strerror(errno));
+            return;
+        }
+        publishState("browser_exit_status", value);
+        info.GetReturnValue().Set(value);
     }
 
     void pollKeyboardRequest(JQFunctionInfo& info)
@@ -1155,6 +1227,7 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("startBrowser", &JSBrowserPlayer::startBrowser);
     tpl->SetProtoMethod("stopBrowser", &JSBrowserPlayer::stopBrowser);
     tpl->SetProtoMethod("isBrowserRunning", &JSBrowserPlayer::isBrowserRunning);
+    tpl->SetProtoMethod("consumeBrowserExitStatus", &JSBrowserPlayer::consumeBrowserExitStatus);
     tpl->SetProtoMethod("pollKeyboardRequest", &JSBrowserPlayer::pollKeyboardRequest);
     tpl->SetProtoMethod("pollKeyboardCompletion", &JSBrowserPlayer::pollKeyboardCompletion);
     tpl->SetProtoMethod("ackKeyboardCompletion", &JSBrowserPlayer::ackKeyboardCompletion);

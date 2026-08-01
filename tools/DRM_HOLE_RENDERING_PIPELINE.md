@@ -506,9 +506,21 @@ WebKit/WPE 渲染完成后，会给 `WPEViewDRM` 一个 `WPEBuffer`。当前支�
 1. 源 buffer 仍按 WebKit viewport 尺寸产出，例如 `960x266`。
 2. 根据 panel 和 rotation 计算目标 framebuffer，例如 `266x960`。
 3. 创建目标 dumb buffer。
-4. CPU 读取源 buffer，旋转写入目标 dumb buffer。
+4. DMABuf 默认通过包内 Rockchip RGA 直接旋转到目标 dumb buffer 的 PRIME fd；
+   RGA 不可用或不支持当前几何时才回退 CPU 读取和旋转。SHM buffer 继续使用 CPU。
 5. 在目标 dumb buffer 上绘制 native chrome overlay。
 6. 提交目标 framebuffer。
+
+主线默认值：
+
+```sh
+WPE_DRM_RGA_ROTATION=auto
+WPE_DRM_RGA_LIBRARY=$RUNTIME/lib/librga.so.2
+```
+
+`auto` 在 RGA 导入或旋转失败时保留 CPU 回退；`off` 强制旧 CPU 路径；
+`required` 用于诊断，RGA 不可用时直接报错。运行时不会隐式加载系统
+`/usr/lib/librga`，因此不同设备固件不会改变包内 ABI。
 
 ### 7.4 Native toolbar/chrome 绘制
 
@@ -568,7 +580,8 @@ WPEViewDRM commit fit=panel-native panel=960x266 drm_mode=480x960 framebuffer=26
    - 可选 `IN_FENCE_FD`
 5. `drmModeAtomicCommit()`
 
-当前旋转是在用户态 CPU 拷贝时完成的，提交给 DRM plane 时 plane rotation 仍设置为 rotate-0。
+旋转在用户态提交前完成：DMABuf 优先使用 RGA，SHM 或 RGA fallback 使用 CPU。
+提交给 DRM plane 时 plane rotation 仍设置为 rotate-0。
 
 ### 8.3 Legacy page flip fallback
 
@@ -1073,6 +1086,9 @@ down/move/up 按 slot 原样发给 WebKit，不生成浏览器 scroll 或 synthe
 toolbar；此时顶部热区仍可手动唤回 toolbar。网页随后通过 Fullscreen API
 进入严格全屏时，launcher 会关闭 toolbar 和所有顶部唤出热区；退出全屏后恢复
 toolbar。
+视频 socket 使用带单调 sequence 的 v2 协议。DRM 同步提交新 framebuffer 后才释放
+上一 framebuffer 并回 ACK；WebProcess 收到对应 ACK 后才释放持有的 `GstSample`。
+被合并、导入失败或未提交的帧会立即 ACK，断线和 hide 会清理全部 retained sample。
 视频采用 `WPE_VIDEO_OVERLAY_FIT=contain` 时，WPEViewDRM 会发布可见视频矩形。
 只有落在该矩形内的 panel-native 触摸才反算到 DOM 视频坐标；留黑区域和网页
 覆盖控件保持原始坐标，避免全屏按钮被夹到游戏画面边缘。raw 坐标边界固定映射
@@ -1091,7 +1107,12 @@ adb shell 'grep -E "mppvideodec|hole-punch|video overlay" \
 adb shell 'grep -E "plane\[|format=NV12|fb=|crtc-pos=" /sys/kernel/debug/dri/0/state'
 ```
 
-旋转或CPU合成路径读取DMA-BUF前会等待WPE rendering fence，并在读取区间执行
+旋转或CPU合成路径读取DMA-BUF前会等待WPE rendering fence。CPU fallback 在读取区间执行
 `DMA_BUF_IOCTL_SYNC`。`WPE_DRM_PARTIAL_COPY=0`默认强制完整帧复制；fence超时会
 丢弃未完成帧并保留上一张完整画面。每60帧的日志应检查
 `fence_timeouts=0`、`full_copies`持续增长且`partial_copies=0`。
+旋转 GPU 路径还会把完整网页帧提升为带 generation 的 CPU 底图；菜单按压、滚动
+和动画从该底图恢复后只绘制 native chrome。诊断日志中的 `page_copy_ms` 代表新网页
+帧的 DMA-BUF 读取与旋转成本，`ui_overlay_ms` 代表 UI-only 重绘成本，后者不应再次
+触发 Mali DMA-BUF map。启用 RGA 后还应看到 `rga_frames` 持续增长、
+`rga_cpu_fallback=0`，并使用 `rga_ms` 区分硬件旋转和其余 overlay 成本。

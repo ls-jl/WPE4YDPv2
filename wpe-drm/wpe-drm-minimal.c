@@ -17,6 +17,7 @@
 #include <wpe/drm/wpe-drm.h>
 #include "ChromeMotionState.h"
 #include "browser-chrome-model.h"
+#include "browser-i18n.h"
 #include "browser-navigation.h"
 #include "browser-profile-store.h"
 #include <errno.h>
@@ -166,6 +167,7 @@ typedef struct {
     gboolean suppress_history;
     guint layout_timer;
     char site_profile[16];
+    char language[8];
     BrowserCookiePolicy cookie_policy;
     char search_engine[16];
     char *custom_search_template;
@@ -310,15 +312,48 @@ static gboolean env_enabled(const char *name, gboolean default_value)
 static const char *gpu_runtime_status_label(const BrowserGlobalSettings *settings)
 {
     if (gpu_render_profile)
-        return "ACTIVE";
+        return "MALI-G52 GPU";
     if (settings && !settings->gpu_acceleration)
-        return "OFF";
+        return "SKIA CPU - GPU OFF";
     const char *status = g_getenv("WPE_GPU_STATUS");
     if (!g_strcmp0(status, "unavailable"))
-        return "UNAVAILABLE";
+        return "SKIA CPU - GPU UNAVAILABLE";
     if (!g_strcmp0(status, "fallback"))
-        return "CPU FALLBACK";
-    return "CPU FALLBACK";
+        return "SKIA CPU - GPU FALLBACK";
+    return "SKIA CPU";
+}
+
+static BrowserLanguage chrome_language(const BrowserChrome *chrome)
+{
+    return browser_language_parse(chrome ? chrome->language : NULL);
+}
+
+static const char *tr(const BrowserChrome *chrome, const char *message_id)
+{
+    return browser_i18n(chrome_language(chrome), message_id);
+}
+
+static const char *chrome_panel_title(const BrowserChrome *chrome, ChromePanel panel)
+{
+    switch (panel) {
+    case CHROME_PANEL_TABS: return tr(chrome, "tabs");
+    case CHROME_PANEL_SETTINGS: return tr(chrome, "settings");
+    case CHROME_PANEL_LANGUAGE: return tr(chrome, "language");
+    case CHROME_PANEL_APPEARANCE: return tr(chrome, "appearance");
+    case CHROME_PANEL_WEB: return tr(chrome, "web_page");
+    case CHROME_PANEL_STARTUP: return tr(chrome, "startup_search");
+    case CHROME_PANEL_SETTINGS_PRIVACY: return tr(chrome, "privacy_data");
+    case CHROME_PANEL_ABOUT: return tr(chrome, "about");
+    case CHROME_PANEL_PRIVACY: return tr(chrome, "privacy_cookies");
+    case CHROME_PANEL_CLEAR_SITE_DATA: return tr(chrome, "clear_site_data_title");
+    case CHROME_PANEL_PROFILES: return tr(chrome, "profiles");
+    case CHROME_PANEL_PROFILE_MANAGE: return tr(chrome, "profile");
+    case CHROME_PANEL_PROFILE_DELETE: return tr(chrome, "delete_profile_title");
+    case CHROME_PANEL_HISTORY: return tr(chrome, "history");
+    case CHROME_PANEL_BOOKMARKS: return tr(chrome, "bookmarks");
+    case CHROME_PANEL_CLEAR_HISTORY: return tr(chrome, "clear_history_title");
+    default: return "";
+    }
 }
 
 static gboolean parse_viewport_string(const char *value, int *width, int *height)
@@ -508,6 +543,37 @@ static const char *site_profile_user_agent(const char *profile)
         : site_profile_mobile_user_agent();
 }
 
+static char *desktop_equivalent_uri(const char *uri)
+{
+    static const struct {
+        const char *mobile_host;
+        const char *desktop_host;
+    } mappings[] = {
+        { "m.baidu.com", "www.baidu.com" },
+        { "m.bilibili.com", "www.bilibili.com" },
+        { "m.douyin.com", "www.douyin.com" },
+    };
+    if (!uri)
+        return NULL;
+
+    for (guint i = 0; i < G_N_ELEMENTS(mappings); ++i) {
+        for (guint scheme_index = 0; scheme_index < 2; ++scheme_index) {
+            const char *scheme = scheme_index ? "http://" : "https://";
+            char *prefix = g_strconcat(scheme, mappings[i].mobile_host, NULL);
+            gsize prefix_length = strlen(prefix);
+            gboolean matches = g_str_has_prefix(uri, prefix)
+                && (!uri[prefix_length] || uri[prefix_length] == '/'
+                    || uri[prefix_length] == '?' || uri[prefix_length] == '#');
+            g_free(prefix);
+            if (!matches)
+                continue;
+            return g_strdup_printf("%s%s%s", scheme, mappings[i].desktop_host,
+                                   uri + prefix_length);
+        }
+    }
+    return g_strdup(uri);
+}
+
 static void chrome_apply_site_profile(AppState *state)
 {
     if (!state || !state->web_view)
@@ -519,6 +585,28 @@ static void chrome_apply_site_profile(AppState *state)
     if (settings)
         webkit_settings_set_user_agent(settings, user_agent);
     g_print("Site profile: site_profile=%s user_agent=%s\n", profile, user_agent);
+}
+
+static void chrome_apply_language(AppState *state, gboolean reload)
+{
+    if (!state || !state->web_view)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    BrowserLanguage language = browser_language_parse(chrome->language);
+    g_strlcpy(chrome->language, browser_language_code(language), sizeof(chrome->language));
+    const char *zh_languages[] = { "zh-CN", "zh", "en-US", "en", NULL };
+    const char *en_languages[] = { "en-US", "en", NULL };
+    WebKitWebContext *context = webkit_web_view_get_context(state->web_view);
+    if (context)
+        webkit_web_context_set_preferred_languages(context,
+            language == BROWSER_LANGUAGE_EN_US ? en_languages : zh_languages);
+    g_print("Browser language applied: language=%s reload=%d\n",
+            chrome->language, reload);
+    if (reload) {
+        chrome->loading = TRUE;
+        chrome->load_progress = 0;
+        webkit_web_view_reload(state->web_view);
+    }
 }
 
 static void chrome_apply_web_preferences(AppState *state, gboolean reload)
@@ -838,16 +926,16 @@ static void chrome_refresh_pages(BrowserChrome *chrome, gboolean bookmarks)
     g_clear_error(&error);
 }
 
-static const char *cookie_policy_label(BrowserCookiePolicy policy)
+static const char *cookie_policy_label(const BrowserChrome *chrome, BrowserCookiePolicy policy)
 {
     switch (policy) {
     case BROWSER_COOKIE_NO_THIRD_PARTY:
-        return "NO THIRD PARTY";
+        return tr(chrome, "no_third_party");
     case BROWSER_COOKIE_ACCEPT_NEVER:
-        return "NEVER";
+        return tr(chrome, "never");
     case BROWSER_COOKIE_ACCEPT_ALL:
     default:
-        return "ALL";
+        return tr(chrome, "all");
     }
 }
 
@@ -905,18 +993,20 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
     g_key_file_remove_group(key_file, "panel", NULL);
     if (chrome->panel == CHROME_PANEL_NONE)
         return;
+    g_key_file_set_string(key_file, "panel", "title",
+                          chrome_panel_title(chrome, chrome->panel));
 
     if (chrome->panel == CHROME_PANEL_MENU) {
         gboolean bookmarked = !profile_runtime.guest && tab && tab->url[0]
             && browser_profile_store_has_bookmark(profile_runtime.store,
                                                   profile_runtime.profile.id, tab->url);
         g_key_file_set_string(key_file, "panel", "line0",
-                              bookmarked ? "REMOVE BOOKMARK" : "ADD BOOKMARK");
-        g_key_file_set_string(key_file, "panel", "line1", "HISTORY");
-        g_key_file_set_string(key_file, "panel", "line2", "BOOKMARKS");
-        g_key_file_set_string(key_file, "panel", "line3", "PROFILES");
-        g_key_file_set_string(key_file, "panel", "line4", "PRIVACY");
-        g_key_file_set_string(key_file, "panel", "line5", "SETTINGS");
+                              bookmarked ? tr(chrome, "remove_bookmark") : tr(chrome, "add_bookmark"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "history"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "bookmarks"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "profiles"));
+        g_key_file_set_string(key_file, "panel", "line4", tr(chrome, "privacy"));
+        g_key_file_set_string(key_file, "panel", "line5", tr(chrome, "settings"));
         line_count = 6;
         static const char *item_ids[CHROME_MENU_ITEM_COUNT] = {
             "bookmark", "history", "bookmarks", "profiles", "privacy", "settings"
@@ -960,26 +1050,35 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         g_key_file_set_boolean(key_file, "panel", "can_add",
                                chrome->tab_count < MAX_BROWSER_TABS);
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
-        g_key_file_set_string(key_file, "panel", "line0", "APPEARANCE");
-        g_key_file_set_string(key_file, "panel", "line1", "WEB PAGE");
-        g_key_file_set_string(key_file, "panel", "line2", "STARTUP & SEARCH");
-        g_key_file_set_string(key_file, "panel", "line3", "PRIVACY & DATA");
-        g_key_file_set_string(key_file, "panel", "line4", "ABOUT");
-        line_count = 5;
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "appearance"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "web_page"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "startup_search"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "privacy_data"));
+        g_key_file_set_string(key_file, "panel", "line4", tr(chrome, "language"));
+        g_key_file_set_string(key_file, "panel", "line5", tr(chrome, "about"));
+        line_count = 6;
+    } else if (chrome->panel == CHROME_PANEL_LANGUAGE) {
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "language_zh_cn"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "language_en_us"));
+        line_count = 2;
+        chrome_set_line_style(key_file, 0, "choice",
+                              !g_ascii_strcasecmp(chrome->language, "zh-CN") ? "*" : "", FALSE, "language");
+        chrome_set_line_style(key_file, 1, "choice",
+                              !g_ascii_strcasecmp(chrome->language, "en-US") ? "*" : "", FALSE, "language");
     } else if (chrome->panel == CHROME_PANEL_APPEARANCE) {
         char zoom[16];
         g_snprintf(zoom, sizeof(zoom), "%d%%", (int)lround(chrome->page_zoom * 100));
-        const char *font = chrome->default_font_size <= 14 ? "SMALL"
-            : chrome->default_font_size >= 20 ? "LARGE" : "STANDARD";
-        g_key_file_set_string(key_file, "panel", "line0", "THEME");
-        g_key_file_set_string(key_file, "panel", "line1", "TOOLBAR AUTO-HIDE");
-        g_key_file_set_string(key_file, "panel", "line2", "PAGE ZOOM");
-        g_key_file_set_string(key_file, "panel", "line3", "DEFAULT FONT");
-        g_key_file_set_string(key_file, "panel", "line4", "GPU ACCELERATION");
+        const char *font = chrome->default_font_size <= 14 ? tr(chrome, "small")
+            : chrome->default_font_size >= 20 ? tr(chrome, "large") : tr(chrome, "standard");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "theme"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "toolbar_auto_hide"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "page_zoom"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "default_font"));
+        g_key_file_set_string(key_file, "panel", "line4", tr(chrome, "gpu_acceleration"));
         line_count = 5;
         chrome_set_line_style(key_file, 0, "choice",
                               !g_ascii_strcasecmp(chrome->global_settings.theme, "dark")
-                                ? "DARK" : "LIGHT", FALSE, "theme");
+                                ? tr(chrome, "dark") : tr(chrome, "light"), FALSE, "theme");
         chrome_set_line_style(key_file, 1, "toggle", "",
                               chrome->global_settings.toolbar_auto_hide, "toolbar");
         chrome_set_line_style(key_file, 2, "choice", zoom, FALSE, "zoom");
@@ -988,19 +1087,19 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                               gpu_runtime_status_label(&chrome->global_settings),
                               chrome->global_settings.gpu_acceleration, "renderer");
     } else if (chrome->panel == CHROME_PANEL_WEB) {
-        g_key_file_set_string(key_file, "panel", "line0", "SITE MODE");
-        g_key_file_set_string(key_file, "panel", "line1", "JAVASCRIPT");
-        g_key_file_set_string(key_file, "panel", "line2", "AUTOPLAY");
-        g_key_file_set_string(key_file, "panel", "line3", "SMOOTH SCROLL");
-        g_key_file_set_string(key_file, "panel", "line4", "BLOCK POPUPS");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "site_mode"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "javascript"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "autoplay"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "smooth_scroll"));
+        g_key_file_set_string(key_file, "panel", "line4", tr(chrome, "block_popups"));
         line_count = 5;
         chrome_set_line_style(key_file, 0, "choice",
                               !g_strcmp0(normalize_site_profile(chrome->site_profile), "desktop")
-                                ? "DESKTOP" : "MOBILE", FALSE, "desktop");
+                                ? tr(chrome, "desktop") : tr(chrome, "mobile"), FALSE, "desktop");
         chrome_set_line_style(key_file, 1, "toggle", "",
                               chrome->javascript_enabled, "javascript");
         chrome_set_line_style(key_file, 2, "choice",
-                              chrome->autoplay_requires_gesture ? "USER ACTION" : "ALLOW",
+                              chrome->autoplay_requires_gesture ? tr(chrome, "user_action") : tr(chrome, "allow"),
                               FALSE, "autoplay");
         chrome_set_line_style(key_file, 3, "toggle", "",
                               chrome->smooth_scrolling, "scroll");
@@ -1010,28 +1109,28 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         const char *engine = !g_strcmp0(chrome->search_engine, "bing") ? "BING"
             : !g_strcmp0(chrome->search_engine, "google") ? "GOOGLE"
             : !g_strcmp0(chrome->search_engine, "custom") ? "CUSTOM" : "BAIDU";
-        g_key_file_set_string(key_file, "panel", "line0", "SEARCH ENGINE");
-        g_key_file_set_string(key_file, "panel", "line1", "CUSTOM SEARCH TEMPLATE");
-        g_key_file_set_string(key_file, "panel", "line2", "HOME PAGE");
-        g_key_file_set_string(key_file, "panel", "line3", "RESTORE TABS");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "search_engine"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "custom_search"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "home_page"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "restore_tabs"));
         line_count = 4;
         chrome_set_line_style(key_file, 0, "choice", engine, FALSE, "search");
         chrome_set_line_style(key_file, 1, "navigation",
                               browser_navigation_custom_search_template_valid(chrome->custom_search_template)
-                                ? "SET" : "NOT SET", FALSE, "custom");
+                                ? tr(chrome, "set") : tr(chrome, "not_set"), FALSE, "custom");
         chrome_set_line_style(key_file, 2, "navigation",
                               chrome->home_url ? chrome->home_url : default_home_url(),
                               FALSE, "home");
         chrome_set_line_style(key_file, 3, "toggle", "",
                               chrome->restore_tabs, "tabs");
     } else if (chrome->panel == CHROME_PANEL_SETTINGS_PRIVACY) {
-        g_key_file_set_string(key_file, "panel", "line0", "COOKIE POLICY");
-        g_key_file_set_string(key_file, "panel", "line1", "CLEAR COOKIES & SITE DATA");
-        g_key_file_set_string(key_file, "panel", "line2", "CLEAR CACHE");
-        g_key_file_set_string(key_file, "panel", "line3", "CLEAR HISTORY");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "cookie_policy"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "clear_site_data"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "clear_cache"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "clear_history"));
         line_count = 4;
         chrome_set_line_style(key_file, 0, "choice",
-                              cookie_policy_label(chrome->cookie_policy),
+                              cookie_policy_label(chrome, chrome->cookie_policy),
                               FALSE, "privacy");
         chrome_set_line_style(key_file, 1, "action", "", FALSE, "clear");
         chrome_set_line_style(key_file, 2, "action", "", FALSE, "cache");
@@ -1040,11 +1139,11 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         char display[64];
         g_snprintf(display, sizeof(display), "%dx%d  R%d",
                    state->panel_width, state->panel_height, state->panel_rotation);
-        g_key_file_set_string(key_file, "panel", "line0", "DIRECT WPE DRM BROWSER");
-        g_key_file_set_string(key_file, "panel", "line1", "WEBKIT RUNTIME");
-        g_key_file_set_string(key_file, "panel", "line2", "CURRENT PROFILE");
-        g_key_file_set_string(key_file, "panel", "line3", "RENDERER");
-        g_key_file_set_string(key_file, "panel", "line4", "DISPLAY");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "browser_name"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "webkit_runtime"));
+        g_key_file_set_string(key_file, "panel", "line2", tr(chrome, "current_profile"));
+        g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "renderer"));
+        g_key_file_set_string(key_file, "panel", "line4", tr(chrome, "display"));
         line_count = 5;
         chrome_set_line_style(key_file, 0, "info", "1.0", FALSE, "about");
         chrome_set_line_style(key_file, 1, "info", "2.53.3", FALSE, "webkit");
@@ -1057,18 +1156,19 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                               FALSE, "renderer");
         chrome_set_line_style(key_file, 4, "info", display, FALSE, "display");
     } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
-        snprintf(line, sizeof(line), "COOKIE POLICY %s", cookie_policy_label(chrome->cookie_policy));
+        snprintf(line, sizeof(line), "%s  %s", tr(chrome, "cookie_policy"),
+                 cookie_policy_label(chrome, chrome->cookie_policy));
         g_key_file_set_string(key_file, "panel", "line0", line);
         g_key_file_set_string(key_file, "panel", "line1",
-                              chrome->site_data_clearing ? "CLEARING SITE DATA..." : "CLEAR COOKIES & SITE DATA");
+                              chrome->site_data_clearing ? tr(chrome, "clearing_site_data") : tr(chrome, "clear_site_data"));
         line_count = 2;
         if (chrome->site_data_status[0]) {
             g_key_file_set_string(key_file, "panel", "line2", chrome->site_data_status);
             line_count = 3;
         }
     } else if (chrome->panel == CHROME_PANEL_CLEAR_SITE_DATA) {
-        g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
-        g_key_file_set_string(key_file, "panel", "line1", "CONFIRM CLEAR COOKIES & SITE DATA");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "cancel"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "confirm_clear_site_data"));
         line_count = 2;
     } else if (chrome->panel == CHROME_PANEL_PROFILES) {
         if (!chrome->panel_profiles)
@@ -1079,26 +1179,30 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
             BrowserProfile *profile = g_ptr_array_index(chrome->panel_profiles, offset + index);
             snprintf(line, sizeof(line), "line%d", line_count);
             char value[128];
+            char default_suffix[32] = { 0 };
+            if (profile->is_default)
+                snprintf(default_suffix, sizeof(default_suffix), " [%s]",
+                         tr(chrome, "default_profile"));
             snprintf(value, sizeof(value), "%c %s%s",
                      !profile_runtime.guest && profile->id == profile_runtime.profile.id ? '*' : ' ',
-                     profile->name, profile->is_default ? " [DEFAULT]" : "");
+                     profile->name, default_suffix);
             g_key_file_set_string(key_file, "panel", line, value);
             line_count++;
         }
-        g_key_file_set_string(key_file, "panel", "line4", "GUEST                 NEW PROFILE");
+        g_key_file_set_string(key_file, "panel", "line4", "");
         line_count = 5;
-        g_key_file_set_string(key_file, "panel", "line5", "PREV       NEXT       MANAGE ACTIVE");
+        g_key_file_set_string(key_file, "panel", "line5", "");
         line_count = 6;
     } else if (chrome->panel == CHROME_PANEL_PROFILE_MANAGE) {
-        snprintf(line, sizeof(line), "RENAME %s",
+        snprintf(line, sizeof(line), "%s  %s", tr(chrome, "rename"),
                  profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT");
         g_key_file_set_string(key_file, "panel", "line0", line);
         g_key_file_set_string(key_file, "panel", "line1",
-                              profile_runtime.profile.is_default ? "DELETE DISABLED (DEFAULT)" : "DELETE PROFILE");
+                              profile_runtime.profile.is_default ? tr(chrome, "delete_default_disabled") : tr(chrome, "delete_profile"));
         line_count = 2;
     } else if (chrome->panel == CHROME_PANEL_PROFILE_DELETE) {
-        g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
-        g_key_file_set_string(key_file, "panel", "line1", "CONFIRM DELETE PROFILE");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "cancel"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "confirm_delete_profile"));
         line_count = 2;
     } else if (chrome->panel == CHROME_PANEL_HISTORY
                || chrome->panel == CHROME_PANEL_BOOKMARKS) {
@@ -1110,7 +1214,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
             snprintf(line, sizeof(line), "line%d", line_count);
             char value[128];
             snprintf(value, sizeof(value), "%s%s",
-                     chrome->panel_delete_mode ? "DELETE " : "",
+                     chrome->panel_delete_mode ? tr(chrome, "delete") : "",
                      page->title && page->title[0] ? page->title : page->url);
             g_key_file_set_string(key_file, "panel", line, value);
             line_count++;
@@ -1120,15 +1224,15 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
             snprintf(line, sizeof(line), "line%d", line_count++);
             g_key_file_set_string(key_file, "panel", line, "-");
         }
-        g_key_file_set_string(key_file, "panel", "line6", "PREV PAGE                 NEXT PAGE");
+        g_key_file_set_string(key_file, "panel", "line6", "");
         g_key_file_set_string(key_file, "panel", "line7",
                               bookmarks
-                                ? (chrome->panel_delete_mode ? "DONE DELETING" : "DELETE MODE")
-                                : (chrome->panel_delete_mode ? "DONE DELETING      CLEAR HISTORY" : "DELETE MODE        CLEAR HISTORY"));
+                                ? (chrome->panel_delete_mode ? tr(chrome, "done_deleting") : tr(chrome, "delete_mode"))
+                                : "");
         line_count = 8;
     } else if (chrome->panel == CHROME_PANEL_CLEAR_HISTORY) {
-        g_key_file_set_string(key_file, "panel", "line0", "CANCEL");
-        g_key_file_set_string(key_file, "panel", "line1", "CONFIRM CLEAR HISTORY");
+        g_key_file_set_string(key_file, "panel", "line0", tr(chrome, "cancel"));
+        g_key_file_set_string(key_file, "panel", "line1", tr(chrome, "confirm_clear_history"));
         line_count = 2;
     }
 
@@ -1149,7 +1253,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
 
         if (chrome->panel == CHROME_PANEL_SETTINGS) {
             static const char *icons[] = {
-                "theme", "web", "search", "privacy", "about"
+                "theme", "web", "search", "privacy", "language", "about"
             };
             for (int index = 0; index < line_count; ++index)
                 chrome_set_line_style(key_file, index, "navigation", "",
@@ -1172,7 +1276,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                                          && !profile_runtime.profile.is_default,
                                      TRUE);
         } else if (chrome->panel == CHROME_PANEL_PROFILES) {
-            const char *row4_labels[] = { "GUEST", "NEW PROFILE" };
+            const char *row4_labels[] = { tr(chrome, "guest"), tr(chrome, "new_profile") };
             const gboolean row4_enabled[] = { TRUE, TRUE };
             const gboolean row4_danger[] = { FALSE, FALSE };
             chrome_set_segmented_line(key_file, 4, 2, row4_labels,
@@ -1180,7 +1284,7 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
             gboolean has_previous = chrome->panel_page > 0;
             gboolean has_next = chrome->panel_profiles
                 && (chrome->panel_page + 1) * 4 < chrome->panel_profiles->len;
-            const char *row5_labels[] = { "PREV", "NEXT", "MANAGE ACTIVE" };
+            const char *row5_labels[] = { tr(chrome, "previous"), tr(chrome, "next"), tr(chrome, "manage_active") };
             const gboolean row5_enabled[] = {
                 has_previous, has_next, !profile_runtime.guest
             };
@@ -1197,15 +1301,15 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
             gboolean has_previous = chrome->panel_page > 0;
             gboolean has_next = chrome->panel_pages
                 && chrome->panel_pages->len == 6;
-            const char *row6_labels[] = { "PREV PAGE", "NEXT PAGE" };
+            const char *row6_labels[] = { tr(chrome, "previous_page"), tr(chrome, "next_page") };
             const gboolean row6_enabled[] = { has_previous, has_next };
             const gboolean row6_danger[] = { FALSE, FALSE };
             chrome_set_segmented_line(key_file, 6, 2, row6_labels,
                                       row6_enabled, row6_danger);
             if (chrome->panel == CHROME_PANEL_HISTORY) {
                 const char *row7_labels[] = {
-                    chrome->panel_delete_mode ? "DONE DELETING" : "DELETE MODE",
-                    "CLEAR HISTORY"
+                    chrome->panel_delete_mode ? tr(chrome, "done_deleting") : tr(chrome, "delete_mode"),
+                    tr(chrome, "clear_history")
                 };
                 const gboolean row7_enabled[] = { TRUE, !profile_runtime.guest };
                 const gboolean row7_danger[] = { chrome->panel_delete_mode, TRUE };
@@ -1255,6 +1359,8 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_boolean(key_file, "chrome", "can_back", tab && tab->back_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "can_forward", tab && tab->forward_count > 0);
     g_key_file_set_boolean(key_file, "chrome", "touch_debug", chrome->touch_debug);
+    g_key_file_set_string(key_file, "chrome", "touch_debug_label", tr(chrome, "touch_debug"));
+    g_key_file_set_string(key_file, "chrome", "home_label", tr(chrome, "home"));
     g_key_file_set_boolean(key_file, "chrome", "page_fullscreen", state->page_fullscreen);
     g_key_file_set_integer(key_file, "chrome", "height", chrome->height);
     g_key_file_set_integer(key_file, "chrome", "tab_count", chrome->tab_count);
@@ -1398,6 +1504,7 @@ static void chrome_save_state(AppState *state)
                     .id = profile_runtime.profile.id,
                     .search_engine = chrome->search_engine,
                     .custom_search_template = chrome->custom_search_template,
+                    .language = chrome->language,
                     .page_zoom = chrome->page_zoom,
                     .default_font_size = chrome->default_font_size,
                     .javascript_enabled = chrome->javascript_enabled,
@@ -2387,7 +2494,7 @@ static gboolean on_keyboard_script_message_with_reply(
         if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
             opened = keyboard_request(state, "web_input",
                 params_get_string(params, "text", ""),
-                params_get_string(params, "placeholder", "请输入内容"),
+                params_get_string(params, "placeholder", tr(&state->chrome, "input_placeholder")),
                 params_get_string(params, "inputType", "ZhCNPreferred"),
                 params_get_int(params, "maxlength", 100),
                 params_get_bool(params, "multiLinesEditVisible", FALSE));
@@ -2483,6 +2590,50 @@ static void setup_keyboard_bridge(AppState *state)
     g_free(status_dir);
 }
 
+static void setup_site_profile_user_script(WebKitUserContentManager *manager)
+{
+    if (!manager)
+        return;
+
+    /* WPE does not expose WebKit's mobile viewport preference through the
+     * public GLib settings API. Desktop UA alone therefore leaves responsive
+     * sites at the physical 936/960 CSS-pixel width. Run before page scripts
+     * and keep the viewport meta at a desktop width whenever the active UA is
+     * not mobile. A profile switch reloads the document with the new UA, so a
+     * single immutable user script covers both modes. */
+    const char *source =
+        "(function(){"
+        "if(/(?:^|\\s)Mobile(?:\\s|$)/.test(navigator.userAgent))return;"
+        "var desktopWidth=1280,updating=false;"
+        "function apply(){"
+        " if(updating||!document.documentElement)return;"
+        " updating=true;"
+        " try{"
+        "  var meta=document.querySelector('meta[name=viewport i]');"
+        "  if(!meta){meta=document.createElement('meta');meta.name='viewport';"
+        "   (document.head||document.documentElement).appendChild(meta);"
+        "  }"
+        "  var deviceWidth=(screen&&screen.width)||innerWidth||960;"
+        "  var scale=Math.max(0.1,Math.min(1,deviceWidth/desktopWidth));"
+        "  var value='width='+desktopWidth+', initial-scale='+scale.toFixed(4)"
+        "   +', minimum-scale=0.1, maximum-scale=5, user-scalable=yes';"
+        "  if(meta.content!==value)meta.content=value;"
+        " }finally{updating=false;}"
+        "}"
+        "new MutationObserver(function(){apply();}).observe(document,{"
+        " childList:true,subtree:true,attributes:true,attributeFilter:['name','content']});"
+        "apply();document.addEventListener('DOMContentLoaded',apply,{once:true});"
+        "})();";
+    WebKitUserScript *script = webkit_user_script_new(source,
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL,
+        NULL);
+    webkit_user_content_manager_add_script(manager, script);
+    webkit_user_script_unref(script);
+    g_print("Site profile viewport script installed: desktop_width=1280\n");
+}
+
 static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppState *state)
 {
     if (!manager || !state)
@@ -2519,7 +2670,7 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "function applyText(value,commit){return new Promise(function(resolve){var el=findTarget();if(!editable(el)){resolve({applied:false,observed:'',alive:false});return;}value=String(value==null?'':value);try{applyCore(el,value);}catch(e){resolve({applied:false,observed:valueOf(el),alive:true});return;}nextFrame(function(){if(valueOf(el)!==value){try{applyCore(el,value);}catch(e){}}nextFrame(function(){var observed=valueOf(el);var applied=observed===value;if(commit&&applied){try{var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}catch(e){}}resolve({applied:applied,observed:observed,alive:editable(el)});});});});}"
         "function finish(){window.__haasKeyboardInFlight=false;window.__haasKeyboardTarget=null;window.__haasKeyboardTargetId='';}"
         "function wait(id,ack){var msg='op=wait&id='+enc(id);if(ack){msg+='&ackSequence='+enc(ack.sequence)+'&applied='+(ack.applied?'1':'0')+'&observed='+enc(ack.observed||'');}return post(msg).then(function(raw){var cmd=parse(raw);if(cmd.op==='update'||cmd.op==='commit'){var sequence=parseInt(cmd.sequence||'0',10)||0;return applyText(cmd.text||'',cmd.op==='commit').then(function(result){return wait(id,{sequence:sequence,applied:result.applied,observed:result.observed});});}if(cmd.op==='complete'||cmd.op==='expired'||cmd.op==='superseded'||cmd.op==='rejected'){finish();return;}return wait(id,null);}).catch(function(){finish();});}"
-        "function request(el){el=closestEditable(el);if(window.__haasKeyboardInFlight||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||'请输入内容';var msg='op=open&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');post(msg).then(function(raw){var opened=parse(raw);if(opened.op!=='opened'||!opened.id){finish();return;}wait(opened.id,null);}).catch(function(){finish();});}"
+        "function request(el){el=closestEditable(el);if(window.__haasKeyboardInFlight||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var fallback=(navigator.language||'').toLowerCase().indexOf('zh')===0?'请输入内容':'Enter text';var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||fallback;var msg='op=open&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');post(msg).then(function(raw){var opened=parse(raw);if(opened.op!=='opened'||!opened.id){finish();return;}wait(opened.id,null);}).catch(function(){finish();});}"
         "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var path=e.composedPath?e.composedPath():null;var el=closestEditable(path&&path.length?path[0]:e.target);if(el)setTimeout(function(){request(el);},0);},true);"
         "})();";
     WebKitUserScript *script = webkit_user_script_new(source,
@@ -2568,7 +2719,19 @@ static void chrome_toggle_site_profile(AppState *state)
     g_strlcpy(chrome->site_profile, next, sizeof(chrome->site_profile));
     g_print("Site profile changed: %s\n", next);
     chrome_save_state(state);
-    chrome_apply_web_preferences(state, TRUE);
+    chrome_apply_web_preferences(state, FALSE);
+    const char *current_uri = webkit_web_view_get_uri(state->web_view);
+    char *target_uri = !g_strcmp0(next, "desktop")
+        ? desktop_equivalent_uri(current_uri) : g_strdup(current_uri);
+    chrome->loading = TRUE;
+    chrome->load_progress = 0;
+    if (target_uri && target_uri[0] && g_strcmp0(target_uri, current_uri)) {
+        g_print("Desktop site canonicalization: %s -> %s\n",
+                current_uri ? current_uri : "(null)", target_uri);
+        webkit_web_view_load_uri(state->web_view, target_uri);
+    } else
+        webkit_web_view_reload_bypass_cache(state->web_view);
+    g_free(target_uri);
     chrome_update_render_state(state);
     chrome_request_frame(state);
 }
@@ -2652,7 +2815,7 @@ static void chrome_cycle_search_engine(AppState *state)
     else if (!g_strcmp0(chrome->search_engine, "google")) {
         if (!browser_navigation_custom_search_template_valid(chrome->custom_search_template)) {
             keyboard_request(state, "custom_search", "",
-                             "HTTPS 搜索模板，使用一个 %s", "EnUSPreferred", 512, FALSE);
+                             tr(chrome, "custom_search_placeholder"), "EnUSPreferred", 512, FALSE);
             return;
         }
         g_strlcpy(chrome->search_engine, "custom", sizeof(chrome->search_engine));
@@ -2800,7 +2963,8 @@ static void on_clear_site_data_finished(GObject *object, GAsyncResult *result, g
         WEBKIT_WEBSITE_DATA_MANAGER(object), result, &error);
     state->chrome.site_data_clearing = FALSE;
     g_strlcpy(state->chrome.site_data_status,
-              success ? "SITE DATA CLEARED" : "CLEAR FAILED",
+              success ? tr(&state->chrome, "site_data_cleared")
+                      : tr(&state->chrome, "clear_failed"),
               sizeof(state->chrome.site_data_status));
     if (success)
         g_print("Profile site data cleared: profile=%s guest=%d\n",
@@ -2903,10 +3067,22 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             CHROME_PANEL_WEB,
             CHROME_PANEL_STARTUP,
             CHROME_PANEL_SETTINGS_PRIVACY,
+            CHROME_PANEL_LANGUAGE,
             CHROME_PANEL_ABOUT,
         };
         if (row >= 0 && row < (int)G_N_ELEMENTS(panels))
             chrome_open_internal_panel(state, panels[row], TRUE);
+    } else if (chrome->panel == CHROME_PANEL_LANGUAGE) {
+        if (row == 0 || row == 1) {
+            const char *language = row == 1 ? "en-US" : "zh-CN";
+            if (g_ascii_strcasecmp(chrome->language, language)) {
+                g_strlcpy(chrome->language, language, sizeof(chrome->language));
+                g_free(profile_runtime.profile.language);
+                profile_runtime.profile.language = g_strdup(language);
+                chrome_save_state(state);
+                chrome_apply_language(state, TRUE);
+            }
+        }
     } else if (chrome->panel == CHROME_PANEL_APPEARANCE) {
         if (row == 0)
             chrome_toggle_theme(state);
@@ -2949,12 +3125,12 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
         else if (row == 1)
             keyboard_request(state, "custom_search",
                              chrome->custom_search_template,
-                             "HTTPS 搜索模板，使用一个 %s",
+                             tr(chrome, "custom_search_placeholder"),
                              "EnUSPreferred", 512, FALSE);
         else if (row == 2)
             keyboard_request(state, "home_url",
                              chrome->home_url ? chrome->home_url : default_home_url(),
-                             "设置主页 URL", "EnUSPreferred", 512, FALSE);
+                             tr(chrome, "home_url_placeholder"), "EnUSPreferred", 512, FALSE);
         else if (row == 3) {
             chrome->restore_tabs = !chrome->restore_tabs;
             chrome_save_state(state);
@@ -2967,7 +3143,7 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             chrome_open_internal_panel(state, CHROME_PANEL_CLEAR_SITE_DATA, TRUE);
         } else if (row == 2) {
             chrome_clear_cache();
-            g_strlcpy(chrome->site_data_status, "CACHE CLEARED",
+            g_strlcpy(chrome->site_data_status, tr(chrome, "cache_cleared"),
                       sizeof(chrome->site_data_status));
             chrome_save_state(state);
         } else if (row == 3 && !profile_runtime.guest) {
@@ -3009,7 +3185,7 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             if (x < panel_width / 2)
                 chrome_switch_profile(state, 0, TRUE);
             else
-                keyboard_request(state, "profile_new", "", "新建 Profile 名称",
+                keyboard_request(state, "profile_new", "", tr(chrome, "new_profile_placeholder"),
                                  "ZhCNPreferred", 20, FALSE);
         } else if (row == 5) {
             guint previous_page = chrome->panel_page;
@@ -3035,7 +3211,7 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
     } else if (chrome->panel == CHROME_PANEL_PROFILE_MANAGE) {
         if (row == 0 && !profile_runtime.guest)
             keyboard_request(state, "profile_rename", profile_runtime.profile.name,
-                             "重命名 Profile", "ZhCNPreferred", 20, FALSE);
+                             tr(chrome, "rename_profile_placeholder"), "ZhCNPreferred", 20, FALSE);
         else if (row == 1 && !profile_runtime.guest && !profile_runtime.profile.is_default) {
             chrome_open_internal_panel(state, CHROME_PANEL_PROFILE_DELETE, TRUE);
             chrome_update_render_state(state);
@@ -3297,7 +3473,7 @@ static void chrome_handle_toolbar_tap(AppState *state, double x, double y)
         chrome_save_state(state);
         chrome_request_frame(state);
         g_print("Chrome tap: edit address x=%.1f y=%.1f\n", x, y);
-        keyboard_request(state, "address", current, "输入网址或搜索",
+        keyboard_request(state, "address", current, tr(chrome, "address_placeholder"),
                          "EnUSPreferred", 512, FALSE);
         return;
     }
@@ -3469,6 +3645,9 @@ static void chrome_load_state(AppState *state, const char *initial_url)
               normalize_site_profile(profile_runtime.profile.site_profile),
               sizeof(chrome->site_profile));
     chrome->cookie_policy = profile_runtime.profile.cookie_policy;
+    g_strlcpy(chrome->language,
+              browser_language_code(browser_language_parse(profile_runtime.profile.language)),
+              sizeof(chrome->language));
     g_strlcpy(chrome->search_engine,
               profile_runtime.profile.search_engine
                 ? profile_runtime.profile.search_engine : "baidu",
@@ -3542,13 +3721,14 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     }
     g_print("Chrome profile state: name=%s guest=%d home=%s site_profile=%s cookie_policy=%s "
             "search=%s zoom=%.2f font=%u js=%d autoplay_gesture=%d smooth=%d popups_blocked=%d "
-            "restore_tabs=%d theme=%s toolbar_auto_hide=%d gpu_acceleration=%d gpu_status=%s tabs=%d active=%d\n",
+            "restore_tabs=%d language=%s theme=%s toolbar_auto_hide=%d gpu_acceleration=%d gpu_status=%s tabs=%d active=%d\n",
             profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
             profile_runtime.guest, chrome->home_url,
             chrome->site_profile, browser_cookie_policy_name(chrome->cookie_policy),
             chrome->search_engine, chrome->page_zoom, chrome->default_font_size,
             chrome->javascript_enabled, chrome->autoplay_requires_gesture,
             chrome->smooth_scrolling, chrome->block_popups, chrome->restore_tabs,
+            chrome->language,
             chrome->global_settings.theme, chrome->global_settings.toolbar_auto_hide,
             chrome->global_settings.gpu_acceleration,
             gpu_runtime_status_label(&chrome->global_settings),
@@ -4754,6 +4934,7 @@ static gboolean profile_runtime_initialize(GError **error)
         profile_runtime.profile.cookie_policy = BROWSER_COOKIE_ACCEPT_NEVER;
         profile_runtime.profile.search_engine = g_strdup("baidu");
         profile_runtime.profile.custom_search_template = g_strdup("");
+        profile_runtime.profile.language = g_strdup("zh-CN");
         profile_runtime.profile.page_zoom = 1.0;
         profile_runtime.profile.default_font_size = 16;
         profile_runtime.profile.javascript_enabled = TRUE;
@@ -4801,12 +4982,13 @@ static gboolean profile_runtime_initialize(GError **error)
     g_mkdir_with_parents(profile_runtime.root, 0700);
     chmod(profile_runtime.root, 0700);
     g_setenv("WPE_DRM_RUNTIME_DIR", profile_runtime.runtime, TRUE);
-    g_print("Browser profile: id=%" G_GINT64_FORMAT " name=%s guest=%d root=%s site_profile=%s cookie_policy=%s\n",
+    g_print("Browser profile: id=%" G_GINT64_FORMAT " name=%s guest=%d root=%s site_profile=%s cookie_policy=%s language=%s\n",
             profile_runtime.profile.id,
             profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
             profile_runtime.guest, profile_runtime.root,
             profile_runtime.profile.site_profile ? profile_runtime.profile.site_profile : "mobile",
-            browser_cookie_policy_name(profile_runtime.profile.cookie_policy));
+            browser_cookie_policy_name(profile_runtime.profile.cookie_policy),
+            browser_language_code(browser_language_parse(profile_runtime.profile.language)));
     return TRUE;
 }
 
@@ -6118,6 +6300,12 @@ int main(int argc, char **argv) {
     WebKitWebContext *context = g_object_new(WEBKIT_TYPE_WEB_CONTEXT,
         "memory-pressure-settings", memory_pressure,
         NULL);
+    const char *startup_zh_languages[] = { "zh-CN", "zh", "en-US", "en", NULL };
+    const char *startup_en_languages[] = { "en-US", "en", NULL };
+    BrowserLanguage startup_language = browser_language_parse(profile_runtime.profile.language);
+    webkit_web_context_set_preferred_languages(context,
+        startup_language == BROWSER_LANGUAGE_EN_US
+            ? startup_en_languages : startup_zh_languages);
     WebKitCacheModel cache_model = total_mb && total_mb <= 1536
         ? WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER
         : WEBKIT_CACHE_MODEL_WEB_BROWSER;
@@ -6133,8 +6321,8 @@ int main(int argc, char **argv) {
     webkit_web_context_add_path_to_sandbox(context, "/tmp", FALSE);
     const char *cache_model_log = cache_model == WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER ? "document-viewer"
         : cache_model == WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER ? "document-browser" : "web-browser";
-    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=%s total_ram=%" G_GUINT64_FORMAT "MB mem_limit=%uMB kill=0.90\n",
-        cache_model_log, total_mb, memory_limit_mb);
+    g_print("WebKit context: 2022 GLib API sandbox_paths=/userdisk,/tmp cache_model=%s language=%s total_ram=%" G_GUINT64_FORMAT "MB mem_limit=%uMB kill=0.90\n",
+        cache_model_log, browser_language_code(startup_language), total_mb, memory_limit_mb);
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_javascript(settings,
                                           profile_runtime.profile.javascript_enabled);
@@ -6253,6 +6441,7 @@ int main(int argc, char **argv) {
                 state->input_profile, state->game_input_active ? "game" : "browser",
                 initial_input_uri ? initial_input_uri : "(null)");
         chrome_apply_web_preferences(state, FALSE);
+        setup_site_profile_user_script(user_content_manager);
         setup_keyboard_bridge(state);
         setup_keyboard_user_script(user_content_manager, state);
         setup_cloud_autostart_user_script(user_content_manager, state);
@@ -6299,15 +6488,26 @@ int main(int argc, char **argv) {
 
     /* 4. Load URL */
     const char *startup_url = url;
+    char *desktop_startup_url = NULL;
     gboolean force_startup_url = env_enabled("WPE_START_URL_OVERRIDE", FALSE);
     if (!force_startup_url && state && chrome_active_tab(&state->chrome) && chrome_active_tab(&state->chrome)->url[0])
         startup_url = chrome_active_tab(&state->chrome)->url;
+    if (state && !g_strcmp0(normalize_site_profile(state->chrome.site_profile), "desktop")) {
+        desktop_startup_url = desktop_equivalent_uri(startup_url);
+        if (desktop_startup_url && desktop_startup_url[0]) {
+            if (g_strcmp0(desktop_startup_url, startup_url))
+                g_print("Desktop startup canonicalization: %s -> %s\n",
+                        startup_url, desktop_startup_url);
+            startup_url = desktop_startup_url;
+        }
+    }
     if (force_startup_url)
         g_print("Startup URL override: %s\n", startup_url);
     if (state)
         update_page_zoom_for_uri(state, startup_url);
     g_print("Loading %s...\n", startup_url);
     load_uri_preserving_local_html(web_view, startup_url);
+    g_free(desktop_startup_url);
 
     /* 5. Run GLib main loop — WPEViewDRM handles everything internally */
     main_loop = g_main_loop_new(NULL, FALSE);

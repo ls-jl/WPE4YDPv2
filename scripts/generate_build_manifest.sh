@@ -26,7 +26,7 @@ while IFS= read -r patch; do
 done < "$PATCH_ROOT/series"
 SERIES_HASH=$(hash_file "$SERIES_INPUT")
 
-WEBKIT_ELF="$STAGE/lib/libWPEWebKit-2.0.so.1.10.2"
+WEBKIT_ELF="$STAGE/lib/libWPEWebKit-2.0.so.1"
 LAUNCHER_ELF="$STAGE/wpe-drm-minimal"
 test -f "$WEBKIT_ELF"
 test -f "$LAUNCHER_ELF"
@@ -47,7 +47,7 @@ cat > "$OUTPUT.tmp" <<EOF
     "ENABLE_GPU_PROCESS": false
   },
   "artifacts": {
-    "lib/libWPEWebKit-2.0.so.1.10.2": "$(hash_file "$WEBKIT_ELF")",
+    "lib/libWPEWebKit-2.0.so.1": "$(hash_file "$WEBKIT_ELF")",
     "wpe-drm-minimal": "$(hash_file "$LAUNCHER_ELF")"
   }
 }

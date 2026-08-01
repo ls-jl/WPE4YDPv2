@@ -11,15 +11,21 @@ find assets/wpe-runtime/lib/gstreamer-1.0 -type f -name '*.so' | wc -l
 
 | Area | Size | Notes |
 | --- | ---: | --- |
-| Complete runtime | 429 MiB | Installed inside the AMR; no external runtime fallback |
-| Runtime libraries | 292 MiB | Includes WebKit, ICU, Mesa, TLS and media dependencies |
+| Complete runtime | 384 MiB | Installed inside the AMR; no external runtime fallback |
+| Runtime libraries | 247 MiB | Includes WebKit, ICU, Mesa, RGA, TLS and media dependencies |
 | Fonts | 88 MiB | 44 CJK/Latin font files |
 | GStreamer plugins | 16 MiB | 126 plugins; WebRTC/video/audio feature set retained |
 
-Largest individual files are `libWPEWebKit-2.0.so.1.10.2` (about 149 MiB),
+Largest individual files are `libWPEWebKit-2.0.so.1` (about 103 MiB stripped; upstream file version 1.10.2),
 the proprietary Mali library (about 42 MiB), ICU data (about 30 MiB), and CJK
 fonts. `swrast_dri.so` and `kms_swrast_dri.so` intentionally share an inode in
 the packaged filesystem where hard links are preserved.
+
+The WebKit runtime intentionally has no `.so` or `.so.1.10.2` aliases. Falcon
+dereferences symlinks while creating an AMR, so aliases would become duplicate
+archive entries and separate files after installation. `librga.so.2` is also
+packaged as one regular file and is loaded only through its explicit package
+path.
 
 ## Retention Rules
 

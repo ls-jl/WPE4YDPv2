@@ -9,6 +9,7 @@ WEBKIT_BASE="${WEBKIT_BASE:-$WPE_ROOT/WebKit}"
 WEBKIT_WORKTREE="${WEBKIT_WORKTREE:-$WPE_ROOT/worktrees/webkit-production}"
 WEBKIT_SOURCE="$WEBKIT_WORKTREE"
 WEBKIT_BUILD="${WEBKIT_BUILD:-$WPE_ROOT/build-drm-aarch64-production}"
+REFERENCE_CACHE="${REFERENCE_CACHE:-$WPE_ROOT/build-drm-aarch64-deb12/CMakeCache.txt}"
 FULL_PREFIX="${FULL_PREFIX:-$BASE/deps-aarch64-fullfat}"
 PREFIX="${WEBRTC_PREFIX:-$BASE/deps-aarch64-webrtc}"
 WORK="${WEBRTC_WORK:-$BASE/build/webrtc-runtime}"
@@ -162,7 +163,12 @@ if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdtls.so" ] || \
 fi
 
 existing_cache_flag() {
-  sed -n "s/^$1:[^=]*=//p" "$WEBKIT_BUILD/CMakeCache.txt" | head -n 1
+  local cache="$REFERENCE_CACHE"
+  [ -f "$cache" ] || {
+    echo "Missing validated WebKit CMake cache: $cache" >&2
+    return 1
+  }
+  sed -n "s/^$1:[^=]*=//p" "$cache" | head -n 1
 }
 EXE_FLAGS="$(existing_cache_flag CMAKE_EXE_LINKER_FLAGS)"
 SHARED_FLAGS="$(existing_cache_flag CMAKE_SHARED_LINKER_FLAGS)"
@@ -173,12 +179,33 @@ case "$SHARED_FLAGS" in *"$PREFIX/lib"*) ;; *) SHARED_FLAGS="$SHARED_FLAGS -L$PR
 case "$C_FLAGS" in *"-I$PREFIX/include"*) ;; *) C_FLAGS="-I$PREFIX/include $C_FLAGS" ;; esac
 case "$CXX_FLAGS" in *"-I$PREFIX/include"*) ;; *) CXX_FLAGS="-I$PREFIX/include $CXX_FLAGS" ;; esac
 
+CMAKE_FEATURE_ARGS=()
+while IFS= read -r cache_entry; do
+  name="${cache_entry%%:*}"
+  value="${cache_entry#*=}"
+  CMAKE_FEATURE_ARGS+=("-D$name=$value")
+done < <(grep -E '^(ENABLE_|USE_)[A-Za-z0-9_]*:(BOOL|STRING)=' "$REFERENCE_CACHE")
+
 if [ "${SKIP_WEBKIT_BUILD:-0}" != 1 ]; then
-  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cmake -S "$WEBKIT_SOURCE" -B "$WEBKIT_BUILD" \
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cmake -S "$WEBKIT_SOURCE" -B "$WEBKIT_BUILD" -GNinja \
+    -DPORT=WPE \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_C_COMPILER=/usr/bin/clang \
+    -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+    -DCMAKE_C_COMPILER_TARGET=aarch64-buildroot-linux-gnu \
+    -DCMAKE_CXX_COMPILER_TARGET=aarch64-buildroot-linux-gnu \
+    -DCMAKE_SYSROOT="$DEB_SYSROOT" \
+    -DCMAKE_FIND_ROOT_PATH="$FULL_PREFIX;$DEB_SYSROOT" \
+    -DGLIB_COMPILE_RESOURCES_EXECUTABLE=/usr/bin/glib-compile-resources \
+    "${CMAKE_FEATURE_ARGS[@]}" \
+    -DPGO_PROFILE_PATH="$(existing_cache_flag PGO_PROFILE_PATH)" \
     -DENABLE_WEB_RTC=ON \
     -DUSE_GSTREAMER_WEBRTC=ON \
     -DENABLE_MEDIA_STREAM=ON \
     -DENABLE_VIDEO=ON \
+    -DENABLE_SPEECH_SYNTHESIS=OFF \
     -DUSE_LIBRICE=OFF \
     -DENABLE_GPU_PROCESS=OFF \
     -DENABLE_WEBGL=ON \
@@ -209,9 +236,10 @@ COMMON_LIBS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH" pkg-config --libs glib-2.0 gob
   -I"$WEBKIT_SOURCE/Source/WebKit/UIProcess/API" \
   -I"$WEBKIT_SOURCE/Source/WebKit/WPEPlatform" \
   $COMMON_CFLAGS \
-  "$WPE_ROOT/wpe-drm-minimal.c" "$WPE_ROOT/browser-chrome-model.c" \
-  "$WPE_ROOT/browser-navigation.c" \
-  "$WPE_ROOT/browser-profile-store.c" \
+  "$PROJECT_ROOT/wpe-drm/wpe-drm-minimal.c" "$PROJECT_ROOT/wpe-drm/browser-chrome-model.c" \
+  "$PROJECT_ROOT/wpe-drm/browser-i18n.c" \
+  "$PROJECT_ROOT/wpe-drm/browser-navigation.c" \
+  "$PROJECT_ROOT/wpe-drm/browser-profile-store.c" \
   -o "$WPE_ROOT/wpe-drm-minimal" \
   -L"$WEBKIT_BUILD/lib" -L"$FULL_PREFIX/lib" -L"$PREFIX/lib" \
   -L"$DEVICE_CXX" -Wl,-rpath-link,"$WEBKIT_BUILD/lib" \
@@ -245,7 +273,8 @@ for plugin in libgstnice.so libgstrtp.so libgstrtpmanager.so libgstsrtp.so \
   cp -a "$PREFIX/lib/gstreamer-1.0/$plugin" "$STAGE/lib/gstreamer-1.0/"
 done
 
-cp -a "$WEBKIT_BUILD/lib/libWPEWebKit-2.0.so.1.10.2" "$STAGE/lib/"
+cp -a "$WEBKIT_BUILD/lib/libWPEWebKit-2.0.so.1.10.2" \
+  "$STAGE/lib/libWPEWebKit-2.0.so.1"
 cp -a "$WEBKIT_BUILD/bin/WPEWebProcess" "$STAGE/libexec/wpe-webkit-2.0/"
 cp -a "$WEBKIT_BUILD/bin/WPENetworkProcess" "$STAGE/libexec/wpe-webkit-2.0/"
 cp -a "$WPE_ROOT/wpe-drm-minimal" "$STAGE/"
@@ -254,5 +283,5 @@ PROJECT_ROOT="$PROJECT_ROOT" WEBRTC_STAGE="$STAGE" \
   "$PROJECT_ROOT/scripts/generate_build_manifest.sh"
 
 find "$STAGE" -type f -exec chmod go-w {} +
-file "$STAGE/lib/libWPEWebKit-2.0.so.1.10.2" "$STAGE/wpe-drm-minimal"
+file "$STAGE/lib/libWPEWebKit-2.0.so.1" "$STAGE/wpe-drm-minimal"
 echo "WebRTC runtime stage: $STAGE"
