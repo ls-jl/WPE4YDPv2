@@ -1,0 +1,185 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -2941,7 +2941,14 @@
+     uint32_t chromeBaseWidth { 0 };
+     uint32_t chromeBaseHeight { 0 };
+     uint32_t chromeBasePitch { 0 };
++    Vector<uint8_t> preparedChromeBasePixels;
++    uint32_t preparedChromeBaseWidth { 0 };
++    uint32_t preparedChromeBaseHeight { 0 };
++    uint32_t preparedChromeBasePitch { 0 };
++    guint64 preparedBaseGeneration { 0 };
++    guint64 nextBaseGeneration { 0 };
+     guint64 chromeBaseGeneration { 0 };
++    guint64 staleChromeRedrawCount { 0 };
+     gint64 pageCopyWindowTotalUS { 0 };
+     gint64 pageCopyWindowMaxUS { 0 };
+     guint64 pageCopyWindowCount { 0 };
+@@ -2985,6 +2992,18 @@
+         priv->pendingScanoutBuffer = nullptr;
+     }
+ 
++    // A page snapshot becomes eligible for chrome-only redraws only after the
++    // corresponding scanout has completed its page flip. Publishing it while
++    // the atomic commit is still pending lets UI animation resurrect a frame
++    // that was never actually visible and produces alternating scroll states.
++    if (committedWebFrame && priv->preparedBaseGeneration) {
++        priv->chromeBasePixels = WTF::move(priv->preparedChromeBasePixels);
++        priv->chromeBaseWidth = std::exchange(priv->preparedChromeBaseWidth, 0);
++        priv->chromeBaseHeight = std::exchange(priv->preparedChromeBaseHeight, 0);
++        priv->chromeBasePitch = std::exchange(priv->preparedChromeBasePitch, 0);
++        priv->chromeBaseGeneration = std::exchange(priv->preparedBaseGeneration, 0);
++    }
++
+     // Chrome-only redraws now use the same page-flip lifecycle as WebKit frames,
+     // but they must not be counted as newly rendered WebKit buffers.
+     if (!committedWebFrame)
+@@ -3002,11 +3021,12 @@
+     auto commitAverageMS = priv->commitWindowCount ? priv->commitWindowTotalUS / 1000. / priv->commitWindowCount : 0.;
+     auto rgaAverageMS = priv->rgaRotateWindowCount
+         ? priv->rgaRotateWindowTotalUS / 1000. / priv->rgaRotateWindowCount : 0.;
+-    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f base_generation=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
++    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f prepared_generation=%" G_GUINT64_FORMAT " committed_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+         fps, copyAverageMS, priv->copyWindowMaxUS / 1000., rgaAverageMS,
+         priv->rgaRotateWindowMaxUS / 1000., priv->rgaRotateWindowCount,
+         priv->rgaCPUFallbackWindowCount, commitAverageMS, priv->commitWindowMaxUS / 1000.,
+-        priv->chromeBaseGeneration, priv->retainedBaseFrameCount, priv->queuedWindowCount,
++        priv->preparedBaseGeneration, priv->chromeBaseGeneration,
++        priv->staleChromeRedrawCount, priv->retainedBaseFrameCount, priv->queuedWindowCount,
+         priv->replacedQueuedWindowCount, priv->droppedWindowCount,
+         priv->statsWindowFrameCount, priv->frameCount, priv->pageFlipCount);
+ 
+@@ -3029,6 +3049,7 @@
+     priv->rgaRotateWindowCount = 0;
+     priv->rgaCPUFallbackWindowCount = 0;
+     priv->retainedBaseFrameCount = 0;
++    priv->staleChromeRedrawCount = 0;
+ }
+ 
+ static void wpeViewDRMQueueBuffer(WPEViewDRM* view, WPEBuffer* buffer, const WPERectangle* damageRects, guint nDamageRects)
+@@ -3253,15 +3274,19 @@
+ 
+         if (stateChanged || animationActive || rotationChanged)
+             videoOverlayRecommit(view);
+-        if (priv->chromeMotionPending && priv->committedBuffer
+-            && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
++        bool webFrameWaiting = priv->pendingBuffer || priv->queuedBuffer
++            || priv->frameThrottleSource
++            || priv->updateFlags.containsAny({ UpdateFlags::BufferUpdateRequested,
++                UpdateFlags::BufferUpdatePending });
++        if (priv->chromeMotionPending && priv->committedBuffer && !webFrameWaiting) {
+             if (wpeViewDRMRequestUpdate(view, nullptr)) {
+                 priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
+                 wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
+                 priv->chromeMotionPending = false;
+                 priv->chromeOverlayCommits++;
+             }
+-        }
++        } else if (priv->chromeMotionPending && webFrameWaiting)
++            priv->staleChromeRedrawCount++;
+ 
+         gint64 nowUS = g_get_monotonic_time();
+         gint64 elapsedUS = nowUS - priv->chromeMotionStatsStartUS;
+@@ -3454,18 +3479,23 @@
+ struct VideoOverlayWireMessage;
+ static void videoOverlayPunchActiveHole(WPEViewDRM*, DRMScanoutBuffer*);
+ 
+-static bool cacheChromeBase(WPEViewDRM* view, DRMScanoutBuffer* buffer)
++static bool prepareChromeBase(WPEViewDRM* view, DRMScanoutBuffer* buffer)
+ {
+     auto* priv = view->priv;
++    priv->preparedChromeBasePixels.clear();
++    priv->preparedChromeBaseWidth = 0;
++    priv->preparedChromeBaseHeight = 0;
++    priv->preparedChromeBasePitch = 0;
++    priv->preparedBaseGeneration = 0;
+     uint32_t width = 0;
+     uint32_t height = 0;
+     uint32_t pitch = 0;
+-    if (!buffer || !buffer->copyBaseTo(priv->chromeBasePixels, width, height, pitch))
++    if (!buffer || !buffer->copyBaseTo(priv->preparedChromeBasePixels, width, height, pitch))
+         return false;
+-    priv->chromeBaseWidth = width;
+-    priv->chromeBaseHeight = height;
+-    priv->chromeBasePitch = pitch;
+-    priv->chromeBaseGeneration++;
++    priv->preparedChromeBaseWidth = width;
++    priv->preparedChromeBaseHeight = height;
++    priv->preparedChromeBasePitch = pitch;
++    priv->preparedBaseGeneration = ++priv->nextBaseGeneration;
+     return true;
+ }
+ 
+@@ -3500,7 +3530,7 @@
+         } else if (!candidate->copyFromSHM(buffer, error))
+             return nullptr;
+ 
+-        cacheChromeBase(view, candidate.get());
++        prepareChromeBase(view, candidate.get());
+         composeNativeChrome(view, candidate.get());
+         priv->nextSHMScanoutBufferIndex = (index + 1) % priv->shmScanoutBuffers.size();
+         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMDumb);
+@@ -3535,7 +3565,7 @@
+         } else if (!candidate->copyRotatedFromDMABuf(device, buffer, rotation, error))
+             return nullptr;
+ 
+-        cacheChromeBase(view, candidate.get());
++        prepareChromeBase(view, candidate.get());
+         composeNativeChrome(view, candidate.get());
+         candidate->finishRGAAccess();
+         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
+@@ -3568,7 +3598,7 @@
+         } else if (!candidate->copyRotatedFromSHM(buffer, rotation, error))
+             return nullptr;
+ 
+-        cacheChromeBase(view, candidate.get());
++        prepareChromeBase(view, candidate.get());
+         composeNativeChrome(view, candidate.get());
+         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
+         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMRotatedDumb);
+@@ -4790,6 +4820,11 @@
+         wpe_view_buffer_released(WPE_VIEW(view), priv->pendingBuffer.get());
+     priv->pendingBuffer = nullptr;
+     priv->pendingScanoutBuffer = nullptr;
++    priv->preparedChromeBasePixels.clear();
++    priv->preparedChromeBaseWidth = 0;
++    priv->preparedChromeBaseHeight = 0;
++    priv->preparedChromeBasePitch = 0;
++    priv->preparedBaseGeneration = 0;
+     priv->damageRects.clear();
+     priv->lastUpdateDroppedBuffer = true;
+     priv->forceFullDamageNextFrame = true;
+@@ -4808,7 +4843,12 @@
+                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb
+                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMDumb
+                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::ChromeDumb)));
+-    bool uiOnlyRedraw = !priv->pendingBuffer && needsScanoutRebuild
++    bool webFrameWaiting = priv->pendingBuffer || priv->queuedBuffer
++        || priv->frameThrottleSource
++        || priv->updateFlags.contains(UpdateFlags::BufferUpdatePending);
++    if (!priv->pendingBuffer && webFrameWaiting)
++        needsScanoutRebuild = false;
++    bool uiOnlyRedraw = !webFrameWaiting && needsScanoutRebuild
+         && !priv->chromeBasePixels.isEmpty();
+     if (priv->pendingBuffer || needsScanoutRebuild) {
+         UnixFileDescriptor renderingFence;
+@@ -4897,8 +4937,17 @@
+         if (result && drmBuffer)
+             priv->lastFrameCommitUS = commitStartUS;
+         priv->lastCommitWasSynchronous = result && bufferUsesSynchronousCommit(drmBuffer);
+-        if (!result && !priv->pendingBuffer)
+-            priv->pendingScanoutBuffer = nullptr;
++        if (!result) {
++            if (!priv->pendingBuffer)
++                priv->pendingScanoutBuffer = nullptr;
++            else {
++                priv->preparedChromeBasePixels.clear();
++                priv->preparedChromeBaseWidth = 0;
++                priv->preparedChromeBaseHeight = 0;
++                priv->preparedChromeBasePitch = 0;
++                priv->preparedBaseGeneration = 0;
++            }
++        }
+         return result;
+     }
+ 

@@ -1025,6 +1025,7 @@ void browser_profile_store_get_global_settings(BrowserProfileStore *store,
     memset(settings, 0, sizeof(*settings));
     g_strlcpy(settings->theme, "light", sizeof(settings->theme));
     settings->toolbar_auto_hide = TRUE;
+    settings->toolbar_gesture_in_immersive = TRUE;
     settings->gpu_acceleration = TRUE;
     if (!store)
         return;
@@ -1041,6 +1042,15 @@ void browser_profile_store_get_global_settings(BrowserProfileStore *store,
             || !g_ascii_strcasecmp(auto_hide, "on");
     }
     g_free(auto_hide);
+    char *gesture_in_immersive = get_meta(store, "toolbar_gesture_in_immersive");
+    if (gesture_in_immersive) {
+        settings->toolbar_gesture_in_immersive =
+            !g_ascii_strcasecmp(gesture_in_immersive, "1")
+            || !g_ascii_strcasecmp(gesture_in_immersive, "true")
+            || !g_ascii_strcasecmp(gesture_in_immersive, "yes")
+            || !g_ascii_strcasecmp(gesture_in_immersive, "on");
+    }
+    g_free(gesture_in_immersive);
     char *gpu_acceleration = get_meta(store, "gpu_acceleration");
     if (gpu_acceleration) {
         settings->gpu_acceleration =
@@ -1062,6 +1072,8 @@ gboolean browser_profile_store_save_global_settings(BrowserProfileStore *store,
                     !g_ascii_strcasecmp(settings->theme, "dark") ? "dark" : "light", error)
         && set_meta(store, "toolbar_auto_hide",
                     settings->toolbar_auto_hide ? "1" : "0", error)
+        && set_meta(store, "toolbar_gesture_in_immersive",
+                    settings->toolbar_gesture_in_immersive ? "1" : "0", error)
         && set_meta(store, "gpu_acceleration",
                     settings->gpu_acceleration ? "1" : "0", error);
 }

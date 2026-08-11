@@ -20,13 +20,47 @@ static void test_panel_definitions(void)
     g_assert_cmpint(chrome_panel_from_name("unknown"), ==, CHROME_PANEL_NONE);
     g_assert_cmpint(chrome_panel_parent(CHROME_PANEL_APPEARANCE), ==,
                     CHROME_PANEL_SETTINGS);
+    g_assert_cmpuint(chrome_panel_default_line_count(
+                         CHROME_PANEL_APPEARANCE), ==, 6);
     g_assert_false(chrome_panel_is_overflow_stack(CHROME_PANEL_TABS));
     g_assert_true(chrome_panel_is_internal_list(CHROME_PANEL_HISTORY));
+}
+
+static void test_toolbar_geometry(void)
+{
+    BrowserChromeToolbarGeometry landscape =
+        browser_chrome_toolbar_geometry(936, 280, 44, 80, 5);
+    g_assert_false(landscape.stacked);
+    g_assert_cmpint(landscape.height, ==, 44);
+    g_assert_cmpint(landscape.address_y, ==, landscape.controls_y);
+    g_assert_cmpint(landscape.controls_x + landscape.controls_width, <=, 936);
+
+    BrowserChromeToolbarGeometry portrait =
+        browser_chrome_toolbar_geometry(280, 936, 44, 80, 5);
+    g_assert_true(portrait.stacked);
+    g_assert_cmpint(portrait.height, ==, 80);
+    g_assert_cmpint(portrait.address_x, >=, 0);
+    g_assert_cmpint(portrait.address_x + portrait.address_width, <=, 280);
+    g_assert_cmpint(portrait.controls_x, >=, 0);
+    g_assert_cmpint(portrait.controls_x + portrait.controls_width, <=, 280);
+    g_assert_cmpint(portrait.address_y + portrait.address_height,
+                    <, portrait.controls_y);
+    for (int index = 0; index < 5; ++index) {
+        double center_x = portrait.controls_x
+            + portrait.controls_width * (index + 0.5) / 5.0;
+        double center_y = portrait.controls_y
+            + portrait.controls_height / 2.0;
+        g_assert_cmpint(browser_chrome_toolbar_button_at(
+                            &portrait, center_x, center_y), ==, index);
+    }
+    g_assert_cmpint(browser_chrome_toolbar_button_at(
+                        &portrait, 140, portrait.address_y + 10), ==, -1);
 }
 
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/browser/chrome/panel-definitions", test_panel_definitions);
+    g_test_add_func("/browser/chrome/toolbar-geometry", test_toolbar_geometry);
     return g_test_run();
 }

@@ -1,0 +1,17 @@
+diff --git a/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp b/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp
+index 8864422f..491b6d50 100644
+--- a/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp
++++ b/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp
+@@ -359,6 +359,12 @@ void AudioFileReader::plugDeinterleave(GstPad* pad)
+     GstElement* capsFilter = gst_element_factory_make("capsfilter", nullptr);
+     m_deInterleave = makeGStreamerElement("deinterleave"_s, "deinterleave"_s);
+ 
++    if (!audioConvert || !audioResample || !capsFilter || !m_deInterleave) {
++        GST_ERROR_OBJECT(m_pipeline.get(), "WebAudio decode pipeline is missing audioconvert, audioresample, capsfilter, or deinterleave");
++        m_errorOccurred = true;
++        return;
++    }
++
+     g_object_set(m_deInterleave.get(), "keep-positions", TRUE, nullptr);
+     g_signal_connect_swapped(m_deInterleave.get(), "pad-added", G_CALLBACK(deinterleavePadAddedCallback), this);
+     g_signal_connect_swapped(m_deInterleave.get(), "no-more-pads", G_CALLBACK(deinterleaveReadyCallback), this);

@@ -1,0 +1,19 @@
+diff --git a/Source/WebCore/html/ImageBitmap.cpp b/Source/WebCore/html/ImageBitmap.cpp
+index 4af6c685..ce52791c 100644
+--- a/Source/WebCore/html/ImageBitmap.cpp
++++ b/Source/WebCore/html/ImageBitmap.cpp
+@@ -860,7 +860,13 @@ void ImageBitmap::createFromBuffer(ScriptExecutionContext& scriptExecutionContex
+     auto observer = ImageBitmapImageObserver::create(mimeType, expectedContentLength, sourceURL);
+     auto image = BitmapImage::create(observer.ptr());
+     auto result = image->setData(sharedBuffer.copyRef(), true);
+-    if (result != EncodedDataStatus::Complete || image->isNull()) {
++    // Some incremental decoders report SizeAvailable after all encoded bytes
++    // have been supplied and only materialize the first frame on demand. Blob
++    // backed createImageBitmap() is synchronous at this point, so force that
++    // first decode before rejecting otherwise valid PNG/WebP/AVIF resources.
++    RefPtr nativeImage = result == EncodedDataStatus::Error
++        ? nullptr : image->currentNativeImage();
++    if (!nativeImage || image->isNull()) {
+         completionHandler(Exception { ExceptionCode::InvalidStateError, "Cannot decode the data in the argument to createImageBitmap"_s });
+         return;
+     }

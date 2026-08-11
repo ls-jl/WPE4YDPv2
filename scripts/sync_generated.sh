@@ -74,10 +74,14 @@ for runtime_file in \
   lib/libgstsctp-1.0.so.0.2212.0 \
   lib/libgstwebrtc-1.0.so.0.2212.0 \
   lib/libgstwebrtcnice-1.0.so.0.2212.0 \
+  lib/libavif.so.16 \
+  lib/libdav1d.so.7 \
   lib/librga.so.2 \
   lib/gstreamer-1.0/libgstnice.so \
   lib/gstreamer-1.0/libgstrtp.so \
   lib/gstreamer-1.0/libgstrtpmanager.so \
+  lib/gstreamer-1.0/libgstinterleave.so \
+  lib/gstreamer-1.0/libgstdeinterlace.so \
   lib/gstreamer-1.0/libgstsrtp.so \
   lib/gstreamer-1.0/libgstdtls.so \
   lib/gstreamer-1.0/libgstsctp.so \

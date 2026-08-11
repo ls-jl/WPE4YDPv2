@@ -17,7 +17,7 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
 - **KMS overlay direct video output (hole-punch)**: `mppvideodec` VPU hardware decoding + RGA hardware pre-rotation output NV12 dmabuf, delivered to the UI process via a unix socket and placed on an idle Esmart overlay plane for direct scan-out.
 - **WebRTC cloud-gaming path**: WebKit uses the GStreamer PeerConnection backend with bundled ICE/DTLS/SRTP/SCTP/RTP/Opus support. Remote media and DataChannels are allowed while microphone, camera, and screen capture are denied. Cloud Genshin hosts automatically use native multi-touch `game` input.
 - **Kernel deeply customized per device model**: `-mcpu=cortex-a53` + ThinLTO + **PGO** (profile-use from real-device workload sampling on Douyin/Bilibili/Baidu, etc.); trimmed SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS and more.
-- **Low-memory self-protection**: memory limit dynamically set at 68% of physical RAM (673MB on 1GB devices, kill threshold 0.92); a crash circuit breaker automatically returns to the home page if the same URL is killed 3 times within 120 seconds; per-SourceBuffer MSE buffer caps.
+- **Low-memory self-protection**: startup headroom selects a unified `448/512/640MB` profile. The 1GB balanced profile reclaims at 40%/58% and terminates the WebProcess only at 96%, preventing premature termination while system headroom remains. A repeated limit breach shows a retry page instead of looping reloads.
 - **Low-risk memory policy**: global swappiness and `drop_caches` remain untouched by default. System-wide experiments are available only through explicit diagnostic switches.
 - **Mobile UA + per-site profiles**: defaults to an Android Chrome UA; supports switching between desktop/mobile profiles per site.
 - **Persistent user profiles and cookies**: up to eight persistent profiles plus Guest. Cookies, LocalStorage, IndexedDB, service workers, cache, tabs, history, bookmarks, and site mode are isolated. Browser metadata uses SQLite WAL; each profile has its own WebKit SQLite CookieJar.
@@ -72,13 +72,16 @@ Writable data lives under `$dataDir/browser/`: `wpe-drm.log`, `browser.sqlite3` 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `WPE_VIDEO_OVERLAY` | `1` | KMS overlay direct video output; `0` falls back to the software path |
-| `WPE_CHROME_LAYOUT` | `inset` | How the toolbar makes room; `resize` is for debugging only |
+| `WPE_CHROME_LAYOUT` | `resize` | Resizes the page viewport while the toolbar is visible so page content is not covered |
 | `WPE_USE_SYSTEM_GST` | `0` | When `1`, appends the system GStreamer plugin directory (for debugging) |
 | `WPE_GPU_MODE` | `auto` | `auto` falls back to CPU, `off` forces CPU, `required` fails if GPU is unavailable |
 | `WPE_GPU_MODE_FILE` | `$WPE_VAR_DIR/gpu-mode` | Pre-launch mirror for the Settings GPU toggle: `auto` enables it and `off` disables it |
 | `WPE_WEBRTC` | `1` | Enables the GStreamer WebRTC backend |
 | `WPE_WEBRTC_CAPTURE` | `deny` | Local capture policy; production must keep this at `deny` |
+| `WEBKIT_GST_FORCE_DEFAULT_ALSA_SINK` | `1` | Routes browser audio through the system `default` ALSA PCM and its volume policy |
+| `WEBKIT_GST_SYSTEM_VOLUME_MUTE_BRIDGE` | `1` | Applies true mute before the WebRTC direct sink when the system Master reaches its minimum |
 | `WPE_INPUT_PROFILE` | `auto` | Selects `browser/game` by host; game mode never converts drags to scrolls |
+| `WPE_CHROME_GESTURE_*` | `28px/48px/160ms/350ms/800ms/500ms` | Two-finger triple-tap movement, position, pair-down, tap, gap, and quiet-period thresholds |
 | `WPE_PROFILE_OVERRIDE` | empty | `guest` or a persistent profile ID; leave empty to restore the last persistent profile |
 | `WPE_BROWSER_DB` | `$WPE_VAR_DIR/browser.sqlite3` | Browser profile metadata database |
 | `WPE_DRM_FENCE_TIMEOUT_MS` | `2000` | Rendering-fence timeout before a CPU DMA-BUF read |
@@ -87,7 +90,12 @@ Writable data lives under `$dataDir/browser/`: `wpe-drm.log`, `browser.sqlite3` 
 | `WPE_TOUCH_HORIZONTAL_SCROLL` | `1` | Horizontal swiping on wide pages |
 | `WEBKIT_SKIA_ENABLE_CPU_RENDERING` | `1` | Native Skia CPU rasterization (avoid falling back to software GL emulation) |
 | `WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS` | `30` | Compositing frame rate cap |
-| `MSE_MAX_BUFFER_SIZE` | `V:40M,A:8M` | MSE per-SourceBuffer buffer cap |
+| `WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS` | `0` | Diagnostic animation full-repaint switch; disabled in production to avoid repainting games in full every frame |
+| `WPE_MEMORY_PROFILE` | adaptive | `conservative/balanced/large` jointly selects WebProcess, JSC, MSE, and pressure thresholds |
+| `WPE_WEB_PROCESS_MEMORY_LIMIT_MB` | `448/512/640` | Selected from RAM, startup headroom, and swap; explicit overrides are range checked |
+| `WPE_WEB_PROCESS_MEMORY_KILL_PERCENT` | `80/96/90` | Final `conservative/balanced/large` termination level; normal and strict reclamation run first |
+| `WEBKIT_SYSTEM_MEMORY_PRESSURE_PERCENT` | `80/82/85` | System warning threshold by profile; critical defaults to `88/90/93` |
+| `MSE_MAX_BUFFER_SIZE` | adaptive | Per-SourceBuffer cap of `V:24M,A:4M`, `V:32M,A:6M`, or `V:40M,A:8M` |
 
 ## Device Debugging
 

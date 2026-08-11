@@ -61,6 +61,14 @@ static void test_profile_store(void)
     g_assert_cmpstr(active.site_profile, ==, "desktop");
     g_assert_cmpstr(active.language, ==, "zh-CN");
 
+    BrowserGlobalSettings global = { 0 };
+    browser_profile_store_get_global_settings(store, &global);
+    g_assert_true(global.toolbar_auto_hide);
+    g_assert_true(global.toolbar_gesture_in_immersive);
+    global.toolbar_gesture_in_immersive = FALSE;
+    g_assert_true(browser_profile_store_save_global_settings(store, &global, &error));
+    g_assert_no_error(error);
+
     guint next_id = 0;
     GPtrArray *loaded = browser_profile_store_load_tabs(store, active.id, &next_id, &error);
     g_assert_no_error(error);
@@ -135,6 +143,8 @@ static void test_profile_store(void)
     g_assert_cmpint(restored.cookie_policy, ==, BROWSER_COOKIE_NO_THIRD_PARTY);
     g_assert_cmpstr(restored.language, ==, "en-US");
     browser_profile_clear(&restored);
+    browser_profile_store_get_global_settings(store, &global);
+    g_assert_false(global.toolbar_gesture_in_immersive);
 
     int64_t fallback_id = 0;
     g_assert_true(browser_profile_store_prepare_delete_profile(store, second_id,

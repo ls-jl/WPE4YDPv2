@@ -27,6 +27,12 @@ function rotateByDelta(rotation, delta) {
   return normalizeRotationValue((Number(rotation) + Number(delta)) % 360, normalizeRotationValue(rotation, 0))
 }
 
+function rotationDelta(fromRotation, toRotation) {
+  const from = normalizeRotationValue(fromRotation, 0)
+  const to = normalizeRotationValue(toRotation, from)
+  return (to - from + 360) % 360
+}
+
 function parseSizeSpec(value) {
   if (!value) return null
   if (typeof value === 'object') {
@@ -49,13 +55,39 @@ function sizeSpec(size) {
   return size && size.width > 0 && size.height > 0 ? `${size.width}x${size.height}` : ''
 }
 
-function normalizeForRotation(size, rotation) {
+function normalizeForRotation(size, rotationDeltaValue) {
   if (!size) return null
-  const rotated = Number(rotation) === 90 || Number(rotation) === 270
-  if (rotated && size.width < size.height) {
-    return { width: size.height, height: size.width }
-  }
+  const rotated = Number(rotationDeltaValue) === 90 || Number(rotationDeltaValue) === 270
+  if (rotated) return { width: size.height, height: size.width }
   return { width: size.width, height: size.height }
+}
+
+function rotatedFramebufferSize(panel, rotation) {
+  if (!panel) return null
+  const swapped = Number(rotation) === 90 || Number(rotation) === 270
+  return swapped
+    ? { width: panel.height, height: panel.width }
+    : { width: panel.width, height: panel.height }
+}
+
+function orientation(size) {
+  if (!size || size.width === size.height) return 'square'
+  return size.width > size.height ? 'landscape' : 'portrait'
+}
+
+function reconcilePanelOrientation(panel, rotation, drmSize) {
+  if (!panel || !drmSize || orientation(drmSize) === 'square') {
+    return { panel, corrected: false }
+  }
+  const framebuffer = rotatedFramebufferSize(panel, rotation)
+  if (orientation(framebuffer) === orientation(drmSize)) {
+    return { panel, corrected: false }
+  }
+  const swapped = { width: panel.height, height: panel.width }
+  if (orientation(rotatedFramebufferSize(swapped, rotation)) === orientation(drmSize)) {
+    return { panel: swapped, corrected: true }
+  }
+  return { panel, corrected: false }
 }
 
 function parseSystemDisplayConfig(raw) {
@@ -299,14 +331,18 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
     const rotation = hasLegacyRotation
       ? normalizeRotationValue(legacyRotation, nativeRotation)
       : (browserMode === ROTATE_270_MODE ? rotateByDelta(nativeRotation, ROTATE_MODE_DELTA) : nativeRotation)
-    const panel = normalizeForRotation(rawPanel, rotation)
-    const panelSize = sizeSpec(panel) || fallback.panelSize || HARD_FALLBACK_DISPLAY.panelSize
     const drmMode = sizeSpec(parseSizeSpec(systemConfig.drmMode)) || readDrmMode(browserPlayer, options || {}, fallback)
+    const drmSize = parseSizeSpec(drmMode)
+    const relativeRotation = rotationDelta(nativeRotation, rotation)
+    const orientedPanel = normalizeForRotation(rawPanel, relativeRotation)
+    const reconciled = reconcilePanelOrientation(orientedPanel, rotation, drmSize)
+    const panel = reconciled.panel
+    const panelSize = sizeSpec(panel) || fallback.panelSize || HARD_FALLBACK_DISPLAY.panelSize
     const touchRotation = hasLegacyRotation
       ? normalizeRotationValue(systemConfig.touchRotation, rotation)
       : (browserMode === ROTATE_270_MODE ? rotateByDelta(nativeTouchRotation, ROTATE_MODE_DELTA) : nativeTouchRotation)
     const displaySource = `system_cfg:${browserMode}`
-    console.warn(`display_resolve source=${displaySource} raw=${systemConfig.width}x${systemConfig.height} direction=${systemConfig.frameworkRotation} video_direction=${systemConfig.videoRotation} tp_direction=${systemConfig.touchRotation} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} touch_rotation=${touchRotation}`)
+    console.warn(`display_resolve source=${displaySource} raw=${systemConfig.width}x${systemConfig.height} direction=${systemConfig.frameworkRotation} relative_rotation=${relativeRotation} video_direction=${systemConfig.videoRotation} tp_direction=${systemConfig.touchRotation} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} touch_rotation=${touchRotation} orientation_corrected=${reconciled.corrected ? 1 : 0}`)
     return {
       panelSize,
       drmMode,
@@ -326,6 +362,9 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
   const rotation = Number.isFinite(optionRotation)
     ? normalizeRotationValue(optionRotation, fallback.rotation)
     : (browserMode === ROTATE_270_MODE ? rotateByDelta(fallback.rotation, ROTATE_MODE_DELTA) : fallback.rotation)
+  const relativeRotation = options && options.browserMode
+    ? (browserMode === ROTATE_270_MODE ? ROTATE_MODE_DELTA : 0)
+    : rotationDelta(fallback.rotation, rotation)
   const drmMode = readDrmMode(browserPlayer, options || {}, fallback)
   const drmSize = parseSizeSpec(drmMode)
   const fallbackPanel = parseSizeSpec((options && options.panelSize) || fallback.panelSize) || parseSizeSpec(HARD_FALLBACK_DISPLAY.panelSize)
@@ -339,11 +378,12 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
 
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i]
-    const normalized = normalizeForRotation(candidate.size, rotation)
+    const normalized = normalizeForRotation(candidate.size, relativeRotation)
     const reject = rejectPanelCandidate(normalized, fallbackPanel, drmSize)
     if (!reject) {
-      const panelSize = sizeSpec(normalized)
-      console.warn(`display_resolve source=${candidate.source}:${browserMode} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation}`)
+      const reconciled = reconcilePanelOrientation(normalized, rotation, drmSize)
+      const panelSize = sizeSpec(reconciled.panel)
+      console.warn(`display_resolve source=${candidate.source}:${browserMode} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} relative_rotation=${relativeRotation} orientation_corrected=${reconciled.corrected ? 1 : 0}`)
       return {
         panelSize,
         drmMode,
@@ -359,9 +399,11 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
     }
   }
 
-  const panelSize = sizeSpec(fallbackPanel) || HARD_FALLBACK_DISPLAY.panelSize
+  const orientedFallback = normalizeForRotation(fallbackPanel, relativeRotation)
+  const reconciledFallback = reconcilePanelOrientation(orientedFallback, rotation, drmSize)
+  const panelSize = sizeSpec(reconciledFallback.panel) || HARD_FALLBACK_DISPLAY.panelSize
   const source = fallbackPanel ? 'app_config' : 'hard_fallback'
-  console.warn(`display_resolve source=${source}:${browserMode} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation}`)
+  console.warn(`display_resolve source=${source}:${browserMode} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} relative_rotation=${relativeRotation} orientation_corrected=${reconciledFallback.corrected ? 1 : 0}`)
   return {
     panelSize,
     drmMode,

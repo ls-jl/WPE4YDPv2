@@ -34,6 +34,20 @@ typedef struct {
     gboolean internal_list;
 } ChromePanelDefinition;
 
+typedef struct {
+    gboolean stacked;
+    int height;
+    int address_x;
+    int address_y;
+    int address_width;
+    int address_height;
+    int controls_x;
+    int controls_y;
+    int controls_width;
+    int controls_height;
+    int button_count;
+} BrowserChromeToolbarGeometry;
+
 const ChromePanelDefinition *chrome_panel_definition(ChromePanel panel);
 const char *chrome_panel_name(ChromePanel panel);
 ChromePanel chrome_panel_from_name(const char *name);
@@ -41,5 +55,10 @@ ChromePanel chrome_panel_parent(ChromePanel panel);
 gboolean chrome_panel_is_overflow_stack(ChromePanel panel);
 gboolean chrome_panel_is_internal_list(ChromePanel panel);
 guint chrome_panel_default_line_count(ChromePanel panel);
+BrowserChromeToolbarGeometry browser_chrome_toolbar_geometry(
+    int panel_width, int panel_height, int landscape_height,
+    int portrait_height, int button_count);
+int browser_chrome_toolbar_button_at(
+    const BrowserChromeToolbarGeometry *geometry, double x, double y);
 
 G_END_DECLS

@@ -19,7 +19,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 - **视频 KMS overlay 直出（hole-punch）**：`mppvideodec` VPU 硬解 + RGA 硬件预旋转输出 NV12 dmabuf，经 v2 unix socket 协议送 UI 进程放到空闲 Esmart overlay plane；解码样本在收到对应 sequence release ACK 前不会复用。
 - **WebRTC 云游戏链路**：WebKit 使用 GStreamer PeerConnection backend，包内提供 ICE/DTLS/SRTP/SCTP/RTP/Opus；允许远端音视频和 DataChannel，默认拒绝麦克风、摄像头和屏幕采集。云原神域名自动切换到原生多点触摸 `game` 输入模式。
 - **内核按机型深度定制**：`-mcpu=cortex-a53` + ThinLTO + **PGO**（抖音/bilibili/百度等真机负载采样 profile-use）；裁剪 SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS 等。
-- **低内存自保**：内存上限按物理内存 68% 动态设定（1GB 机型 673MB，kill 阈值 0.92）；同一 URL 120 秒内被杀 3 次自动回主页的崩溃熔断；MSE 每 SourceBuffer 缓冲上限。
+- **低内存自保**：按启动余量选择 `448/512/640MB` 统一内存 Profile；1GB balanced 模式先在 40%/58% 回收，96% 才终止 WebProcess，避免系统仍有余量时过早停止重型页面；同一 URL 再次超限后显示可重试错误页，禁止循环重载。
 - **低风险内存策略**：默认不改全局 swappiness、不执行 `drop_caches`；仅调整 WPE 自身 OOM 优先级，并通过显式诊断开关临时启用系统级实验。
 - **移动 UA + 站点档案**：默认 Android Chrome UA；支持按站点切换 desktop/mobile 档案。
 - **多用户 Profile 与 Cookie 持久化**：最多 8 个持久 Profile 和访客模式；Cookie、LocalStorage、IndexedDB、Service Worker、缓存、标签、历史、收藏和站点档案完全隔离。浏览器元数据使用 SQLite WAL，Cookie 使用 WebKit 独立 SQLite CookieJar。
@@ -78,13 +78,16 @@ WebKit 内核与 `wpe-drm-minimal` 在 ARM64 交叉编译服务器上构建。`s
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `WPE_VIDEO_OVERLAY` | `1` | 视频 KMS overlay 直出，`0` 回退软件路径 |
-| `WPE_CHROME_LAYOUT` | `inset` | 工具栏让位方式，`resize` 仅调试 |
+| `WPE_CHROME_LAYOUT` | `resize` | 工具栏展开时真实压缩网页 viewport，避免覆盖页面顶部 |
 | `WPE_USE_SYSTEM_GST` | `0` | `1` 时附加系统 GStreamer 插件目录（调试用） |
 | `WPE_GPU_MODE` | `auto` | `auto` 探测失败回 CPU；`off` 强制 CPU；`required` GPU 失败即退出 |
 | `WPE_GPU_MODE_FILE` | `$WPE_VAR_DIR/gpu-mode` | 设置页 GPU 开关的启动前镜像；`auto` 开启，`off` 关闭 |
 | `WPE_WEBRTC` | `1` | 启用 GStreamer WebRTC backend |
 | `WPE_WEBRTC_CAPTURE` | `deny` | 本地音视频采集策略；产品模式必须保持 `deny` |
+| `WEBKIT_GST_FORCE_DEFAULT_ALSA_SINK` | `1` | 强制浏览器音频走系统 `default` ALSA PCM，继承系统音量路由 |
+| `WEBKIT_GST_SYSTEM_VOLUME_MUTE_BRIDGE` | `1` | 系统 Master 为最低值时在 WebRTC direct sink 前执行真静音 |
 | `WPE_INPUT_PROFILE` | `auto` | `auto` 按域名选择 `browser/game`；`game` 不把拖动转换成滚动 |
+| `WPE_CHROME_GESTURE_*` | `28px/48px/160ms/350ms/800ms/500ms` | 双指三击移动、位置、落指、单击、间隔和静默判定阈值 |
 | `WPE_PROFILE_OVERRIDE` | 空 | `guest` 或持久 Profile ID；正常启动留空以恢复上次用户 |
 | `WPE_BROWSER_DB` | `$WPE_VAR_DIR/browser.sqlite3` | 浏览器 Profile 元数据 SQLite |
 | `WPE_DRM_FENCE_TIMEOUT_MS` | `2000` | CPU 读取 DMA-BUF 前等待 rendering fence 的上限 |
@@ -93,7 +96,12 @@ WebKit 内核与 `wpe-drm-minimal` 在 ARM64 交叉编译服务器上构建。`s
 | `WPE_TOUCH_HORIZONTAL_SCROLL` | `1` | 宽页横向滑动 |
 | `WEBKIT_SKIA_ENABLE_CPU_RENDERING` | `1` | Skia 原生 CPU 光栅化（勿走软件 GL 模拟） |
 | `WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS` | `30` | 合成帧率上限 |
-| `MSE_MAX_BUFFER_SIZE` | `V:40M,A:8M` | MSE 每 SourceBuffer 缓冲上限 |
+| `WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS` | `0` | 动画全帧重绘诊断开关；生产关闭以免游戏持续满帧重绘 |
+| `WPE_MEMORY_PROFILE` | 自适应 | `conservative/balanced/large` 统一选择 WebProcess、JSC、MSE 和压力阈值 |
+| `WPE_WEB_PROCESS_MEMORY_LIMIT_MB` | `448/512/640` | 按整机内存、启动余量和 swap 自动选择；显式设置时仍受安全范围校验 |
+| `WPE_WEB_PROCESS_MEMORY_KILL_PERCENT` | `80/96/90` | `conservative/balanced/large` 的最终终止水位；标准和严格回收会先执行 |
+| `WEBKIT_SYSTEM_MEMORY_PRESSURE_PERCENT` | `80/82/85` | 各 Profile 的整机 warning 阈值；critical 默认 `88/90/93` |
+| `MSE_MAX_BUFFER_SIZE` | 自适应 | 每 SourceBuffer 为 `V:24M,A:4M`、`V:32M,A:6M` 或 `V:40M,A:8M` |
 
 ## 设备调试
 

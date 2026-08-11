@@ -40,6 +40,7 @@ for script in wpe-drm/run.sh wpe-drm/runtime/*.sh scripts/*.sh; do
         *) sh -n "$script" ;;
     esac
 done
+sh scripts/test_memory_runtime.sh
 
 echo '[3/8] Chrome model test'
 if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists glib-2.0; then
@@ -63,6 +64,18 @@ cc -std=c11 -Wall -Wextra -Werror \
     $(pkg-config --libs glib-2.0) \
     -o /tmp/wpe-browser-navigation-test
 /tmp/wpe-browser-navigation-test
+cc -std=c11 -Wall -Wextra -Werror \
+    $(pkg-config --cflags glib-2.0) \
+    wpe-drm/browser-touch-gesture.c wpe-drm/tests/browser-touch-gesture-test.c \
+    $(pkg-config --libs glib-2.0) -lm \
+    -o /tmp/wpe-browser-touch-gesture-test
+/tmp/wpe-browser-touch-gesture-test
+cc -std=c11 -Wall -Wextra -Werror \
+    $(pkg-config --cflags glib-2.0) \
+    wpe-drm/browser-memory-policy.c wpe-drm/tests/browser-memory-policy-test.c \
+    $(pkg-config --libs glib-2.0) \
+    -o /tmp/wpe-browser-memory-policy-test
+/tmp/wpe-browser-memory-policy-test
 
 echo '[4/8] Profile database test'
 if command -v pkg-config >/dev/null 2>&1 \
@@ -83,6 +96,13 @@ for path in \
     assets/wpe-runtime/build-manifest.json \
     assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1 \
     assets/wpe-runtime/lib/librga.so.2 \
+    assets/wpe-runtime/lib/libavif.so.16 \
+    assets/wpe-runtime/lib/libdav1d.so.7 \
+    assets/wpe-runtime/lib/gstreamer-1.0/libgstinterleave.so \
+    assets/wpe-runtime/lib/gstreamer-1.0/libgstdeinterlace.so \
+    assets/wpe-runtime/lib/gstreamer-1.0/libgstalsa.so \
+    assets/wpe-runtime/lib/gstreamer-1.0/libgstvolume.so \
+    assets/wpe-runtime/lib/libasound.so.2 \
     assets/wpe-runtime/etc/ssl/certs/ca-certificates.crt \
     assets/wpe-runtime/libexec/wpe-webkit-2.0/WPEWebProcess \
     assets/wpe-runtime/libexec/wpe-webkit-2.0/WPENetworkProcess \
@@ -91,6 +111,9 @@ for path in \
     require_file "$path"
     reject_lfs_pointer "$path"
 done
+dynamic_info assets/wpe-runtime/lib/libavif.so.16 \
+    | grep -q 'NEEDED.*libdav1d.so.7' \
+    || fail 'packaged AVIF decoder is not linked to the bundled dav1d runtime'
 webkit_entries=$(find assets/wpe-runtime/lib -maxdepth 1 \
     -name 'libWPEWebKit-2.0.so*' -print)
 [ "$webkit_entries" = "assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1" ] \
@@ -123,9 +146,13 @@ echo '[6/8] Generated-source policy'
 [ ! -e assets/wpe-runtime/run.sh ] \
     || cmp -s wpe-drm/run.sh assets/wpe-runtime/run.sh \
     || fail 'assets/wpe-runtime/run.sh differs from wpe-drm/run.sh'
-[ ! -d assets/wpe-runtime/runtime ] \
-    || cmp -s wpe-drm/runtime/gpu-runtime.sh assets/wpe-runtime/runtime/gpu-runtime.sh \
-    || fail 'generated GPU runtime module differs from source'
+if [ -d assets/wpe-runtime/runtime ]; then
+    for module in wpe-drm/runtime/*.sh; do
+        generated="assets/wpe-runtime/runtime/$(basename "$module")"
+        cmp -s "$module" "$generated" \
+            || fail "generated runtime module differs from source: $module"
+    done
+fi
 
 echo '[7/8] External fallback policy'
 if rg -n '/userdisk/(wpe-drm2|wpe-cairo|mesa)' \

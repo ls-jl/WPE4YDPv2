@@ -1,4 +1,11 @@
 0100-wpe-drm-platform.patch
+0150-drm-generation-order.patch
+0160-rga-inset-and-lazy-chrome-base.patch
 0200-skia-raster-compositor.patch
+0250-full-repaint-on-motion.patch
+0260-imagebitmap-complete-decode.patch
+0270-webaudio-missing-elements.patch
 0300-webrtc-media-overlay.patch
+0310-system-volume-control.patch
 0400-network-cloud-compat.patch
+0500-adaptive-memory-pressure.patch

@@ -749,7 +749,10 @@ public:
                 const std::string fpsMaxValue = std::to_string(fpsMax);
                 setenv("WPE_DRM_MAX_FPS", fpsMaxValue.c_str(), 1);
             }
-            setenv("WPE_CHROME_LAYOUT", "inset", 0);
+            // The native toolbar owns a reserved WebKit content inset. Keeping
+            // this explicit prevents stale package environments from restoring
+            // the legacy overlay layout.
+            setenv("WPE_CHROME_LAYOUT", "resize", 1);
             setenv("GST_REGISTRY", joinPath(workdir, "gst-registry.bin").c_str(), 1);
             setenv("WPE_DEFAULT_URL", url.c_str(), 1);
             setenv("HOME", workdir.c_str(), 1);

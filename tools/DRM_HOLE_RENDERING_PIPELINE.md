@@ -388,6 +388,22 @@ drmMode=480x960
 
 这种情况下，`WPEViewDRM` 会把 `960x266` 的源画面旋转复制到 `266x960` 的 dumb framebuffer，然后在 `480x960` 的 DRM envelope 中居中或按 `WPE_DRM_ROTATED_X/WPE_PANEL_CRTC_X` 定位。
 
+显示模式按相对原生方向的旋转量计算业务尺寸，而不是按最终绝对角度猜测横竖屏：
+
+- `native` 的相对旋转为 `0`，保留系统配置的 `width x height`。
+- `rotate270` 相对原生方向旋转 `270`，因此始终交换 panel/viewport 宽高。
+- WPE 输出和触摸仍使用绝对角度 `frameworkRotation + modeDelta`。
+
+例如系统配置为 `936x280 / direction=270` 时，原生模式输出
+`panel=936x280, rotation=270`；旋转模式输出
+`panel=280x936, rotation=180`。两者最终 framebuffer 都与 `280x936`
+DRM envelope 同方向。启动解析器会检查 framebuffer 与 DRM mode 的横竖方向，
+只在结果唯一时交换一次 panel 宽高，并打印 `orientation_corrected=1`。
+
+横屏 native toolbar 高 `44px`。当 `panelWidth < panelHeight` 时使用 `80px`
+竖屏布局：第一行是完整地址栏，第二行是五个等宽按钮。绘制和触摸命中均读取
+launcher 输出的同一组 toolbar geometry，避免窄屏按钮越界或坐标漂移。
+
 ### 5.5 `frame` 页解析优先级
 
 `frame` 页启动 WPE 前解析显示配置，优先级是：
@@ -1083,9 +1099,11 @@ DMA-BUF 后，hole-punch sink 通过 unix socket 交给 UI 进程并提交到独
 视频 plane。云原神主机在 `WPE_INPUT_PROFILE=auto` 下使用 `game`，raw touch 的
 down/move/up 按 slot 原样发给 WebKit，不生成浏览器 scroll 或 synthetic tap。
 云游戏视频进入 `playing` 后，`WPE_GAME_MEDIA_IMMERSIVE=1` 会自动隐藏 native
-toolbar；此时顶部热区仍可手动唤回 toolbar。网页随后通过 Fullscreen API
-进入严格全屏时，launcher 会关闭 toolbar 和所有顶部唤出热区；退出全屏后恢复
-toolbar。
+toolbar。手动显隐统一使用三次连续双指轻点，默认允许两指在 `160ms` 内落下、
+单次轻点不超过 `350ms`、相邻轻点间隔不超过 `800ms`，第三次完成后还需保持 `500ms`
+无其他触摸；旧的顶部唤出热区已删除。该手势默认也能在 game 和 Fullscreen API
+状态中临时覆盖显示 toolbar，可在“设置 → 外观”关闭其沉浸模式响应。页面滚动
+触发的自动显隐保持不变。
 视频 socket 使用带单调 sequence 的 v2 协议。DRM 同步提交新 framebuffer 后才释放
 上一 framebuffer 并回 ACK；WebProcess 收到对应 ACK 后才释放持有的 `GstSample`。
 被合并、导入失败或未提交的帧会立即 ACK，断线和 hide 会清理全部 retained sample。

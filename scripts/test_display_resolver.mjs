@@ -41,6 +41,31 @@ assert.equal(rotatedPortrait.panelSize, '1210x568')
 assert.equal(rotatedPortrait.rotation, 90)
 assert.equal(rotatedPortrait.touchRotation, 90)
 
+const landscape = {
+  width: 936,
+  height: 280,
+  frameworkRotation: 270,
+  touchRotation: 270,
+  touchDevice: '/dev/input/by-path/sitronix_ts_spi',
+  drmMode: '280x936',
+}
+
+const nativeLandscape = await display.resolveDisplayConfig({}, player(landscape), {
+  browserMode: 'native',
+})
+assert.equal(nativeLandscape.panelSize, '936x280')
+assert.equal(nativeLandscape.viewport, '936x280')
+assert.equal(nativeLandscape.rotation, 270)
+assert.equal(nativeLandscape.touchRotation, 270)
+
+const rotatedLandscape = await display.resolveDisplayConfig({}, player(landscape), {
+  browserMode: 'rotate270',
+})
+assert.equal(rotatedLandscape.panelSize, '280x936')
+assert.equal(rotatedLandscape.viewport, '280x936')
+assert.equal(rotatedLandscape.rotation, 180)
+assert.equal(rotatedLandscape.touchRotation, 180)
+
 const legacyLandscape = await display.resolveDisplayConfig({}, player({
   width: 266,
   height: 960,
@@ -56,4 +81,4 @@ assert.equal(legacyLandscape.touchRotation, 270)
 assert.equal(display.normalizeBrowserMode('rotate270'), 'rotate270')
 assert.equal(display.normalizeBrowserMode('invalid'), 'native')
 
-console.log('display resolver fixtures passed: 4')
+console.log('display resolver fixtures passed: 6')

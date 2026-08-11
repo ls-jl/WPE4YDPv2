@@ -1,0 +1,343 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -48,6 +48,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <cctype>
++#include <iterator>
+ #include <optional>
+ #include <unordered_map>
+ #include <vector>
+@@ -342,6 +343,7 @@
+     int left { 0 };
+     int top { 0 };
+     int advance { 0 };
++    uint64_t lastUsed { 0 };
+     std::vector<uint8_t> pixels;
+ };
+ 
+@@ -366,8 +368,10 @@
+         if (!font.face)
+             return nullptr;
+         auto found = font.glyphs.find(character);
+-        if (found != font.glyphs.end())
++        if (found != font.glyphs.end()) {
++            found->second.lastUsed = ++m_generation;
+             return &found->second;
++        }
+         if (FT_Load_Char(font.face, character, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT))
+             return nullptr;
+         auto& bitmap = font.face->glyph->bitmap;
+@@ -377,6 +381,7 @@
+         glyph.left = font.face->glyph->bitmap_left;
+         glyph.top = font.face->glyph->bitmap_top;
+         glyph.advance = std::max<int>(1, font.face->glyph->advance.x >> 6);
++        glyph.lastUsed = ++m_generation;
+         glyph.pixels.resize(static_cast<size_t>(glyph.width) * glyph.height);
+         for (int row = 0; row < glyph.height; ++row) {
+             const uint8_t* source = bitmap.buffer + static_cast<ptrdiff_t>(row) * bitmap.pitch;
+@@ -388,21 +393,57 @@
+                         source[column / 8] & (0x80 >> (column % 8)) ? 255 : 0;
+             }
+         }
+-        if (font.glyphs.size() >= 512)
+-            font.glyphs.clear();
++        if (font.glyphs.size() >= maximumGlyphsPerFont)
++            evictOldest(font);
+         return &font.glyphs.emplace(character, std::move(glyph)).first->second;
+     }
+ 
+     bool available(ChromeFontWeight weight = ChromeFontWeight::Regular) const
+     {
+         return m_fonts[static_cast<size_t>(weight)].face;
++    }
++
++    size_t bytes() const
++    {
++        size_t total = 0;
++        for (const auto& font : m_fonts) {
++            for (const auto& entry : font.glyphs)
++                total += sizeof(entry) + entry.second.pixels.capacity();
++        }
++        return total;
+     }
+ 
++    void trim(bool critical)
++    {
++        for (auto& font : m_fonts) {
++            size_t target = critical ? 0 : warningGlyphsPerFont;
++            while (font.glyphs.size() > target)
++                evictOldest(font);
++            if (critical)
++                font.glyphs.rehash(0);
++        }
++    }
++
+ private:
++    static constexpr size_t maximumGlyphsPerFont = 512;
++    static constexpr size_t warningGlyphsPerFont = 256;
++
+     struct Font {
+         FT_Face face { nullptr };
+         std::unordered_map<gunichar, ChromeGlyph> glyphs;
+     };
++
++    static void evictOldest(Font& font)
++    {
++        if (font.glyphs.empty())
++            return;
++        auto oldest = font.glyphs.begin();
++        for (auto it = std::next(font.glyphs.begin()); it != font.glyphs.end(); ++it) {
++            if (it->second.lastUsed < oldest->second.lastUsed)
++                oldest = it;
++        }
++        font.glyphs.erase(oldest);
++    }
+ 
+     ChromeFontCache()
+     {
+@@ -449,6 +490,7 @@
+ 
+     FT_Library m_library { nullptr };
+     std::array<Font, 3> m_fonts;
++    uint64_t m_generation { 0 };
+ };
+ 
+ struct PanelSize {
+@@ -3029,6 +3071,57 @@
+ static void setDamageRects(Vector<drm_mode_rect>&, const WPERectangle*, guint);
+ static bool captureCommittedChromeBase(WPEViewDRM*);
+ 
++static guint64 wpeViewDRMCacheBytes(WPEViewDRM* view)
++{
++    auto* priv = view->priv;
++    return priv->chromeBasePixels.capacity()
++        + priv->preparedChromeBasePixels.capacity()
++        + priv->damageRects.capacity() * sizeof(drm_mode_rect)
++        + priv->queuedDamageRects.capacity() * sizeof(drm_mode_rect)
++        + ChromeFontCache::singleton().bytes();
++}
++
++guint64 wpe_view_drm_get_cache_bytes(WPEViewDRM* view)
++{
++    g_return_val_if_fail(WPE_IS_VIEW_DRM(view), 0);
++    return wpeViewDRMCacheBytes(view);
++}
++
++void wpe_view_drm_trim_caches(WPEViewDRM* view, gboolean critical)
++{
++    g_return_if_fail(WPE_IS_VIEW_DRM(view));
++    auto* priv = view->priv;
++    guint64 before = wpeViewDRMCacheBytes(view);
++    bool frameInFlight = priv->pendingBuffer || priv->pendingScanoutBuffer
++        || priv->queuedBuffer || priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested);
++
++    if (!frameInFlight) {
++        priv->preparedChromeBasePixels.clear();
++        priv->preparedChromeBasePixels.shrinkToFit();
++        priv->preparedChromeBaseWidth = 0;
++        priv->preparedChromeBaseHeight = 0;
++        priv->preparedChromeBasePitch = 0;
++        priv->preparedBaseGeneration = 0;
++        priv->damageRects.clear();
++        priv->damageRects.shrinkToFit();
++        priv->queuedDamageRects.clear();
++        priv->queuedDamageRects.shrinkToFit();
++        if (critical) {
++            priv->chromeBasePixels.clear();
++            priv->chromeBasePixels.shrinkToFit();
++            priv->chromeBaseWidth = 0;
++            priv->chromeBaseHeight = 0;
++            priv->chromeBasePitch = 0;
++            priv->chromeBaseGeneration = 0;
++        }
++    }
++    ChromeFontCache::singleton().trim(critical);
++    guint64 after = wpeViewDRMCacheBytes(view);
++    g_message("WPEViewDRM memory trim: level=%s frame_in_flight=%d before=%" G_GUINT64_FORMAT " after=%" G_GUINT64_FORMAT " released=%" G_GUINT64_FORMAT,
++        critical ? "critical" : "warning", frameInFlight, before, after,
++        before > after ? before - after : 0);
++}
++
+ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
+ {
+     auto* priv = view->priv;
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.h
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.h
+@@ -39,6 +39,10 @@
+ #define WPE_TYPE_VIEW_DRM (wpe_view_drm_get_type())
+ WPE_API G_DECLARE_FINAL_TYPE (WPEViewDRM, wpe_view_drm, WPE, VIEW_DRM, WPEView)
+ 
++WPE_API guint64 wpe_view_drm_get_cache_bytes (WPEViewDRM *view);
++WPE_API void wpe_view_drm_trim_caches (WPEViewDRM *view,
++                                       gboolean critical);
++
+ G_END_DECLS
+ 
+ #endif /* WPEViewDRM_h */
+--- a/Source/WebKit/UIProcess/linux/MemoryPressureMonitor.cpp
++++ b/Source/WebKit/UIProcess/linux/MemoryPressureMonitor.cpp
+@@ -30,11 +30,13 @@
+ 
+ #include "WebProcessPool.h"
+ #include <mutex>
++#include <optional>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <wtf/PageBlock.h>
++#include <wtf/MonotonicTime.h>
+ #include <wtf/Threading.h>
+ #include <wtf/UniStdExtras.h>
+ #include <wtf/text/CString.h>
+@@ -50,8 +52,8 @@
+ static const Seconds s_maxPollingInterval { 5_s };
+ static const double s_minUsedMemoryPercentageForPolling = 50;
+ static const double s_maxUsedMemoryPercentageForPolling = 85;
+-static const int s_memoryPresurePercentageThreshold = 90;
+-static const int s_memoryPresurePercentageThresholdCritical = 95;
++static const int s_defaultMemoryPressurePercentageThreshold = 90;
++static const int s_defaultMemoryPressurePercentageThresholdCritical = 95;
+ // cgroups.7: The usual place for such mounts is under a tmpfs(5)
+ // filesystem mounted at /sys/fs/cgroup.
+ static const char* s_cgroupMemoryPath = "/sys/fs/cgroup/%s/%s/%s";
+@@ -242,7 +244,8 @@
+ }
+ 
+ 
+-static int systemMemoryUsedAsPercentage(FILE* memInfoFile, FILE* zoneInfoFile, CGroupMemoryController* memoryController)
++static int systemMemoryUsedAsPercentage(FILE* memInfoFile, FILE* zoneInfoFile,
++    CGroupMemoryController* memoryController, size_t* totalKB, size_t* availableKB)
+ {
+     if (!memInfoFile || fseek(memInfoFile, 0, SEEK_SET))
+         return -1;
+@@ -283,6 +286,11 @@
+ 
+     if (memoryAvailable > memoryTotal)
+         return -1;
++
++    if (totalKB)
++        *totalKB = memoryTotal;
++    if (availableKB)
++        *availableKB = memoryAvailable;
+ 
+     int memoryUsagePercentage = ((memoryTotal - memoryAvailable) * 100) / memoryTotal;
+     LOG(MemoryPressure, "MemoryPressureMonitor::memory: real (total: %zu kB) (available: %zu kB) (usage: %d%%)", memoryTotal, memoryAvailable, memoryUsagePercentage);
+@@ -298,6 +306,22 @@
+     }
+     LOG(MemoryPressure, "MemoryPressureMonitor::memory: (memoryUsagePercentage: %d%%)", memoryUsagePercentage);
+     return memoryUsagePercentage;
++}
++
++static unsigned environmentUInt(const char* name, unsigned fallback, unsigned minimum, unsigned maximum)
++{
++    const char* value = getenv(name);
++    if (!value || !*value)
++        return fallback;
++    char* end = nullptr;
++    unsigned long parsed = strtoul(value, &end, 10);
++    if (end == value || *end)
++        return fallback;
++    if (parsed < minimum)
++        return minimum;
++    if (parsed > maximum)
++        return maximum;
++    return static_cast<unsigned>(parsed);
+ }
+ 
+ static inline Seconds pollIntervalForUsedMemoryPercentage(int usedPercentage)
+@@ -350,10 +374,26 @@
+ 
+     m_started = true;
+ 
+-    Thread::create("MemoryPressureMonitor"_s, [] {
++    unsigned warningPercentage = environmentUInt("WEBKIT_SYSTEM_MEMORY_PRESSURE_PERCENT",
++        s_defaultMemoryPressurePercentageThreshold, 50, 98);
++    unsigned criticalPercentage = environmentUInt("WEBKIT_SYSTEM_MEMORY_PRESSURE_CRITICAL_PERCENT",
++        s_defaultMemoryPressurePercentageThresholdCritical, warningPercentage + 1, 99);
++    unsigned warningAvailableKB = environmentUInt("WEBKIT_SYSTEM_MEMORY_PRESSURE_AVAILABLE_MB",
++        0, 0, 4096) * KB;
++    unsigned criticalAvailableKB = environmentUInt("WEBKIT_SYSTEM_MEMORY_PRESSURE_CRITICAL_AVAILABLE_MB",
++        0, 0, 4096) * KB;
++    unsigned recoverySeconds = environmentUInt("WEBKIT_SYSTEM_MEMORY_PRESSURE_RECOVERY_SECONDS",
++        10, 2, 120);
++
++    Thread::create("MemoryPressureMonitor"_s, [warningPercentage, criticalPercentage,
++        warningAvailableKB, criticalAvailableKB, recoverySeconds] {
++        enum class PressureLevel : uint8_t { Normal, Warning, Critical };
+         FileHandle memInfoFile, zoneInfoFile, cgroupControllerFile;
+         CGroupMemoryController memoryController = CGroupMemoryController();
+         Seconds pollInterval = s_maxPollingInterval;
++        PressureLevel level = PressureLevel::Normal;
++        std::optional<MonotonicTime> recoveryStart;
++        MonotonicTime lastDispatch;
+         while (true) {
+             sleep(pollInterval);
+ 
+@@ -367,20 +407,62 @@
+ 
+             CString cgroupMemoryControllerPath = getCgroupControllerPath(cgroupControllerFile.get(), "memory");
+             memoryController.setMemoryControllerPath(cgroupMemoryControllerPath);
+-            int usedPercentage = systemMemoryUsedAsPercentage(memInfoFile.get(), zoneInfoFile.get(), &memoryController);
++            size_t totalKB = 0;
++            size_t availableKB = 0;
++            int usedPercentage = systemMemoryUsedAsPercentage(memInfoFile.get(), zoneInfoFile.get(),
++                &memoryController, &totalKB, &availableKB);
+             if (usedPercentage == -1) {
+                 WTFLogAlways("Failed to get the memory usage");
+                 pollInterval = s_maxPollingInterval;
+                 continue;
+             }
+ 
+-            if (usedPercentage >= s_memoryPresurePercentageThreshold) {
+-                bool isCritical = (usedPercentage >= s_memoryPresurePercentageThresholdCritical);
++            PressureLevel desired = PressureLevel::Normal;
++            if (usedPercentage >= static_cast<int>(criticalPercentage)
++                || (criticalAvailableKB && availableKB <= criticalAvailableKB))
++                desired = PressureLevel::Critical;
++            else if (usedPercentage >= static_cast<int>(warningPercentage)
++                || (warningAvailableKB && availableKB <= warningAvailableKB))
++                desired = PressureLevel::Warning;
++
++            MonotonicTime now = MonotonicTime::now();
++            bool transitioned = false;
++            if (desired > level) {
++                level = desired;
++                recoveryStart = std::nullopt;
++                transitioned = true;
++            } else if (desired < level) {
++                bool safelyRecovered = usedPercentage + 4 < static_cast<int>(warningPercentage)
++                    && (!warningAvailableKB || availableKB > warningAvailableKB + 64 * KB);
++                if (!safelyRecovered)
++                    recoveryStart = std::nullopt;
++                else if (!recoveryStart)
++                    recoveryStart = now;
++                else if (now - *recoveryStart >= Seconds(recoverySeconds)) {
++                    level = desired;
++                    recoveryStart = std::nullopt;
++                    transitioned = true;
++                }
++            } else
++                recoveryStart = std::nullopt;
++
++            bool pressureActive = level != PressureLevel::Normal;
++            bool retryPressure = pressureActive && lastDispatch
++                && now - lastDispatch >= Seconds(recoverySeconds);
++            if (pressureActive && (transitioned || !lastDispatch || retryPressure)) {
++                bool isCritical = level == PressureLevel::Critical;
+                 RunLoop::mainSingleton().dispatch([isCritical] {
+                     for (auto& processPool : WebProcessPool::allProcessPools())
+                         processPool->sendMemoryPressureEvent(isCritical);
+                 });
++                lastDispatch = now;
+             }
++            if (transitioned) {
++                WTFLogAlways("MemoryPressureMonitor transition level=%s used=%d%% available=%zuKB thresholds=%u/%u available_thresholds=%zu/%zuMB recovery=%us",
++                    level == PressureLevel::Critical ? "critical" : level == PressureLevel::Warning ? "warning" : "normal",
++                    usedPercentage, availableKB, warningPercentage, criticalPercentage,
++                    warningAvailableKB / KB, criticalAvailableKB / KB, recoverySeconds);
++            }
+             pollInterval = pollIntervalForUsedMemoryPercentage(usedPercentage);
+         }
+     })->detach();

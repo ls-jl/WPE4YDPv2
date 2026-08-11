@@ -65,6 +65,10 @@ download "https://github.com/openssl/openssl/releases/download/openssl-3.5.7/ope
   "$DOWNLOADS/openssl-3.5.7.tar.gz"
 download "https://github.com/cisco/libsrtp/archive/refs/tags/v2.8.0.tar.gz" \
   "$DOWNLOADS/libsrtp-2.8.0.tar.gz"
+download "https://code.videolan.org/videolan/dav1d/-/archive/1.5.1/dav1d-1.5.1.tar.gz" \
+  "$DOWNLOADS/dav1d-1.5.1.tar.gz"
+download "https://codeload.github.com/AOMediaCodec/libavif/tar.gz/refs/tags/v1.1.1" \
+  "$DOWNLOADS/libavif-1.1.1.tar.gz"
 
 GST_BAD_SOURCE="$BASE/sources/gst-plugins-bad-1.22.12"
 GST_WEBRTC_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0001-webrtcbin-update-remote-offer-transceivers.patch"
@@ -137,6 +141,35 @@ meson_build() {
   PKG_CONFIG_PATH="$PKG_CONFIG_PATH" ninja -C "$build" -j"$JOBS" install
 }
 
+if [ ! -f "$PREFIX/lib/libdav1d.so" ]; then
+  rm -rf "$WORK/dav1d-1.5.1"
+  tar -xzf "$DOWNLOADS/dav1d-1.5.1.tar.gz" -C "$WORK"
+  meson_build dav1d "$WORK/dav1d-1.5.1" \
+    -Denable_tools=false -Denable_tests=false -Denable_examples=false
+fi
+
+if [ ! -f "$PREFIX/lib/libavif.so" ]; then
+  rm -rf "$WORK/libavif-1.1.1" "$WORK/libavif-build"
+  tar -xzf "$DOWNLOADS/libavif-1.1.1.tar.gz" -C "$WORK"
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cmake \
+    -S "$WORK/libavif-1.1.1" -B "$WORK/libavif-build" -GNinja \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_C_COMPILER="$WORK/bin/aarch64-cc" \
+    -DCMAKE_CXX_COMPILER="$WORK/bin/aarch64-cxx" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -DAVIF_CODEC_DAV1D=SYSTEM \
+    -DAVIF_LIBYUV=OFF \
+    -DAVIF_BUILD_APPS=OFF \
+    -DAVIF_BUILD_TESTS=OFF \
+    -DAVIF_ENABLE_WERROR=OFF
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" ninja -C "$WORK/libavif-build" \
+    -j"$JOBS" install
+fi
+
 if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstnice.so" ]; then
   meson_build libnice "$BASE/sources/libnice-0.1.22" \
     -Dgstreamer=enabled -Dcrypto-library=openssl -Dgupnp=disabled \
@@ -144,9 +177,13 @@ if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstnice.so" ]; then
 fi
 
 if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstrtp.so" ] || \
-  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstrtpmanager.so" ]; then
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstrtpmanager.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstinterleave.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdeinterlace.so" ]; then
   meson_build gst-good "$BASE/sources/gst-plugins-good-1.22.12" \
-    -Drtp=enabled -Drtpmanager=enabled -Dexamples=disabled -Dtests=disabled
+    -Drtp=enabled -Drtpmanager=enabled -Dinterleave=enabled \
+    -Ddeinterlace=enabled \
+    -Dexamples=disabled -Dtests=disabled
 fi
 
 if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdtls.so" ] || \
@@ -209,6 +246,8 @@ if [ "${SKIP_WEBKIT_BUILD:-0}" != 1 ]; then
     -DUSE_LIBRICE=OFF \
     -DENABLE_GPU_PROCESS=OFF \
     -DENABLE_WEBGL=ON \
+    -DUSE_AVIF=ON \
+    -DUSE_JPEGXL=OFF \
     -DUSE_GBM=ON \
     -DUSE_SKIA=ON \
     -DOPENSSL_ROOT_DIR="$PREFIX" \
@@ -238,7 +277,9 @@ COMMON_LIBS="$(PKG_CONFIG_PATH="$PKG_CONFIG_PATH" pkg-config --libs glib-2.0 gob
   $COMMON_CFLAGS \
   "$PROJECT_ROOT/wpe-drm/wpe-drm-minimal.c" "$PROJECT_ROOT/wpe-drm/browser-chrome-model.c" \
   "$PROJECT_ROOT/wpe-drm/browser-i18n.c" \
+  "$PROJECT_ROOT/wpe-drm/browser-memory-policy.c" \
   "$PROJECT_ROOT/wpe-drm/browser-navigation.c" \
+  "$PROJECT_ROOT/wpe-drm/browser-touch-gesture.c" \
   "$PROJECT_ROOT/wpe-drm/browser-profile-store.c" \
   -o "$WPE_ROOT/wpe-drm-minimal" \
   -L"$WEBKIT_BUILD/lib" -L"$FULL_PREFIX/lib" -L"$PREFIX/lib" \
@@ -263,11 +304,14 @@ copy_family 'libgstwebrtc-1.0.so*'
 copy_family 'libgstsdp-1.0.so*'
 copy_family 'libgstsctp-1.0.so*'
 copy_family 'libgstwebrtcnice-1.0.so*'
+copy_family 'libdav1d.so*'
+copy_family 'libavif.so*'
 
 if [ -d "$PREFIX/lib/ossl-modules" ]; then
   cp -a "$PREFIX/lib/ossl-modules/." "$STAGE/lib/ossl-modules/"
 fi
-for plugin in libgstnice.so libgstrtp.so libgstrtpmanager.so libgstsrtp.so \
+for plugin in libgstnice.so libgstrtp.so libgstrtpmanager.so libgstinterleave.so \
+  libgstdeinterlace.so libgstsrtp.so \
   libgstdtls.so libgstsctp.so libgstwebrtc.so; do
   test -f "$PREFIX/lib/gstreamer-1.0/$plugin"
   cp -a "$PREFIX/lib/gstreamer-1.0/$plugin" "$STAGE/lib/gstreamer-1.0/"

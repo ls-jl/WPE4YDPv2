@@ -24,6 +24,7 @@ static const BrowserTranslation translations[] = {
     { "about", "关于", "ABOUT" },
     { "theme", "主题", "THEME" },
     { "toolbar_auto_hide", "工具栏自动隐藏", "TOOLBAR AUTO-HIDE" },
+    { "toolbar_gesture_in_immersive", "全屏/游戏双指三击", "TWO-FINGER TRIPLE TAP IN FULLSCREEN" },
     { "page_zoom", "页面缩放", "PAGE ZOOM" },
     { "default_font", "默认字体", "DEFAULT FONT" },
     { "gpu_acceleration", "GPU 加速", "GPU ACCELERATION" },

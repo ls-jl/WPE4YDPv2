@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <iterator>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -138,6 +139,13 @@ struct RGAHandleParameters {
     uint32_t format;
 };
 
+struct RGARect {
+    int x;
+    int y;
+    int width;
+    int height;
+};
+
 class RockchipRGA {
 public:
     enum class Mode : uint8_t {
@@ -162,7 +170,8 @@ public:
     bool rotate(int sourceFD, uint32_t sourceWidth, uint32_t sourceHeight,
         uint32_t sourceStride, uint32_t sourceFormat, int destinationFD,
         uint32_t destinationWidth, uint32_t destinationHeight,
-        uint32_t destinationStride, OutputRotation rotation, gint64& durationUS)
+        uint32_t destinationStride, OutputRotation rotation, gint64& durationUS,
+        RGARect destinationRect = { })
     {
         durationUS = 0;
         if (!shouldAttempt())
@@ -198,13 +207,31 @@ public:
         auto destination = m_wrapBufferHandle(destinationHandle,
             destinationWidth, destinationHeight, destinationStride / 4,
             destinationHeight, rkFormatBGRA8888);
+        if (destinationRect.width <= 0 || destinationRect.height <= 0)
+            destinationRect = { 0, 0, static_cast<int>(destinationWidth),
+                static_cast<int>(destinationHeight) };
         gint64 startUS = g_get_monotonic_time();
-        int result = m_rotate(source, destination, transform, 1);
+        int result = 0;
+        bool useDestinationRect = destinationRect.x || destinationRect.y
+            || destinationRect.width != static_cast<int>(destinationWidth)
+            || destinationRect.height != static_cast<int>(destinationHeight);
+        if (useDestinationRect && m_process) {
+            RGABuffer pattern { };
+            RGARect sourceRect { 0, 0, static_cast<int>(sourceWidth),
+                static_cast<int>(sourceHeight) };
+            RGARect patternRect { };
+            result = m_process(source, destination, pattern, sourceRect,
+                destinationRect, patternRect, transform);
+        } else if (!useDestinationRect)
+            result = m_rotate(source, destination, transform, 1);
+        else
+            result = 0;
         durationUS = g_get_monotonic_time() - startUS;
         m_releaseBufferHandle(destinationHandle);
         m_releaseBufferHandle(sourceHandle);
         if (result <= 0)
-            return fail("imrotate_t failed", result);
+            return fail(useDestinationRect
+                ? "improcess inset rotation failed" : "imrotate_t failed", result);
 
         m_consecutiveFailures = 0;
         return true;
@@ -215,6 +242,8 @@ private:
     using WrapBufferHandleFunction = RGABuffer (*)(RGABufferHandle, int, int, int, int, int);
     using ReleaseBufferHandleFunction = int (*)(RGABufferHandle);
     using RotateFunction = int (*)(const RGABuffer, RGABuffer, int, int);
+    using ProcessFunction = int (*)(RGABuffer, RGABuffer, RGABuffer,
+        RGARect, RGARect, RGARect, int);
 
     static Mode mode()
     {
@@ -273,14 +302,15 @@ private:
         m_wrapBufferHandle = reinterpret_cast<WrapBufferHandleFunction>(dlsym(m_library, "wrapbuffer_handle_t"));
         m_releaseBufferHandle = reinterpret_cast<ReleaseBufferHandleFunction>(dlsym(m_library, "releasebuffer_handle"));
         m_rotate = reinterpret_cast<RotateFunction>(dlsym(m_library, "imrotate_t"));
+        m_process = reinterpret_cast<ProcessFunction>(dlsym(m_library, "improcess"));
         if (!m_importBufferFD || !m_wrapBufferHandle || !m_releaseBufferHandle || !m_rotate) {
             g_warning("WPEViewDRM rga_rotation=unavailable path=%s error=missing-im2d-symbols", path);
             dlclose(m_library);
             m_library = nullptr;
             return false;
         }
-        g_message("WPEViewDRM rga_rotation=available mode=%s path=%s",
-            mode() == Mode::Required ? "required" : "auto", path);
+        g_message("WPEViewDRM rga_rotation=available mode=%s inset=%d path=%s",
+            mode() == Mode::Required ? "required" : "auto", !!m_process, path);
         return true;
     }
 
@@ -304,6 +334,7 @@ private:
     WrapBufferHandleFunction m_wrapBufferHandle { nullptr };
     ReleaseBufferHandleFunction m_releaseBufferHandle { nullptr };
     RotateFunction m_rotate { nullptr };
+    ProcessFunction m_process { nullptr };
 };
 
 struct ChromeGlyph {
@@ -312,6 +343,7 @@ struct ChromeGlyph {
     int left { 0 };
     int top { 0 };
     int advance { 0 };
+    uint64_t lastUsed { 0 };
     std::vector<uint8_t> pixels;
 };
 
@@ -336,8 +368,10 @@ public:
         if (!font.face)
             return nullptr;
         auto found = font.glyphs.find(character);
-        if (found != font.glyphs.end())
+        if (found != font.glyphs.end()) {
+            found->second.lastUsed = ++m_generation;
             return &found->second;
+        }
         if (FT_Load_Char(font.face, character, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT))
             return nullptr;
         auto& bitmap = font.face->glyph->bitmap;
@@ -347,6 +381,7 @@ public:
         glyph.left = font.face->glyph->bitmap_left;
         glyph.top = font.face->glyph->bitmap_top;
         glyph.advance = std::max<int>(1, font.face->glyph->advance.x >> 6);
+        glyph.lastUsed = ++m_generation;
         glyph.pixels.resize(static_cast<size_t>(glyph.width) * glyph.height);
         for (int row = 0; row < glyph.height; ++row) {
             const uint8_t* source = bitmap.buffer + static_cast<ptrdiff_t>(row) * bitmap.pitch;
@@ -358,8 +393,8 @@ public:
                         source[column / 8] & (0x80 >> (column % 8)) ? 255 : 0;
             }
         }
-        if (font.glyphs.size() >= 512)
-            font.glyphs.clear();
+        if (font.glyphs.size() >= maximumGlyphsPerFont)
+            evictOldest(font);
         return &font.glyphs.emplace(character, std::move(glyph)).first->second;
     }
 
@@ -368,11 +403,47 @@ public:
         return m_fonts[static_cast<size_t>(weight)].face;
     }
 
+    size_t bytes() const
+    {
+        size_t total = 0;
+        for (const auto& font : m_fonts) {
+            for (const auto& entry : font.glyphs)
+                total += sizeof(entry) + entry.second.pixels.capacity();
+        }
+        return total;
+    }
+
+    void trim(bool critical)
+    {
+        for (auto& font : m_fonts) {
+            size_t target = critical ? 0 : warningGlyphsPerFont;
+            while (font.glyphs.size() > target)
+                evictOldest(font);
+            if (critical)
+                font.glyphs.rehash(0);
+        }
+    }
+
 private:
+    static constexpr size_t maximumGlyphsPerFont = 512;
+    static constexpr size_t warningGlyphsPerFont = 256;
+
     struct Font {
         FT_Face face { nullptr };
         std::unordered_map<gunichar, ChromeGlyph> glyphs;
     };
+
+    static void evictOldest(Font& font)
+    {
+        if (font.glyphs.empty())
+            return;
+        auto oldest = font.glyphs.begin();
+        for (auto it = std::next(font.glyphs.begin()); it != font.glyphs.end(); ++it) {
+            if (it->second.lastUsed < oldest->second.lastUsed)
+                oldest = it;
+        }
+        font.glyphs.erase(oldest);
+    }
 
     ChromeFontCache()
     {
@@ -419,6 +490,7 @@ private:
 
     FT_Library m_library { nullptr };
     std::array<Font, 3> m_fonts;
+    uint64_t m_generation { 0 };
 };
 
 struct PanelSize {
@@ -794,6 +866,16 @@ struct ChromeRenderState {
     bool canForward { false };
     bool touchDebug { false };
     unsigned height { 44 };
+    bool toolbarStacked { false };
+    int addressX { 8 };
+    int addressY { 6 };
+    int addressWidth { 0 };
+    int addressHeight { 32 };
+    int controlsX { 0 };
+    int controlsY { 6 };
+    int controlsWidth { 0 };
+    int controlsHeight { 32 };
+    int buttonCount { 5 };
     gint64 transitionUS { 0 };
     unsigned tabCount { 1 };
     unsigned activeTab { 0 };
@@ -918,6 +1000,27 @@ static ChromeRenderState readChromeRenderState()
         state.touchDebug = g_key_file_get_boolean(keyFile, "chrome", "touch_debug", nullptr);
     if (g_key_file_has_key(keyFile, "chrome", "height", nullptr))
         state.height = std::clamp<int>(g_key_file_get_integer(keyFile, "chrome", "height", nullptr), 24, 80);
+    if (g_key_file_has_key(keyFile, "chrome", "toolbar_stacked", nullptr))
+        state.toolbarStacked = g_key_file_get_boolean(keyFile, "chrome", "toolbar_stacked", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "address_x", nullptr))
+        state.addressX = g_key_file_get_integer(keyFile, "chrome", "address_x", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "address_y", nullptr))
+        state.addressY = g_key_file_get_integer(keyFile, "chrome", "address_y", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "address_width", nullptr))
+        state.addressWidth = g_key_file_get_integer(keyFile, "chrome", "address_width", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "address_height", nullptr))
+        state.addressHeight = g_key_file_get_integer(keyFile, "chrome", "address_height", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "controls_x", nullptr))
+        state.controlsX = g_key_file_get_integer(keyFile, "chrome", "controls_x", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "controls_y", nullptr))
+        state.controlsY = g_key_file_get_integer(keyFile, "chrome", "controls_y", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "controls_width", nullptr))
+        state.controlsWidth = g_key_file_get_integer(keyFile, "chrome", "controls_width", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "controls_height", nullptr))
+        state.controlsHeight = g_key_file_get_integer(keyFile, "chrome", "controls_height", nullptr);
+    if (g_key_file_has_key(keyFile, "chrome", "button_count", nullptr))
+        state.buttonCount = std::clamp(
+            g_key_file_get_integer(keyFile, "chrome", "button_count", nullptr), 1, 8);
     if (g_key_file_has_key(keyFile, "chrome", "transition_us", nullptr)) {
         char* value = g_key_file_get_string(keyFile, "chrome", "transition_us", nullptr);
         if (value) {
@@ -1762,17 +1865,38 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
         return;
 
     painter.fillRect(0, toolbarY, panelWidth, chromeHeight, dark);
-    int legacyButtonX = panelWidth / 2 + 8;
-    int buttonW = std::max<int>(36, (static_cast<int>(panelWidth) - legacyButtonX - 8) / 6);
-    int buttonX = legacyButtonX + buttonW;
-    int addressRight = buttonX - 8;
-    int addressWidth = std::max<int>(1, addressRight - 8);
-    int controlHeight = chromeHeight - 12;
-    painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8, white, mid, 1);
+    int addressX = chrome.addressWidth > 0 ? chrome.addressX : 8;
+    int addressY = chrome.addressWidth > 0 ? chrome.addressY : 6;
+    int addressWidth = chrome.addressWidth;
+    int addressHeight = chrome.addressHeight;
+    int controlsX = chrome.controlsX;
+    int controlsY = chrome.controlsY;
+    int controlsWidth = chrome.controlsWidth;
+    int controlsHeight = chrome.controlsHeight;
+    int buttonCount = std::clamp(chrome.buttonCount, 1, 8);
+    if (addressWidth <= 0 || addressHeight <= 0
+        || controlsWidth <= 0 || controlsHeight <= 0) {
+        int legacyButtonX = panelWidth / 2 + 8;
+        int legacyButtonW = std::max<int>(36,
+            (static_cast<int>(panelWidth) - legacyButtonX - 8) / 6);
+        controlsX = legacyButtonX + legacyButtonW;
+        controlsY = 6;
+        controlsWidth = legacyButtonW * 5;
+        controlsHeight = chromeHeight - 12;
+        buttonCount = 5;
+        addressX = 8;
+        addressY = 6;
+        addressWidth = std::max(1, controlsX - 16);
+        addressHeight = controlsHeight;
+    }
+    painter.drawRoundedRect(addressX, toolbarY + addressY,
+                            addressWidth, addressHeight, 8, white, mid, 1);
     if (chrome.pressedControl == -2)
-        painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8,
+        painter.drawRoundedRect(addressX, toolbarY + addressY,
+                                addressWidth, addressHeight, 8,
                                 theme.pressed, theme.pressed, 1);
-    painter.drawText(18, toolbarY + 17, chrome.url[0] ? chrome.url : chrome.homeLabel,
+    painter.drawText(addressX + 10, toolbarY + addressY + 11,
+                     chrome.url[0] ? chrome.url : chrome.homeLabel,
                      text, 1, std::max(1, addressWidth - 20));
 
     bool tabsPanelOpen = !strcmp(chrome.panel, "tabs");
@@ -1784,17 +1908,23 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
         overflowPanelOpen || !tabsPanelOpen || chrome.panelCanAdd,
         true
     };
-    for (int i = 0; i < 5; ++i) {
-        int x = buttonX + i * buttonW;
-        painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4, controlHeight, 6,
+    int visibleButtonCount = std::min(5, buttonCount);
+    for (int i = 0; i < visibleButtonCount; ++i) {
+        int x = controlsX + controlsWidth * i / buttonCount;
+        int right = controlsX + controlsWidth * (i + 1) / buttonCount;
+        int buttonW = std::max(1, right - x);
+        painter.drawRoundedRect(x + 2, toolbarY + controlsY + 1,
+                                std::max(1, buttonW - 4),
+                                std::max(1, controlsHeight - 2), 6,
                                 theme.surface, enabled[i] ? theme.outline : mid, 1);
         if (chrome.pressedControl == i)
-            painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4,
-                                    controlHeight, 6,
+            painter.drawRoundedRect(x + 2, toolbarY + controlsY + 1,
+                                    std::max(1, buttonW - 4),
+                                    std::max(1, controlsHeight - 2), 6,
                                     theme.pressed, theme.pressed, 1);
 
         int centerX = x + buttonW / 2;
-        int centerY = toolbarY + chromeHeight / 2;
+        int centerY = toolbarY + controlsY + controlsHeight / 2;
         uint32_t iconColor = enabled[i] ? accent : disabled;
         switch (i) {
         case 0:
@@ -2490,8 +2620,22 @@ public:
         size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
         int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
         auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
-        bool rgaGeometrySupported = panel.width == sourceWidth
-            && panel.height == sourceHeight;
+        auto topInset = chromeReservedTopInset(panel.height);
+        uint32_t availableHeight = panel.height > topInset
+            ? panel.height - topInset : 0;
+        uint32_t copyWidth = std::min(sourceWidth, panel.width);
+        uint32_t copyHeight = std::min(sourceHeight, availableHeight);
+        auto destinationDamage = rotatedDestRect(0, 0, copyWidth, copyHeight,
+            panel.width, panel.height, rotation, topInset);
+        RGARect destinationRect {
+            destinationDamage.x1,
+            destinationDamage.y1,
+            destinationDamage.x2 - destinationDamage.x1,
+            destinationDamage.y2 - destinationDamage.y1,
+        };
+        bool rgaGeometrySupported = !sourceOffset && copyWidth == sourceWidth
+            && copyHeight == sourceHeight && destinationRect.width > 0
+            && destinationRect.height > 0;
         auto& rga = RockchipRGA::singleton();
         if (rgaGeometrySupported && rga.shouldAttempt()) {
             if (m_rgaPrimeFD < 0) {
@@ -2502,9 +2646,19 @@ public:
                     m_rgaPrimeFD = -1;
                 }
             }
+            bool needsBackgroundClear = topInset || copyWidth != panel.width
+                || copyHeight != availableHeight;
+            if (m_rgaPrimeFD >= 0 && needsBackgroundClear) {
+                struct dma_buf_sync clearStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
+                ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &clearStart);
+                fillARGB8888(static_cast<uint8_t*>(m_mapping), m_pitch,
+                    m_width, m_height, 0xff000000);
+                struct dma_buf_sync clearEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
+                ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &clearEnd);
+            }
             if (m_rgaPrimeFD >= 0 && rga.rotate(sourceFD, sourceWidth, sourceHeight,
                     sourceStride, sourceFormat, m_rgaPrimeFD, m_width, m_height,
-                    m_pitch, rotation, m_lastRGADurationUS)) {
+                    m_pitch, rotation, m_lastRGADurationUS, destinationRect)) {
                 struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
                 if (ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &syncStart) < 0)
                     g_warning("WPEViewDRM rga destination sync start failed: %s", strerror(errno));
@@ -2515,7 +2669,7 @@ public:
                 m_lastDestDamage.clear();
                 m_pendingDamage.clear();
                 m_pendingFullRepaint = false;
-                m_lastTopInset = 0;
+                m_lastTopInset = topInset;
                 m_lastChromeHash = chromeStateCache().hash;
                 return true;
             }
@@ -2883,7 +3037,14 @@ struct _WPEViewDRMPrivate {
     uint32_t chromeBaseWidth { 0 };
     uint32_t chromeBaseHeight { 0 };
     uint32_t chromeBasePitch { 0 };
+    Vector<uint8_t> preparedChromeBasePixels;
+    uint32_t preparedChromeBaseWidth { 0 };
+    uint32_t preparedChromeBaseHeight { 0 };
+    uint32_t preparedChromeBasePitch { 0 };
+    guint64 preparedBaseGeneration { 0 };
+    guint64 committedFrameGeneration { 0 };
     guint64 chromeBaseGeneration { 0 };
+    guint64 staleChromeRedrawCount { 0 };
     gint64 pageCopyWindowTotalUS { 0 };
     gint64 pageCopyWindowMaxUS { 0 };
     guint64 pageCopyWindowCount { 0 };
@@ -2908,6 +3069,58 @@ static void wpeViewDRMDidPageFlip(WPEViewDRM*);
 static gboolean wpeViewDRMRequestUpdate(WPEViewDRM*, GError**);
 static void wpeViewDRMCompleteSynchronousCommitIfNeeded(WPEViewDRM*);
 static void setDamageRects(Vector<drm_mode_rect>&, const WPERectangle*, guint);
+static bool captureCommittedChromeBase(WPEViewDRM*);
+
+static guint64 wpeViewDRMCacheBytes(WPEViewDRM* view)
+{
+    auto* priv = view->priv;
+    return priv->chromeBasePixels.capacity()
+        + priv->preparedChromeBasePixels.capacity()
+        + priv->damageRects.capacity() * sizeof(drm_mode_rect)
+        + priv->queuedDamageRects.capacity() * sizeof(drm_mode_rect)
+        + ChromeFontCache::singleton().bytes();
+}
+
+guint64 wpe_view_drm_get_cache_bytes(WPEViewDRM* view)
+{
+    g_return_val_if_fail(WPE_IS_VIEW_DRM(view), 0);
+    return wpeViewDRMCacheBytes(view);
+}
+
+void wpe_view_drm_trim_caches(WPEViewDRM* view, gboolean critical)
+{
+    g_return_if_fail(WPE_IS_VIEW_DRM(view));
+    auto* priv = view->priv;
+    guint64 before = wpeViewDRMCacheBytes(view);
+    bool frameInFlight = priv->pendingBuffer || priv->pendingScanoutBuffer
+        || priv->queuedBuffer || priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested);
+
+    if (!frameInFlight) {
+        priv->preparedChromeBasePixels.clear();
+        priv->preparedChromeBasePixels.shrinkToFit();
+        priv->preparedChromeBaseWidth = 0;
+        priv->preparedChromeBaseHeight = 0;
+        priv->preparedChromeBasePitch = 0;
+        priv->preparedBaseGeneration = 0;
+        priv->damageRects.clear();
+        priv->damageRects.shrinkToFit();
+        priv->queuedDamageRects.clear();
+        priv->queuedDamageRects.shrinkToFit();
+        if (critical) {
+            priv->chromeBasePixels.clear();
+            priv->chromeBasePixels.shrinkToFit();
+            priv->chromeBaseWidth = 0;
+            priv->chromeBaseHeight = 0;
+            priv->chromeBasePitch = 0;
+            priv->chromeBaseGeneration = 0;
+        }
+    }
+    ChromeFontCache::singleton().trim(critical);
+    guint64 after = wpeViewDRMCacheBytes(view);
+    g_message("WPEViewDRM memory trim: level=%s frame_in_flight=%d before=%" G_GUINT64_FORMAT " after=%" G_GUINT64_FORMAT " released=%" G_GUINT64_FORMAT,
+        critical ? "critical" : "warning", frameInFlight, before, after,
+        before > after ? before - after : 0);
+}
 
 static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
 {
@@ -2927,6 +3140,18 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
         priv->pendingScanoutBuffer = nullptr;
     }
 
+    if (committedWebFrame) {
+        priv->committedFrameGeneration++;
+        if (priv->preparedBaseGeneration) {
+            priv->chromeBasePixels = WTF::move(priv->preparedChromeBasePixels);
+            priv->chromeBaseWidth = std::exchange(priv->preparedChromeBaseWidth, 0);
+            priv->chromeBaseHeight = std::exchange(priv->preparedChromeBaseHeight, 0);
+            priv->chromeBasePitch = std::exchange(priv->preparedChromeBasePitch, 0);
+            priv->chromeBaseGeneration = priv->committedFrameGeneration;
+            priv->preparedBaseGeneration = 0;
+        }
+    }
+
     // Chrome-only redraws now use the same page-flip lifecycle as WebKit frames,
     // but they must not be counted as newly rendered WebKit buffers.
     if (!committedWebFrame)
@@ -2944,11 +3169,12 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
     auto commitAverageMS = priv->commitWindowCount ? priv->commitWindowTotalUS / 1000. / priv->commitWindowCount : 0.;
     auto rgaAverageMS = priv->rgaRotateWindowCount
         ? priv->rgaRotateWindowTotalUS / 1000. / priv->rgaRotateWindowCount : 0.;
-    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f base_generation=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f frame_generation=%" G_GUINT64_FORMAT " chrome_base_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
         fps, copyAverageMS, priv->copyWindowMaxUS / 1000., rgaAverageMS,
         priv->rgaRotateWindowMaxUS / 1000., priv->rgaRotateWindowCount,
         priv->rgaCPUFallbackWindowCount, commitAverageMS, priv->commitWindowMaxUS / 1000.,
-        priv->chromeBaseGeneration, priv->retainedBaseFrameCount, priv->queuedWindowCount,
+        priv->committedFrameGeneration, priv->chromeBaseGeneration,
+        priv->staleChromeRedrawCount, priv->retainedBaseFrameCount, priv->queuedWindowCount,
         priv->replacedQueuedWindowCount, priv->droppedWindowCount,
         priv->statsWindowFrameCount, priv->frameCount, priv->pageFlipCount);
 
@@ -2971,6 +3197,7 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
     priv->rgaRotateWindowCount = 0;
     priv->rgaCPUFallbackWindowCount = 0;
     priv->retainedBaseFrameCount = 0;
+    priv->staleChromeRedrawCount = 0;
 }
 
 static void wpeViewDRMQueueBuffer(WPEViewDRM* view, WPEBuffer* buffer, const WPERectangle* damageRects, guint nDamageRects)
@@ -3195,15 +3422,23 @@ static void wpeViewDRMConstructed(GObject* object)
 
         if (stateChanged || animationActive || rotationChanged)
             videoOverlayRecommit(view);
-        if (priv->chromeMotionPending && priv->committedBuffer
-            && !priv->updateFlags.contains(UpdateFlags::BufferUpdateRequested)) {
-            if (wpeViewDRMRequestUpdate(view, nullptr)) {
+        bool webFrameWaiting = priv->pendingBuffer || priv->queuedBuffer
+            || priv->frameThrottleSource
+            || priv->updateFlags.containsAny({ UpdateFlags::BufferUpdateRequested,
+                UpdateFlags::BufferUpdatePending });
+        if (priv->chromeMotionPending && priv->committedBuffer && !webFrameWaiting) {
+            bool baseReady = priv->chromeBaseGeneration
+                    == priv->committedFrameGeneration
+                || captureCommittedChromeBase(view);
+            if (baseReady && wpeViewDRMRequestUpdate(view, nullptr)) {
                 priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
                 wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
                 priv->chromeMotionPending = false;
                 priv->chromeOverlayCommits++;
-            }
-        }
+            } else if (!baseReady)
+                priv->staleChromeRedrawCount++;
+        } else if (priv->chromeMotionPending && webFrameWaiting)
+            priv->staleChromeRedrawCount++;
 
         gint64 nowUS = g_get_monotonic_time();
         gint64 elapsedUS = nowUS - priv->chromeMotionStatsStartUS;
@@ -3396,9 +3631,14 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
 struct VideoOverlayWireMessage;
 static void videoOverlayPunchActiveHole(WPEViewDRM*, DRMScanoutBuffer*);
 
-static bool cacheChromeBase(WPEViewDRM* view, DRMScanoutBuffer* buffer)
+static bool captureCommittedChromeBase(WPEViewDRM* view)
 {
     auto* priv = view->priv;
+    auto* buffer = priv->committedScanoutBuffer;
+    priv->chromeBasePixels.clear();
+    priv->chromeBaseWidth = 0;
+    priv->chromeBaseHeight = 0;
+    priv->chromeBasePitch = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t pitch = 0;
@@ -3407,7 +3647,33 @@ static bool cacheChromeBase(WPEViewDRM* view, DRMScanoutBuffer* buffer)
     priv->chromeBaseWidth = width;
     priv->chromeBaseHeight = height;
     priv->chromeBasePitch = pitch;
-    priv->chromeBaseGeneration++;
+    priv->chromeBaseGeneration = priv->committedFrameGeneration;
+    return true;
+}
+
+static bool prepareChromeBaseIfNeeded(WPEViewDRM* view,
+                                      DRMScanoutBuffer* buffer)
+{
+    auto* priv = view->priv;
+    const auto& chrome = cachedChromeRenderState();
+    bool panelOpen = chrome.panel[0] && strcmp(chrome.panel, "none");
+    if (!priv->chromeMotionPending && !chrome.visible
+        && !panelOpen && !chromeAnimationActive()) {
+        priv->preparedBaseGeneration = 0;
+        return false;
+    }
+
+    priv->preparedChromeBasePixels.clear();
+    priv->preparedChromeBaseWidth = 0;
+    priv->preparedChromeBaseHeight = 0;
+    priv->preparedChromeBasePitch = 0;
+    if (!buffer || !buffer->copyBaseTo(priv->preparedChromeBasePixels,
+            priv->preparedChromeBaseWidth, priv->preparedChromeBaseHeight,
+            priv->preparedChromeBasePitch)) {
+        priv->preparedBaseGeneration = 0;
+        return false;
+    }
+    priv->preparedBaseGeneration = priv->committedFrameGeneration + 1;
     return true;
 }
 
@@ -3442,7 +3708,7 @@ static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer, 
         } else if (!candidate->copyFromSHM(buffer, error))
             return nullptr;
 
-        cacheChromeBase(view, candidate.get());
+        prepareChromeBaseIfNeeded(view, candidate.get());
         composeNativeChrome(view, candidate.get());
         priv->nextSHMScanoutBufferIndex = (index + 1) % priv->shmScanoutBuffers.size();
         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMDumb);
@@ -3477,7 +3743,7 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
         } else if (!candidate->copyRotatedFromDMABuf(device, buffer, rotation, error))
             return nullptr;
 
-        cacheChromeBase(view, candidate.get());
+        prepareChromeBaseIfNeeded(view, candidate.get());
         composeNativeChrome(view, candidate.get());
         candidate->finishRGAAccess();
         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
@@ -3510,7 +3776,7 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
         } else if (!candidate->copyRotatedFromSHM(buffer, rotation, error))
             return nullptr;
 
-        cacheChromeBase(view, candidate.get());
+        prepareChromeBaseIfNeeded(view, candidate.get());
         composeNativeChrome(view, candidate.get());
         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMRotatedDumb);
@@ -4732,6 +4998,11 @@ static void dropPendingFrame(WPEViewDRM* view)
         wpe_view_buffer_released(WPE_VIEW(view), priv->pendingBuffer.get());
     priv->pendingBuffer = nullptr;
     priv->pendingScanoutBuffer = nullptr;
+    priv->preparedChromeBasePixels.clear();
+    priv->preparedChromeBaseWidth = 0;
+    priv->preparedChromeBaseHeight = 0;
+    priv->preparedChromeBasePitch = 0;
+    priv->preparedBaseGeneration = 0;
     priv->damageRects.clear();
     priv->lastUpdateDroppedBuffer = true;
     priv->forceFullDamageNextFrame = true;
@@ -4750,7 +5021,12 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMRotatedDumb
                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::SHMDumb
                 || priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::ChromeDumb)));
-    bool uiOnlyRedraw = !priv->pendingBuffer && needsScanoutRebuild
+    bool webFrameWaiting = priv->pendingBuffer || priv->queuedBuffer
+        || priv->frameThrottleSource
+        || priv->updateFlags.contains(UpdateFlags::BufferUpdatePending);
+    if (!priv->pendingBuffer && webFrameWaiting)
+        needsScanoutRebuild = false;
+    bool uiOnlyRedraw = !webFrameWaiting && needsScanoutRebuild
         && !priv->chromeBasePixels.isEmpty();
     if (priv->pendingBuffer || needsScanoutRebuild) {
         UnixFileDescriptor renderingFence;
@@ -4839,8 +5115,18 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
         if (result && drmBuffer)
             priv->lastFrameCommitUS = commitStartUS;
         priv->lastCommitWasSynchronous = result && bufferUsesSynchronousCommit(drmBuffer);
-        if (!result && !priv->pendingBuffer)
-            priv->pendingScanoutBuffer = nullptr;
+        if (!result) {
+            if (!priv->pendingBuffer)
+                priv->pendingScanoutBuffer = nullptr;
+            else {
+                priv->forceFullDamageNextFrame = true;
+                priv->preparedChromeBasePixels.clear();
+                priv->preparedChromeBaseWidth = 0;
+                priv->preparedChromeBaseHeight = 0;
+                priv->preparedChromeBasePitch = 0;
+                priv->preparedBaseGeneration = 0;
+            }
+        }
         return result;
     }
 

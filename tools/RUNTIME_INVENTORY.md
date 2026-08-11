@@ -31,6 +31,14 @@ path.
 
 - Keep the complete bundled GStreamer set until site playback, WebRTC receive,
   DataChannel, Opus, MPP decode and DRM video overlay have automated coverage.
+- WebAudio decoding requires `libgstinterleave.so` in addition to the usual
+  decoder, audioconvert and audioresample plugins. Missing it presents as Ogg
+  `not-linked`, failed `.opus` assets and repeated game resource retries.
+- HTML video playback requires `libgstdeinterlace.so` when GStreamer inserts
+  `deinterlace` for interlaced or unknown-interlace streams. Missing it can
+  leave Poki previews or game media blank even when the decoder is present.
+- AVIF support consists of bundled `libavif.so.16` plus `libdav1d.so.7`; both
+  are runtime requirements when WebKit is built with `USE_AVIF=ON`.
 - Keep HarmonyOS Sans SC Regular/Medium/Bold and Noto Sans SC. Other CJK fonts
   are candidates only after a glyph-coverage comparison against all supported
   locales.

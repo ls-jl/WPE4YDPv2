@@ -51,6 +51,8 @@ WPE_VIDEO_OVERLAY_FIT=contain
 WEBKIT_GST_HOLE_PUNCH_QUIRK=rockchip
 WEBKIT_GST_WEBRTC_FORCE_EARLY_VIDEO_DECODING=1
 WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO=1
+WEBKIT_GST_FORCE_DEFAULT_ALSA_SINK=1
+WEBKIT_GST_SYSTEM_VOLUME_MUTE_BRIDGE=1
 WEBKIT_GST_WEBRTC_COALESCE_INCOMING_VIDEO=1
 WEBKIT_GST_WEBRTC_REPARSE_H264=1
 WEBKIT_GST_MPP_REQUIRE_H264_AU=1
@@ -132,6 +134,19 @@ Check gesture logs and the frozen video mapping before changing thresholds.
 This is separate from WebRTC. CPU read paths must wait for the rendering fence
 and perform full-frame copies by default. Keep `WPE_DRM_PARTIAL_COPY=0` while
 diagnosing; a fence timeout must retain the previous complete frame.
+
+### Poki Repeats Loading Or Misses Textures
+
+Classify network, image and WebAudio failures separately. A successful HTTP
+response does not prove that the browser can decode the resource. Check for
+`createImageBitmap` decode errors, AVIF support, `.opus` decode failures and
+GStreamer `not-linked`. The bundled runtime must include `deinterleave`; do
+not treat an audio pipeline construction failure as a page reload problem.
+
+For rotated output, verify `rga_frames` continues increasing while the toolbar
+reserves an inset. `rga_cpu_fallback` should remain zero. Full CPU snapshots
+are allowed only while native chrome is animating or a panel is active; they
+must not run once an immersive game has hidden the toolbar.
 
 ## Build And Rollback
 

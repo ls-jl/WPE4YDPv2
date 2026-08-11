@@ -1,0 +1,324 @@
+diff --git a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+index fb1bbd0..ede6ff7 100644
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -138,6 +138,13 @@ struct RGAHandleParameters {
+     uint32_t format;
+ };
+ 
++struct RGARect {
++    int x;
++    int y;
++    int width;
++    int height;
++};
++
+ class RockchipRGA {
+ public:
+     enum class Mode : uint8_t {
+@@ -162,7 +169,8 @@ public:
+     bool rotate(int sourceFD, uint32_t sourceWidth, uint32_t sourceHeight,
+         uint32_t sourceStride, uint32_t sourceFormat, int destinationFD,
+         uint32_t destinationWidth, uint32_t destinationHeight,
+-        uint32_t destinationStride, OutputRotation rotation, gint64& durationUS)
++        uint32_t destinationStride, OutputRotation rotation, gint64& durationUS,
++        RGARect destinationRect = { })
+     {
+         durationUS = 0;
+         if (!shouldAttempt())
+@@ -198,13 +206,31 @@ public:
+         auto destination = m_wrapBufferHandle(destinationHandle,
+             destinationWidth, destinationHeight, destinationStride / 4,
+             destinationHeight, rkFormatBGRA8888);
++        if (destinationRect.width <= 0 || destinationRect.height <= 0)
++            destinationRect = { 0, 0, static_cast<int>(destinationWidth),
++                static_cast<int>(destinationHeight) };
+         gint64 startUS = g_get_monotonic_time();
+-        int result = m_rotate(source, destination, transform, 1);
++        int result = 0;
++        bool useDestinationRect = destinationRect.x || destinationRect.y
++            || destinationRect.width != static_cast<int>(destinationWidth)
++            || destinationRect.height != static_cast<int>(destinationHeight);
++        if (useDestinationRect && m_process) {
++            RGABuffer pattern { };
++            RGARect sourceRect { 0, 0, static_cast<int>(sourceWidth),
++                static_cast<int>(sourceHeight) };
++            RGARect patternRect { };
++            result = m_process(source, destination, pattern, sourceRect,
++                destinationRect, patternRect, transform);
++        } else if (!useDestinationRect)
++            result = m_rotate(source, destination, transform, 1);
++        else
++            result = 0;
+         durationUS = g_get_monotonic_time() - startUS;
+         m_releaseBufferHandle(destinationHandle);
+         m_releaseBufferHandle(sourceHandle);
+         if (result <= 0)
+-            return fail("imrotate_t failed", result);
++            return fail(useDestinationRect
++                ? "improcess inset rotation failed" : "imrotate_t failed", result);
+ 
+         m_consecutiveFailures = 0;
+         return true;
+@@ -215,6 +241,8 @@ private:
+     using WrapBufferHandleFunction = RGABuffer (*)(RGABufferHandle, int, int, int, int, int);
+     using ReleaseBufferHandleFunction = int (*)(RGABufferHandle);
+     using RotateFunction = int (*)(const RGABuffer, RGABuffer, int, int);
++    using ProcessFunction = int (*)(RGABuffer, RGABuffer, RGABuffer,
++        RGARect, RGARect, RGARect, int);
+ 
+     static Mode mode()
+     {
+@@ -273,14 +301,15 @@ private:
+         m_wrapBufferHandle = reinterpret_cast<WrapBufferHandleFunction>(dlsym(m_library, "wrapbuffer_handle_t"));
+         m_releaseBufferHandle = reinterpret_cast<ReleaseBufferHandleFunction>(dlsym(m_library, "releasebuffer_handle"));
+         m_rotate = reinterpret_cast<RotateFunction>(dlsym(m_library, "imrotate_t"));
++        m_process = reinterpret_cast<ProcessFunction>(dlsym(m_library, "improcess"));
+         if (!m_importBufferFD || !m_wrapBufferHandle || !m_releaseBufferHandle || !m_rotate) {
+             g_warning("WPEViewDRM rga_rotation=unavailable path=%s error=missing-im2d-symbols", path);
+             dlclose(m_library);
+             m_library = nullptr;
+             return false;
+         }
+-        g_message("WPEViewDRM rga_rotation=available mode=%s path=%s",
+-            mode() == Mode::Required ? "required" : "auto", path);
++        g_message("WPEViewDRM rga_rotation=available mode=%s inset=%d path=%s",
++            mode() == Mode::Required ? "required" : "auto", !!m_process, path);
+         return true;
+     }
+ 
+@@ -304,6 +333,7 @@ private:
+     WrapBufferHandleFunction m_wrapBufferHandle { nullptr };
+     ReleaseBufferHandleFunction m_releaseBufferHandle { nullptr };
+     RotateFunction m_rotate { nullptr };
++    ProcessFunction m_process { nullptr };
+ };
+ 
+ struct ChromeGlyph {
+@@ -2548,8 +2578,22 @@ public:
+         size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
+         int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
+         auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
+-        bool rgaGeometrySupported = panel.width == sourceWidth
+-            && panel.height == sourceHeight;
++        auto topInset = chromeReservedTopInset(panel.height);
++        uint32_t availableHeight = panel.height > topInset
++            ? panel.height - topInset : 0;
++        uint32_t copyWidth = std::min(sourceWidth, panel.width);
++        uint32_t copyHeight = std::min(sourceHeight, availableHeight);
++        auto destinationDamage = rotatedDestRect(0, 0, copyWidth, copyHeight,
++            panel.width, panel.height, rotation, topInset);
++        RGARect destinationRect {
++            destinationDamage.x1,
++            destinationDamage.y1,
++            destinationDamage.x2 - destinationDamage.x1,
++            destinationDamage.y2 - destinationDamage.y1,
++        };
++        bool rgaGeometrySupported = !sourceOffset && copyWidth == sourceWidth
++            && copyHeight == sourceHeight && destinationRect.width > 0
++            && destinationRect.height > 0;
+         auto& rga = RockchipRGA::singleton();
+         if (rgaGeometrySupported && rga.shouldAttempt()) {
+             if (m_rgaPrimeFD < 0) {
+@@ -2560,9 +2604,19 @@ public:
+                     m_rgaPrimeFD = -1;
+                 }
+             }
++            bool needsBackgroundClear = topInset || copyWidth != panel.width
++                || copyHeight != availableHeight;
++            if (m_rgaPrimeFD >= 0 && needsBackgroundClear) {
++                struct dma_buf_sync clearStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
++                ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &clearStart);
++                fillARGB8888(static_cast<uint8_t*>(m_mapping), m_pitch,
++                    m_width, m_height, 0xff000000);
++                struct dma_buf_sync clearEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
++                ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &clearEnd);
++            }
+             if (m_rgaPrimeFD >= 0 && rga.rotate(sourceFD, sourceWidth, sourceHeight,
+                     sourceStride, sourceFormat, m_rgaPrimeFD, m_width, m_height,
+-                    m_pitch, rotation, m_lastRGADurationUS)) {
++                    m_pitch, rotation, m_lastRGADurationUS, destinationRect)) {
+                 struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
+                 if (ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &syncStart) < 0)
+                     g_warning("WPEViewDRM rga destination sync start failed: %s", strerror(errno));
+@@ -2573,7 +2627,7 @@ public:
+                 m_lastDestDamage.clear();
+                 m_pendingDamage.clear();
+                 m_pendingFullRepaint = false;
+-                m_lastTopInset = 0;
++                m_lastTopInset = topInset;
+                 m_lastChromeHash = chromeStateCache().hash;
+                 return true;
+             }
+@@ -2946,7 +3000,7 @@ struct _WPEViewDRMPrivate {
+     uint32_t preparedChromeBaseHeight { 0 };
+     uint32_t preparedChromeBasePitch { 0 };
+     guint64 preparedBaseGeneration { 0 };
+-    guint64 nextBaseGeneration { 0 };
++    guint64 committedFrameGeneration { 0 };
+     guint64 chromeBaseGeneration { 0 };
+     guint64 staleChromeRedrawCount { 0 };
+     gint64 pageCopyWindowTotalUS { 0 };
+@@ -2973,6 +3027,7 @@ static void wpeViewDRMDidPageFlip(WPEViewDRM*);
+ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM*, GError**);
+ static void wpeViewDRMCompleteSynchronousCommitIfNeeded(WPEViewDRM*);
+ static void setDamageRects(Vector<drm_mode_rect>&, const WPERectangle*, guint);
++static bool captureCommittedChromeBase(WPEViewDRM*);
+ 
+ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
+ {
+@@ -2992,16 +3047,16 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
+         priv->pendingScanoutBuffer = nullptr;
+     }
+ 
+-    // A page snapshot becomes eligible for chrome-only redraws only after the
+-    // corresponding scanout has completed its page flip. Publishing it while
+-    // the atomic commit is still pending lets UI animation resurrect a frame
+-    // that was never actually visible and produces alternating scroll states.
+-    if (committedWebFrame && priv->preparedBaseGeneration) {
+-        priv->chromeBasePixels = WTF::move(priv->preparedChromeBasePixels);
+-        priv->chromeBaseWidth = std::exchange(priv->preparedChromeBaseWidth, 0);
+-        priv->chromeBaseHeight = std::exchange(priv->preparedChromeBaseHeight, 0);
+-        priv->chromeBasePitch = std::exchange(priv->preparedChromeBasePitch, 0);
+-        priv->chromeBaseGeneration = std::exchange(priv->preparedBaseGeneration, 0);
++    if (committedWebFrame) {
++        priv->committedFrameGeneration++;
++        if (priv->preparedBaseGeneration) {
++            priv->chromeBasePixels = WTF::move(priv->preparedChromeBasePixels);
++            priv->chromeBaseWidth = std::exchange(priv->preparedChromeBaseWidth, 0);
++            priv->chromeBaseHeight = std::exchange(priv->preparedChromeBaseHeight, 0);
++            priv->chromeBasePitch = std::exchange(priv->preparedChromeBasePitch, 0);
++            priv->chromeBaseGeneration = priv->committedFrameGeneration;
++            priv->preparedBaseGeneration = 0;
++        }
+     }
+ 
+     // Chrome-only redraws now use the same page-flip lifecycle as WebKit frames,
+@@ -3021,11 +3076,11 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
+     auto commitAverageMS = priv->commitWindowCount ? priv->commitWindowTotalUS / 1000. / priv->commitWindowCount : 0.;
+     auto rgaAverageMS = priv->rgaRotateWindowCount
+         ? priv->rgaRotateWindowTotalUS / 1000. / priv->rgaRotateWindowCount : 0.;
+-    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f prepared_generation=%" G_GUINT64_FORMAT " committed_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
++    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f frame_generation=%" G_GUINT64_FORMAT " chrome_base_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+         fps, copyAverageMS, priv->copyWindowMaxUS / 1000., rgaAverageMS,
+         priv->rgaRotateWindowMaxUS / 1000., priv->rgaRotateWindowCount,
+         priv->rgaCPUFallbackWindowCount, commitAverageMS, priv->commitWindowMaxUS / 1000.,
+-        priv->preparedBaseGeneration, priv->chromeBaseGeneration,
++        priv->committedFrameGeneration, priv->chromeBaseGeneration,
+         priv->staleChromeRedrawCount, priv->retainedBaseFrameCount, priv->queuedWindowCount,
+         priv->replacedQueuedWindowCount, priv->droppedWindowCount,
+         priv->statsWindowFrameCount, priv->frameCount, priv->pageFlipCount);
+@@ -3279,12 +3334,16 @@ static void wpeViewDRMConstructed(GObject* object)
+             || priv->updateFlags.containsAny({ UpdateFlags::BufferUpdateRequested,
+                 UpdateFlags::BufferUpdatePending });
+         if (priv->chromeMotionPending && priv->committedBuffer && !webFrameWaiting) {
+-            if (wpeViewDRMRequestUpdate(view, nullptr)) {
++            bool baseReady = priv->chromeBaseGeneration
++                    == priv->committedFrameGeneration
++                || captureCommittedChromeBase(view);
++            if (baseReady && wpeViewDRMRequestUpdate(view, nullptr)) {
+                 priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
+                 wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
+                 priv->chromeMotionPending = false;
+                 priv->chromeOverlayCommits++;
+-            }
++            } else if (!baseReady)
++                priv->staleChromeRedrawCount++;
+         } else if (priv->chromeMotionPending && webFrameWaiting)
+             priv->staleChromeRedrawCount++;
+ 
+@@ -3479,23 +3538,49 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
+ struct VideoOverlayWireMessage;
+ static void videoOverlayPunchActiveHole(WPEViewDRM*, DRMScanoutBuffer*);
+ 
+-static bool prepareChromeBase(WPEViewDRM* view, DRMScanoutBuffer* buffer)
++static bool captureCommittedChromeBase(WPEViewDRM* view)
++{
++    auto* priv = view->priv;
++    auto* buffer = priv->committedScanoutBuffer;
++    priv->chromeBasePixels.clear();
++    priv->chromeBaseWidth = 0;
++    priv->chromeBaseHeight = 0;
++    priv->chromeBasePitch = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t pitch = 0;
++    if (!buffer || !buffer->copyBaseTo(priv->chromeBasePixels, width, height, pitch))
++        return false;
++    priv->chromeBaseWidth = width;
++    priv->chromeBaseHeight = height;
++    priv->chromeBasePitch = pitch;
++    priv->chromeBaseGeneration = priv->committedFrameGeneration;
++    return true;
++}
++
++static bool prepareChromeBaseIfNeeded(WPEViewDRM* view,
++                                      DRMScanoutBuffer* buffer)
+ {
+     auto* priv = view->priv;
++    const auto& chrome = cachedChromeRenderState();
++    bool panelOpen = chrome.panel[0] && strcmp(chrome.panel, "none");
++    if (!priv->chromeMotionPending && !chrome.visible
++        && !panelOpen && !chromeAnimationActive()) {
++        priv->preparedBaseGeneration = 0;
++        return false;
++    }
++
+     priv->preparedChromeBasePixels.clear();
+     priv->preparedChromeBaseWidth = 0;
+     priv->preparedChromeBaseHeight = 0;
+     priv->preparedChromeBasePitch = 0;
+-    priv->preparedBaseGeneration = 0;
+-    uint32_t width = 0;
+-    uint32_t height = 0;
+-    uint32_t pitch = 0;
+-    if (!buffer || !buffer->copyBaseTo(priv->preparedChromeBasePixels, width, height, pitch))
++    if (!buffer || !buffer->copyBaseTo(priv->preparedChromeBasePixels,
++            priv->preparedChromeBaseWidth, priv->preparedChromeBaseHeight,
++            priv->preparedChromeBasePitch)) {
++        priv->preparedBaseGeneration = 0;
+         return false;
+-    priv->preparedChromeBaseWidth = width;
+-    priv->preparedChromeBaseHeight = height;
+-    priv->preparedChromeBasePitch = pitch;
+-    priv->preparedBaseGeneration = ++priv->nextBaseGeneration;
++    }
++    priv->preparedBaseGeneration = priv->committedFrameGeneration + 1;
+     return true;
+ }
+ 
+@@ -3530,7 +3615,7 @@ static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer,
+         } else if (!candidate->copyFromSHM(buffer, error))
+             return nullptr;
+ 
+-        prepareChromeBase(view, candidate.get());
++        prepareChromeBaseIfNeeded(view, candidate.get());
+         composeNativeChrome(view, candidate.get());
+         priv->nextSHMScanoutBufferIndex = (index + 1) % priv->shmScanoutBuffers.size();
+         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMDumb);
+@@ -3565,7 +3650,7 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
+         } else if (!candidate->copyRotatedFromDMABuf(device, buffer, rotation, error))
+             return nullptr;
+ 
+-        prepareChromeBase(view, candidate.get());
++        prepareChromeBaseIfNeeded(view, candidate.get());
+         composeNativeChrome(view, candidate.get());
+         candidate->finishRGAAccess();
+         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
+@@ -3598,7 +3683,7 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
+         } else if (!candidate->copyRotatedFromSHM(buffer, rotation, error))
+             return nullptr;
+ 
+-        prepareChromeBase(view, candidate.get());
++        prepareChromeBaseIfNeeded(view, candidate.get());
+         composeNativeChrome(view, candidate.get());
+         priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
+         logBufferPathOnce(DRMScanoutBuffer::Kind::SHMRotatedDumb);
+@@ -4941,6 +5026,7 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+             if (!priv->pendingBuffer)
+                 priv->pendingScanoutBuffer = nullptr;
+             else {
++                priv->forceFullDamageNextFrame = true;
+                 priv->preparedChromeBasePixels.clear();
+                 priv->preparedChromeBaseWidth = 0;
+                 priv->preparedChromeBaseHeight = 0;

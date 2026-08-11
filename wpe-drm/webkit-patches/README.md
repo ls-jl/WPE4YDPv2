@@ -8,15 +8,32 @@ the patches in application order.
 
 - `0100-wpe-drm-platform.patch`: DRM scanout, native chrome, raw-touch seat
   ownership, video overlay and synchronized video-plane commits.
+- `0150-drm-generation-order.patch`: orders page, chrome and page-flip
+  generations so UI redraws cannot resurrect an uncommitted page frame.
+- `0160-rga-inset-and-lazy-chrome-base.patch`: keeps toolbar-resized rotated
+  frames on RGA and avoids full CPU base snapshots while chrome is idle.
 - `0200-skia-raster-compositor.patch`: direct Skia CPU raster-to-SHM path,
   compositor scheduling and GL-fence avoidance for CPU devices.
+- `0250-full-repaint-on-motion.patch`: forces complete target painting and
+  full damage publication during async scrolling. Animation repaint is an
+  explicit diagnostic opt-in because games animate continuously.
+- `0260-imagebitmap-complete-decode.patch`: forces lazy first-frame decoding
+  before rejecting Blob-backed `createImageBitmap()` resources.
+- `0270-webaudio-missing-elements.patch`: fails WebAudio decoding cleanly when
+  a required bundled GStreamer element is absent.
 - `0300-webrtc-media-overlay.patch`: WebRTC negotiation, DataChannel,
   Rockchip MPP decode, direct audio and hole-punch video integration.
+- `0310-system-volume-control.patch`: routes audio through the system default
+  ALSA PCM and adds true mute for the direct WebRTC audio branch when the
+  system Master control reaches its minimum.
 - `0400-network-cloud-compat.patch`: scoped cloud TLS compatibility and
   WebSocket diagnostics required by the current cloud-game flow.
+- `0500-adaptive-memory-pressure.patch`: adds configurable Linux system-memory
+  thresholds with recovery hysteresis, bounded native glyph caching and safe
+  DRM chrome-cache trimming without releasing scanout or in-flight buffers.
 
 The former experiment-by-experiment patches and full modified source mirrors
-were consolidated after replaying these four patches successfully against
+were consolidated after replaying the production series successfully against
 `9effc8745be9b7b0fab96b29cc69716c9a5c4ae0`. Their history remains available
 in Git before `pre-cleanup-20260731`.
 

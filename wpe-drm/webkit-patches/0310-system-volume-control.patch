@@ -1,0 +1,261 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp b/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp
+index e4b3b2d..3c55bb3 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.cpp
+@@ -38,6 +38,7 @@
+ #include "SharedBuffer.h"
+ #include "VideoSinkGStreamer.h"
+ #include "WebKitAudioSinkGStreamer.h"
++#include <dlfcn.h>
+ #include <fnmatch.h>
+ #include <gst/audio/audio-info.h>
+ #include <gst/gst.h>
+@@ -1190,6 +1191,16 @@ IGNORE_WARNINGS_END
+ 
+ GstElement* /* (transfer floating) */ createPlatformAudioSink(const String& role, const String& deviceId, const GRefPtr<GstDevice>& device)
+ {
++    const char* forceDefaultAlsa = g_getenv("WEBKIT_GST_FORCE_DEFAULT_ALSA_SINK");
++    if (!device && forceDefaultAlsa && !g_strcmp0(forceDefaultAlsa, "1")) {
++        if (auto* audioSink = gst_element_factory_make("alsasink", nullptr)) {
++            g_object_set(audioSink, "device", "default", nullptr);
++            GST_WARNING_OBJECT(audioSink, "Using system default ALSA PCM for browser audio");
++            return audioSink;
++        }
++        GST_WARNING("System default ALSA sink requested but alsasink is unavailable; falling back to platform selection");
++    }
++
+     GstElement* audioSink = webkitAudioSinkNew(role, deviceId, device);
+     if (!audioSink) {
+         // This means the WebKit audio sink configuration failed. It can happen for the following reasons:
+@@ -1205,6 +1216,171 @@ GstElement* /* (transfer floating) */ createPlatformAudioSink(const String& role
+     return audioSink;
+ }
+ 
++namespace {
++
++struct snd_mixer_t;
++struct snd_mixer_elem_t;
++
++struct AlsaMixerAPI {
++    void* library { nullptr };
++    int (*mixerOpen)(snd_mixer_t**, int) { nullptr };
++    int (*mixerAttach)(snd_mixer_t*, const char*) { nullptr };
++    int (*mixerRegister)(snd_mixer_t*, void*, void**) { nullptr };
++    int (*mixerLoad)(snd_mixer_t*) { nullptr };
++    snd_mixer_elem_t* (*firstElement)(snd_mixer_t*) { nullptr };
++    snd_mixer_elem_t* (*nextElement)(snd_mixer_elem_t*) { nullptr };
++    int (*elementIsActive)(snd_mixer_elem_t*) { nullptr };
++    int (*hasPlaybackVolume)(snd_mixer_elem_t*) { nullptr };
++    const char* (*elementName)(snd_mixer_elem_t*) { nullptr };
++    int (*volumeRange)(snd_mixer_elem_t*, long*, long*) { nullptr };
++    int (*playbackVolume)(snd_mixer_elem_t*, int, long*) { nullptr };
++    int (*handleEvents)(snd_mixer_t*) { nullptr };
++    int (*mixerClose)(snd_mixer_t*) { nullptr };
++};
++
++template<typename T> bool loadAlsaSymbol(void* library, T& target, const char* name)
++{
++    target = reinterpret_cast<T>(dlsym(library, name));
++    return target;
++}
++
++static bool loadAlsaMixerAPI(AlsaMixerAPI& api)
++{
++    api.library = dlopen("libasound.so.2", RTLD_NOW | RTLD_LOCAL);
++    if (!api.library)
++        return false;
++
++    bool loaded = loadAlsaSymbol(api.library, api.mixerOpen, "snd_mixer_open")
++        && loadAlsaSymbol(api.library, api.mixerAttach, "snd_mixer_attach")
++        && loadAlsaSymbol(api.library, api.mixerRegister, "snd_mixer_selem_register")
++        && loadAlsaSymbol(api.library, api.mixerLoad, "snd_mixer_load")
++        && loadAlsaSymbol(api.library, api.firstElement, "snd_mixer_first_elem")
++        && loadAlsaSymbol(api.library, api.nextElement, "snd_mixer_elem_next")
++        && loadAlsaSymbol(api.library, api.elementIsActive, "snd_mixer_selem_is_active")
++        && loadAlsaSymbol(api.library, api.hasPlaybackVolume, "snd_mixer_selem_has_playback_volume")
++        && loadAlsaSymbol(api.library, api.elementName, "snd_mixer_selem_get_name")
++        && loadAlsaSymbol(api.library, api.volumeRange, "snd_mixer_selem_get_playback_volume_range")
++        && loadAlsaSymbol(api.library, api.playbackVolume, "snd_mixer_selem_get_playback_volume")
++        && loadAlsaSymbol(api.library, api.handleEvents, "snd_mixer_handle_events")
++        && loadAlsaSymbol(api.library, api.mixerClose, "snd_mixer_close");
++    if (!loaded) {
++        dlclose(api.library);
++        api.library = nullptr;
++    }
++    return loaded;
++}
++
++struct SystemVolumeMuteBridge {
++    AlsaMixerAPI api;
++    snd_mixer_t* mixer { nullptr };
++    snd_mixer_elem_t* element { nullptr };
++    long minimum { 0 };
++    GWeakRef volumeElement;
++    std::optional<bool> muted;
++    unsigned card { 0 };
++};
++
++static void destroySystemVolumeMuteBridge(gpointer data)
++{
++    auto* bridge = static_cast<SystemVolumeMuteBridge*>(data);
++    g_weak_ref_clear(&bridge->volumeElement);
++    if (bridge->mixer)
++        bridge->api.mixerClose(bridge->mixer);
++    if (bridge->api.library)
++        dlclose(bridge->api.library);
++    delete bridge;
++}
++
++static bool openSystemVolumeMixer(SystemVolumeMuteBridge& bridge)
++{
++    if (!loadAlsaMixerAPI(bridge.api))
++        return false;
++
++    for (unsigned card = 0; card < 8; ++card) {
++        snd_mixer_t* mixer = nullptr;
++        if (bridge.api.mixerOpen(&mixer, 0) < 0 || !mixer)
++            continue;
++
++        char device[16];
++        g_snprintf(device, sizeof(device), "hw:%u", card);
++        if (bridge.api.mixerAttach(mixer, device) < 0
++            || bridge.api.mixerRegister(mixer, nullptr, nullptr) < 0
++            || bridge.api.mixerLoad(mixer) < 0) {
++            bridge.api.mixerClose(mixer);
++            continue;
++        }
++
++        for (auto* element = bridge.api.firstElement(mixer); element; element = bridge.api.nextElement(element)) {
++            const char* name = bridge.api.elementName(element);
++            if (!bridge.api.elementIsActive(element)
++                || !bridge.api.hasPlaybackVolume(element)
++                || !name || g_strcmp0(name, "Master"))
++                continue;
++
++            long maximum = 0;
++            bridge.api.volumeRange(element, &bridge.minimum, &maximum);
++            bridge.mixer = mixer;
++            bridge.element = element;
++            bridge.card = card;
++            return true;
++        }
++        bridge.api.mixerClose(mixer);
++    }
++    return false;
++}
++
++static gboolean updateSystemVolumeMute(gpointer data)
++{
++    auto* bridge = static_cast<SystemVolumeMuteBridge*>(data);
++    auto* volumeElement = GST_ELEMENT_CAST(g_weak_ref_get(&bridge->volumeElement));
++    if (!volumeElement)
++        return G_SOURCE_REMOVE;
++
++    bridge->api.handleEvents(bridge->mixer);
++    long left = bridge->minimum;
++    long right = bridge->minimum;
++    bool haveLeft = bridge->api.playbackVolume(bridge->element, 0, &left) >= 0;
++    bool haveRight = bridge->api.playbackVolume(bridge->element, 1, &right) >= 0;
++    bool muted = haveLeft || haveRight;
++    if (haveLeft)
++        muted &= left <= bridge->minimum;
++    if (haveRight)
++        muted &= right <= bridge->minimum;
++
++    if (!bridge->muted || *bridge->muted != muted) {
++        g_object_set(volumeElement, "mute", muted, nullptr);
++        GST_WARNING_OBJECT(volumeElement, "System volume bridge card=%u raw=%ld/%ld minimum=%ld muted=%d",
++            bridge->card, left, right, bridge->minimum, muted);
++        bridge->muted = muted;
++    }
++    gst_object_unref(volumeElement);
++    return G_SOURCE_CONTINUE;
++}
++
++} // namespace
++
++GstElement* createSystemVolumeElement()
++{
++    auto* volume = gst_element_factory_make("volume", nullptr);
++    if (!volume)
++        return nullptr;
++
++    const char* bridgeEnabled = g_getenv("WEBKIT_GST_SYSTEM_VOLUME_MUTE_BRIDGE");
++    if (!bridgeEnabled || g_strcmp0(bridgeEnabled, "1"))
++        return volume;
++
++    auto bridge = std::unique_ptr<SystemVolumeMuteBridge>(new SystemVolumeMuteBridge);
++    if (!openSystemVolumeMixer(*bridge)) {
++        GST_WARNING_OBJECT(volume, "System volume bridge could not find an ALSA Master playback control");
++        return volume;
++    }
++
++    g_weak_ref_init(&bridge->volumeElement, G_OBJECT(volume));
++    updateSystemVolumeMute(bridge.get());
++    g_timeout_add_full(G_PRIORITY_DEFAULT, 100, updateSystemVolumeMute, bridge.release(), destroySystemVolumeMuteBridge);
++    return volume;
++}
++
+ bool webkitGstSetElementStateSynchronously(GstElement* pipeline, GstState targetState, Function<bool(GstMessage*)>&& messageHandler)
+ {
+     GST_DEBUG_OBJECT(pipeline, "Setting state to %s", gst_state_get_name(targetState));
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.h b/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.h
+index a085d31..99abb71 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.h
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerCommon.h
+@@ -294,6 +294,7 @@ bool gstElementFactoryEquals(GstElement*, ASCIILiteral name);
+ 
+ GstElement* createAutoAudioSink(const String& role);
+ GstElement* createPlatformAudioSink(const String& role, const String& deviceId = { }, const GRefPtr<GstDevice>& = { });
++GstElement* createSystemVolumeElement();
+ 
+ bool webkitGstSetElementStateSynchronously(GstElement*, GstState, Function<bool(GstMessage*)>&& = [](GstMessage*) -> bool {
+     return true;
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+index aaea4c9..9a08978 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -227,21 +227,26 @@ void GStreamerIncomingTrackProcessor::configure(ThreadSafeWeakPtr<GStreamerMedia
+         && m_isDecoding && useDirectRemoteAudioSink();
+     GstElement* tee = nullptr;
+     GstElement* directAudioQueue = nullptr;
++    GstElement* directAudioVolume = nullptr;
+     GstElement* directAudioSink = nullptr;
+     bool trackProcessorLinked = false;
+ 
+     if (directRemoteAudio) {
+         tee = gst_element_factory_make("tee", "direct-remote-audio-tee");
+         directAudioQueue = gst_element_factory_make("queue", "direct-remote-audio-queue");
+-        if (tee && directAudioQueue)
++        if (tee && directAudioQueue) {
++            directAudioVolume = createSystemVolumeElement();
+             directAudioSink = createPlatformAudioSink("video"_s);
+-        if (!tee || !directAudioQueue || !directAudioSink) {
++        }
++        if (!tee || !directAudioQueue || !directAudioVolume || !directAudioSink) {
+             GST_ERROR_OBJECT(m_bin.get(), "Direct remote audio elements unavailable; using MediaStream player audio");
+             discardFloatingElement(tee);
+             discardFloatingElement(directAudioQueue);
++            discardFloatingElement(directAudioVolume);
+             discardFloatingElement(directAudioSink);
+             tee = nullptr;
+             directAudioQueue = nullptr;
++            directAudioVolume = nullptr;
+             directAudioSink = nullptr;
+             directRemoteAudio = false;
+         }
+@@ -257,12 +262,12 @@ void GStreamerIncomingTrackProcessor::configure(ThreadSafeWeakPtr<GStreamerMedia
+             g_object_set(directAudioSink, "async", FALSE, nullptr);
+ 
+         gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), tee, queue, m_sink.get(),
+-            directAudioQueue, directAudioSink, nullptr);
++            directAudioQueue, directAudioVolume, directAudioSink, nullptr);
+         bool linked = gst_element_link(trackProcessor.get(), tee)
+             && gst_element_link(tee, queue)
+             && gst_element_link(queue, m_sink.get())
+             && gst_element_link(tee, directAudioQueue)
+-            && gst_element_link(directAudioQueue, directAudioSink);
++            && gst_element_link_many(directAudioQueue, directAudioVolume, directAudioSink, nullptr);
+         RELEASE_ASSERT(linked);
+         trackProcessorLinked = true;
+         GST_WARNING_OBJECT(m_bin.get(), "Using direct remote audio sink with isolated leaky branches");

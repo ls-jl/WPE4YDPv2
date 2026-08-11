@@ -18,7 +18,7 @@ hash_file() {
 SERIES_INPUT=$(mktemp "${TMPDIR:-/tmp}/wpe-patch-series.XXXXXX")
 trap 'rm -f "$SERIES_INPUT"' EXIT
 cat "$PATCH_ROOT/series" > "$SERIES_INPUT"
-while IFS= read -r patch; do
+while IFS= read -r patch || [ -n "$patch" ]; do
     case "$patch" in
         ''|'#'*) continue ;;
     esac
@@ -42,6 +42,8 @@ cat > "$OUTPUT.tmp" <<EOF
     "ENABLE_MEDIA_STREAM": true,
     "ENABLE_VIDEO": true,
     "ENABLE_WEBGL": true,
+    "USE_AVIF": true,
+    "USE_JPEGXL": false,
     "USE_GBM": true,
     "USE_SKIA": true,
     "ENABLE_GPU_PROCESS": false

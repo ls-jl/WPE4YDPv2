@@ -1,5 +1,5 @@
 diff --git a/Source/WebKit/WPEPlatform/wpe/drm/CMakeLists.txt b/Source/WebKit/WPEPlatform/wpe/drm/CMakeLists.txt
-index 6cd4483a..9dfa7a3a 100644
+index 6cd4483acd61e4d4aa9cc51dfdc6d9903205f55e..9dfa7a3ab1aac56a93e5104397f2ffd0be75aef0 100644
 --- a/Source/WebKit/WPEPlatform/wpe/drm/CMakeLists.txt
 +++ b/Source/WebKit/WPEPlatform/wpe/drm/CMakeLists.txt
 @@ -33,6 +33,7 @@ set(WPEPlatformDRM_SYSTEM_INCLUDE_DIRECTORIES
@@ -11,7 +11,7 @@ index 6cd4483a..9dfa7a3a 100644
      LibInput::LibInput
      Udev::Udev
 diff --git a/Source/WebKit/WPEPlatform/wpe/drm/WPEDRMSeat.cpp b/Source/WebKit/WPEPlatform/wpe/drm/WPEDRMSeat.cpp
-index cf817133..740511fb 100644
+index cf817133ec994b9670b5d1f560cad1964155faff..740511fbfbaabea912fc81d41113bef06fb2b870 100644
 --- a/Source/WebKit/WPEPlatform/wpe/drm/WPEDRMSeat.cpp
 +++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEDRMSeat.cpp
 @@ -32,6 +32,7 @@
@@ -48,7 +48,7 @@ index cf817133..740511fb 100644
      },
      // close_restricted
 diff --git a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
-index 93e75f13..085d3aa2 100644
+index 93e75f139bb2c1e090b1f9cd43eeecdfdcf3801e..30139a665e183c203117d5f652235ca2c0f52078 100644
 --- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
 +++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
 @@ -26,6 +26,7 @@
@@ -456,7 +456,20 @@ index 93e75f13..085d3aa2 100644
  static PanelSize scanoutPanelForSource(uint32_t sourceWidth, uint32_t sourceHeight)
  {
      PanelSize sourcePanel { sourceWidth, sourceHeight };
-@@ -427,11 +797,43 @@ struct ChromeRenderState {
+@@ -424,14 +794,56 @@ struct ChromeRenderState {
+     bool canForward { false };
+     bool touchDebug { false };
+     unsigned height { 44 };
++    bool toolbarStacked { false };
++    int addressX { 8 };
++    int addressY { 6 };
++    int addressWidth { 0 };
++    int addressHeight { 32 };
++    int controlsX { 0 };
++    int controlsY { 6 };
++    int controlsWidth { 0 };
++    int controlsHeight { 32 };
++    int buttonCount { 5 };
      gint64 transitionUS { 0 };
      unsigned tabCount { 1 };
      unsigned activeTab { 0 };
@@ -500,7 +513,7 @@ index 93e75f13..085d3aa2 100644
  };
  
  static bool chromeEnabled()
-@@ -482,6 +884,12 @@ static void copyKeyString(GKeyFile* keyFile, const char* group, const char* key,
+@@ -482,6 +894,12 @@ static void copyKeyString(GKeyFile* keyFile, const char* group, const char* key,
  static ChromeRenderState readChromeRenderState()
  {
      ChromeRenderState state;
@@ -513,7 +526,35 @@ index 93e75f13..085d3aa2 100644
      state.enabled = chromeEnabled();
      if (!state.enabled)
          return state;
-@@ -526,10 +934,17 @@ static ChromeRenderState readChromeRenderState()
+@@ -510,6 +928,27 @@ static ChromeRenderState readChromeRenderState()
+         state.touchDebug = g_key_file_get_boolean(keyFile, "chrome", "touch_debug", nullptr);
+     if (g_key_file_has_key(keyFile, "chrome", "height", nullptr))
+         state.height = std::clamp<int>(g_key_file_get_integer(keyFile, "chrome", "height", nullptr), 24, 80);
++    if (g_key_file_has_key(keyFile, "chrome", "toolbar_stacked", nullptr))
++        state.toolbarStacked = g_key_file_get_boolean(keyFile, "chrome", "toolbar_stacked", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "address_x", nullptr))
++        state.addressX = g_key_file_get_integer(keyFile, "chrome", "address_x", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "address_y", nullptr))
++        state.addressY = g_key_file_get_integer(keyFile, "chrome", "address_y", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "address_width", nullptr))
++        state.addressWidth = g_key_file_get_integer(keyFile, "chrome", "address_width", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "address_height", nullptr))
++        state.addressHeight = g_key_file_get_integer(keyFile, "chrome", "address_height", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "controls_x", nullptr))
++        state.controlsX = g_key_file_get_integer(keyFile, "chrome", "controls_x", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "controls_y", nullptr))
++        state.controlsY = g_key_file_get_integer(keyFile, "chrome", "controls_y", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "controls_width", nullptr))
++        state.controlsWidth = g_key_file_get_integer(keyFile, "chrome", "controls_width", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "controls_height", nullptr))
++        state.controlsHeight = g_key_file_get_integer(keyFile, "chrome", "controls_height", nullptr);
++    if (g_key_file_has_key(keyFile, "chrome", "button_count", nullptr))
++        state.buttonCount = std::clamp(
++            g_key_file_get_integer(keyFile, "chrome", "button_count", nullptr), 1, 8);
+     if (g_key_file_has_key(keyFile, "chrome", "transition_us", nullptr)) {
+         char* value = g_key_file_get_string(keyFile, "chrome", "transition_us", nullptr);
+         if (value) {
+@@ -526,10 +965,17 @@ static ChromeRenderState readChromeRenderState()
          state.activeTab = std::max<int>(0, g_key_file_get_integer(keyFile, "chrome", "active_tab", nullptr));
  
      copyKeyString(keyFile, "chrome", "panel", state.panel, sizeof(state.panel));
@@ -531,7 +572,7 @@ index 93e75f13..085d3aa2 100644
          auto count = std::clamp<int>(g_key_file_get_integer(keyFile, "panel", "line_count", nullptr), 0, 10);
          state.lineCount = count;
          for (int i = 0; i < count; ++i) {
-@@ -537,6 +952,76 @@ static ChromeRenderState readChromeRenderState()
+@@ -537,6 +983,76 @@ static ChromeRenderState readChromeRenderState()
              snprintf(key, sizeof(key), "line%d", i);
              copyKeyString(keyFile, "panel", key, state.lines[i], sizeof(state.lines[i]));
          }
@@ -608,7 +649,7 @@ index 93e75f13..085d3aa2 100644
      }
  
      g_key_file_unref(keyFile);
-@@ -707,11 +1192,28 @@ public:
+@@ -707,11 +1223,28 @@ public:
          , m_panelHeight(panelHeight)
          , m_rotation(rotation)
      {
@@ -638,7 +679,7 @@ index 93e75f13..085d3aa2 100644
              return;
  
          int dx = x;
-@@ -739,14 +1241,50 @@ public:
+@@ -739,14 +1272,50 @@ public:
          row[dx] = color;
      }
  
@@ -693,7 +734,7 @@ index 93e75f13..085d3aa2 100644
          if (x2 <= x1 || y2 <= y1)
              return;
          auto rect = rotatedDestRect(x1, y1, x2, y2, m_panelWidth, m_panelHeight, m_rotation, 0);
-@@ -768,6 +1306,167 @@ public:
+@@ -768,6 +1337,167 @@ public:
          fillRect(x + width - 1, y, 1, height, color);
      }
  
@@ -861,7 +902,7 @@ index 93e75f13..085d3aa2 100644
      void drawChar(int x, int y, char c, uint32_t color, int scale)
      {
          if (c == ' ')
-@@ -783,10 +1482,41 @@ public:
+@@ -783,10 +1513,41 @@ public:
          }
      }
  
@@ -904,7 +945,7 @@ index 93e75f13..085d3aa2 100644
          int cursor = x;
          int advance = 6 * scale;
          for (const char* p = text; *p && cursor + advance <= x + maxWidth; ++p) {
-@@ -795,6 +1525,30 @@ public:
+@@ -795,6 +1556,30 @@ public:
          }
      }
  
@@ -935,7 +976,7 @@ index 93e75f13..085d3aa2 100644
  private:
      uint8_t* m_destination { nullptr };
      uint32_t m_destinationPitch { 0 };
-@@ -803,8 +1557,168 @@ private:
+@@ -803,8 +1588,168 @@ private:
      uint32_t m_panelWidth { 0 };
      uint32_t m_panelHeight { 0 };
      OutputRotation m_rotation { OutputRotation::Rotate0 };
@@ -1104,7 +1145,7 @@ index 93e75f13..085d3aa2 100644
  static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, uint32_t destinationWidth, uint32_t destinationHeight, uint32_t panelWidth, uint32_t panelHeight, OutputRotation rotation)
  {
      const auto& chrome = cachedChromeRenderState();
-@@ -817,15 +1731,16 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
+@@ -817,15 +1762,16 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
      }
  
      PanelPixelWriter painter(destination, destinationPitch, destinationWidth, destinationHeight, panelWidth, panelHeight, rotation);
@@ -1129,7 +1170,7 @@ index 93e75f13..085d3aa2 100644
  
      int chromeHeight = std::clamp<int>(chrome.height, 24, std::min<int>(80, panelHeight));
      bool hasPanel = strcmp(chrome.panel, "none") && chrome.panel[0];
-@@ -847,47 +1762,340 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
+@@ -847,47 +1793,367 @@ static void drawChromeOverlay(uint8_t* destination, uint32_t destinationPitch, u
          return;
  
      painter.fillRect(0, toolbarY, panelWidth, chromeHeight, dark);
@@ -1142,17 +1183,42 @@ index 93e75f13..085d3aa2 100644
 -    const char* labels[6] = { "<", ">", "TAB", "+", chrome.loading ? "X" : "R", "SET" };
 -    bool enabled[6] = { chrome.canBack, chrome.canForward, true, true, true, true };
 -    for (int i = 0; i < 6; ++i) {
-+    int legacyButtonX = panelWidth / 2 + 8;
-+    int buttonW = std::max<int>(36, (static_cast<int>(panelWidth) - legacyButtonX - 8) / 6);
-+    int buttonX = legacyButtonX + buttonW;
-+    int addressRight = buttonX - 8;
-+    int addressWidth = std::max<int>(1, addressRight - 8);
-+    int controlHeight = chromeHeight - 12;
-+    painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8, white, mid, 1);
+-        int x = buttonX + i * buttonW;
+-        painter.fillRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, black);
+-        painter.strokeRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, enabled[i] ? accent : mid);
+-        painter.drawText(x + 10, toolbarY + 17, labels[i], enabled[i] ? white : disabled, 1, buttonW - 16);
++    int addressX = chrome.addressWidth > 0 ? chrome.addressX : 8;
++    int addressY = chrome.addressWidth > 0 ? chrome.addressY : 6;
++    int addressWidth = chrome.addressWidth;
++    int addressHeight = chrome.addressHeight;
++    int controlsX = chrome.controlsX;
++    int controlsY = chrome.controlsY;
++    int controlsWidth = chrome.controlsWidth;
++    int controlsHeight = chrome.controlsHeight;
++    int buttonCount = std::clamp(chrome.buttonCount, 1, 8);
++    if (addressWidth <= 0 || addressHeight <= 0
++        || controlsWidth <= 0 || controlsHeight <= 0) {
++        int legacyButtonX = panelWidth / 2 + 8;
++        int legacyButtonW = std::max<int>(36,
++            (static_cast<int>(panelWidth) - legacyButtonX - 8) / 6);
++        controlsX = legacyButtonX + legacyButtonW;
++        controlsY = 6;
++        controlsWidth = legacyButtonW * 5;
++        controlsHeight = chromeHeight - 12;
++        buttonCount = 5;
++        addressX = 8;
++        addressY = 6;
++        addressWidth = std::max(1, controlsX - 16);
++        addressHeight = controlsHeight;
++    }
++    painter.drawRoundedRect(addressX, toolbarY + addressY,
++                            addressWidth, addressHeight, 8, white, mid, 1);
 +    if (chrome.pressedControl == -2)
-+        painter.drawRoundedRect(8, toolbarY + 6, addressWidth, controlHeight, 8,
++        painter.drawRoundedRect(addressX, toolbarY + addressY,
++                                addressWidth, addressHeight, 8,
 +                                theme.pressed, theme.pressed, 1);
-+    painter.drawText(18, toolbarY + 17, chrome.url[0] ? chrome.url : chrome.homeLabel,
++    painter.drawText(addressX + 10, toolbarY + addressY + 11,
++                     chrome.url[0] ? chrome.url : chrome.homeLabel,
 +                     text, 1, std::max(1, addressWidth - 20));
 +
 +    bool tabsPanelOpen = !strcmp(chrome.panel, "tabs");
@@ -1164,20 +1230,23 @@ index 93e75f13..085d3aa2 100644
 +        overflowPanelOpen || !tabsPanelOpen || chrome.panelCanAdd,
 +        true
 +    };
-+    for (int i = 0; i < 5; ++i) {
-         int x = buttonX + i * buttonW;
--        painter.fillRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, black);
--        painter.strokeRect(x + 2, toolbarY + 6, buttonW - 4, chromeHeight - 12, enabled[i] ? accent : mid);
--        painter.drawText(x + 10, toolbarY + 17, labels[i], enabled[i] ? white : disabled, 1, buttonW - 16);
-+        painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4, controlHeight, 6,
++    int visibleButtonCount = std::min(5, buttonCount);
++    for (int i = 0; i < visibleButtonCount; ++i) {
++        int x = controlsX + controlsWidth * i / buttonCount;
++        int right = controlsX + controlsWidth * (i + 1) / buttonCount;
++        int buttonW = std::max(1, right - x);
++        painter.drawRoundedRect(x + 2, toolbarY + controlsY + 1,
++                                std::max(1, buttonW - 4),
++                                std::max(1, controlsHeight - 2), 6,
 +                                theme.surface, enabled[i] ? theme.outline : mid, 1);
 +        if (chrome.pressedControl == i)
-+            painter.drawRoundedRect(x + 2, toolbarY + 6, buttonW - 4,
-+                                    controlHeight, 6,
++            painter.drawRoundedRect(x + 2, toolbarY + controlsY + 1,
++                                    std::max(1, buttonW - 4),
++                                    std::max(1, controlsHeight - 2), 6,
 +                                    theme.pressed, theme.pressed, 1);
 +
 +        int centerX = x + buttonW / 2;
-+        int centerY = toolbarY + chromeHeight / 2;
++        int centerY = toolbarY + controlsY + controlsHeight / 2;
 +        uint32_t iconColor = enabled[i] ? accent : disabled;
 +        switch (i) {
 +        case 0:
@@ -1230,11 +1299,11 @@ index 93e75f13..085d3aa2 100644
 +            break;
 +        }
      }
- 
+-
 -    char tabLabel[32];
 -    snprintf(tabLabel, sizeof(tabLabel), "%u/%u", chrome.activeTab + 1, std::max<unsigned>(1, chrome.tabCount));
 -    painter.drawText(buttonX + buttonW * 2 + 8, toolbarY + chromeHeight - 12, tabLabel, white, 1, buttonW - 12);
--
+ 
      if (!hasPanel)
          return;
  
@@ -1500,7 +1569,7 @@ index 93e75f13..085d3aa2 100644
  }
  
  class DRMScanoutBuffer;
-@@ -899,6 +2107,8 @@ struct WPEBufferDRMUserData {
+@@ -899,6 +2165,8 @@ struct WPEBufferDRMUserData {
      DRMScanoutBuffer* scanoutBuffer { nullptr }; // owned
      void* sourceMapping { nullptr };
      size_t sourceMappingSize { 0 };
@@ -1509,7 +1578,7 @@ index 93e75f13..085d3aa2 100644
      ~WPEBufferDRMUserData();
  };
  
-@@ -921,7 +2131,8 @@ public:
+@@ -921,7 +2189,8 @@ public:
          DMABufDirect,
          DMABufRotatedDumb,
          SHMRotatedDumb,
@@ -1519,7 +1588,7 @@ index 93e75f13..085d3aa2 100644
      };
  
      static std::unique_ptr<DRMScanoutBuffer> createDMABuf(std::unique_ptr<WPE::DRM::Buffer>&& buffer)
-@@ -974,15 +2185,16 @@ public:
+@@ -974,15 +2243,16 @@ public:
          return scanoutBuffer;
      }
  
@@ -1539,7 +1608,7 @@ index 93e75f13..085d3aa2 100644
              return nullptr;
          }
  
-@@ -995,7 +2207,7 @@ public:
+@@ -995,7 +2265,7 @@ public:
          scanoutBuffer->m_rotation = rotation;
          if (!scanoutBuffer->initializeDumb(fd, rotatedWidth(panel.width, panel.height, rotation), rotatedHeight(panel.width, panel.height, rotation), error))
              return nullptr;
@@ -1548,7 +1617,7 @@ index 93e75f13..085d3aa2 100644
              return nullptr;
          return scanoutBuffer;
      }
-@@ -1040,8 +2252,20 @@ public:
+@@ -1040,8 +2310,20 @@ public:
          return scanoutBuffer;
      }
  
@@ -1569,7 +1638,7 @@ index 93e75f13..085d3aa2 100644
          if (m_mapping)
              munmap(m_mapping, m_size);
  
-@@ -1204,8 +2428,6 @@ public:
+@@ -1204,8 +2486,6 @@ public:
              for (uint32_t y = 0; y < m_height; ++y)
                  memcpy(destination + static_cast<size_t>(y) * m_pitch, source + static_cast<size_t>(y) * sourceStride, rowBytes);
          }
@@ -1578,7 +1647,7 @@ index 93e75f13..085d3aa2 100644
          return true;
      }
  
-@@ -1243,9 +2465,18 @@ public:
+@@ -1243,9 +2523,18 @@ public:
          return true;
      }
  
@@ -1598,7 +1667,7 @@ index 93e75f13..085d3aa2 100644
          auto sourceWidth = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
          auto sourceHeight = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
          auto sourceStride = wpe_buffer_dma_buf_get_stride(dmaBuffer, 0);
-@@ -1258,27 +2489,129 @@ public:
+@@ -1258,27 +2547,129 @@ public:
  
          size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
          int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
@@ -1738,7 +1807,7 @@ index 93e75f13..085d3aa2 100644
  
          struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
          ioctl(sourceFD, DMA_BUF_IOCTL_SYNC, &syncEnd);
-@@ -1304,6 +2637,87 @@ public:
+@@ -1304,6 +2695,87 @@ public:
      // 内容差异的超集，作 FB_DAMAGE_CLIPS 安全），整帧拷贝时为空（不带 clips）。
      Vector<drm_mode_rect> takeDestDamage() { return WTF::move(m_lastDestDamage); }
  
@@ -1826,7 +1895,7 @@ index 93e75f13..085d3aa2 100644
      void copyRotatedPixels(const uint8_t* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, OutputRotation rotation)
      {
          auto* destination = static_cast<uint8_t*>(m_mapping);
-@@ -1317,7 +2731,7 @@ public:
+@@ -1317,7 +2789,7 @@ public:
          // 增量路径条件：本缓冲上帧内容有效且仅差累计脏区；chrome 状态与让位带
          // 未变（resize 布局下工具栏与内容区不相交，无需重画 overlay）；无面板
          // 悬浮在内容上、无显隐动画；源尺寸与内容区精确匹配（稳态）。
@@ -1835,7 +1904,7 @@ index 93e75f13..085d3aa2 100644
              && chromeLayoutResizeEnabled() && !panelOpen && !chromeAnimationActive()
              && chromeHash == m_lastChromeHash && topInset == m_lastTopInset
              && sourceWidth == panel.width && sourceHeight == availableHeight;
-@@ -1336,8 +2750,8 @@ public:
+@@ -1336,8 +2808,8 @@ public:
              }
          } else {
              copyRotatedARGB8888(source, sourceWidth, sourceHeight, sourceStride, destination, m_pitch, panel.width, panel.height, rotation);
@@ -1845,7 +1914,7 @@ index 93e75f13..085d3aa2 100644
          m_pendingDamage.clear();
          m_pendingFullRepaint = false;
          m_lastTopInset = topInset;
-@@ -1378,19 +2792,33 @@ private:
+@@ -1378,19 +2850,33 @@ private:
      uint64_t m_size { 0 };
      uint32_t m_frameBufferID { 0 };
      void* m_mapping { nullptr };
@@ -1881,7 +1950,7 @@ index 93e75f13..085d3aa2 100644
  }
  
  /**
-@@ -1427,10 +2855,50 @@ struct _WPEViewDRMPrivate {
+@@ -1427,10 +2913,50 @@ struct _WPEViewDRMPrivate {
      bool lastCommitWasSynchronous { false };
      gint64 copyTotalUS { 0 };
      gint64 commitTotalUS { 0 };
@@ -1933,7 +2002,7 @@ index 93e75f13..085d3aa2 100644
      OutputRotation outputRotation { OutputRotation::Rotate0 };
      struct VideoOverlayState* videoOverlay { nullptr };
  };
-@@ -1444,37 +2912,89 @@ static void setDamageRects(Vector<drm_mode_rect>&, const WPERectangle*, guint);
+@@ -1444,37 +2970,89 @@ static void setDamageRects(Vector<drm_mode_rect>&, const WPERectangle*, guint);
  static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
  {
      auto* priv = view->priv;
@@ -2042,7 +2111,7 @@ index 93e75f13..085d3aa2 100644
      priv->updateFlags.add(UpdateFlags::BufferUpdatePending);
  }
  
-@@ -1501,7 +3021,12 @@ static gboolean wpeViewDRMCommitQueuedBuffer(WPEViewDRM* view, GError** error)
+@@ -1501,7 +3079,12 @@ static gboolean wpeViewDRMCommitQueuedBuffer(WPEViewDRM* view, GError** error)
      priv->updateFlags.remove(UpdateFlags::BufferUpdatePending);
      priv->pendingBuffer = WTF::move(priv->queuedBuffer);
      priv->damageRects = WTF::move(priv->queuedDamageRects);
@@ -2055,7 +2124,7 @@ index 93e75f13..085d3aa2 100644
          priv->updateFlags.add(UpdateFlags::BufferUpdateRequested);
          wpeViewDRMCompleteSynchronousCommitIfNeeded(view);
          return TRUE;
-@@ -1577,7 +3102,7 @@ static void wpeViewDRMConstructed(GObject* object)
+@@ -1577,7 +3160,7 @@ static void wpeViewDRMConstructed(GObject* object)
      auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(view));
      auto* priv = WPE_VIEW_DRM(view)->priv;
      priv->refreshDuration = Seconds(1 / (wpe_screen_get_refresh_rate(wpeDisplayDRMGetScreen(display)) / 1000.));
@@ -2064,7 +2133,7 @@ index 93e75f13..085d3aa2 100644
      // 注意：生产 run.sh 设 WPE_DRM_MAX_FPS=0，此节流机制全程不生效，
      // 实际限帧由 WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS 承担。
      if (auto maxFPS = configuredMaxFPS())
-@@ -1611,34 +3136,97 @@ static void wpeViewDRMConstructed(GObject* object)
+@@ -1611,34 +3194,97 @@ static void wpeViewDRMConstructed(GObject* object)
      g_source_attach(priv->eventSource.get(), g_main_context_get_thread_default());
  
      refreshChromeRenderState();
@@ -2172,7 +2241,7 @@ index 93e75f13..085d3aa2 100644
          return G_SOURCE_CONTINUE;
      })), object, nullptr);
      g_source_attach(priv->chromeSource.get(), g_main_context_get_thread_default());
-@@ -1805,11 +3393,39 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
+@@ -1805,11 +3451,39 @@ static DRMScanoutBuffer* drmBufferCreateDMABuf(WPEView* view, WPEBuffer* buffer,
      return userData->scanoutBuffer;
  }
  
@@ -2213,7 +2282,7 @@ index 93e75f13..085d3aa2 100644
  
      for (unsigned i = 0; i < priv->shmScanoutBuffers.size(); ++i) {
          auto index = (priv->nextSHMScanoutBufferIndex + i) % priv->shmScanoutBuffers.size();
-@@ -1826,6 +3442,8 @@ static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer,
+@@ -1826,6 +3500,8 @@ static DRMScanoutBuffer* nextSHMDumbBuffer(WPEViewDRM* view, WPEBuffer* buffer,
          } else if (!candidate->copyFromSHM(buffer, error))
              return nullptr;
  
@@ -2222,7 +2291,7 @@ index 93e75f13..085d3aa2 100644
          priv->nextSHMScanoutBufferIndex = (index + 1) % priv->shmScanoutBuffers.size();
          logBufferPathOnce(DRMScanoutBuffer::Kind::SHMDumb);
          return candidate.get();
-@@ -1841,7 +3459,8 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
+@@ -1841,7 +3517,8 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
  {
      auto* priv = view->priv;
      auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
@@ -2232,7 +2301,7 @@ index 93e75f13..085d3aa2 100644
  
      for (unsigned i = 0; i < priv->rotatedScanoutBuffers.size(); ++i) {
          auto index = (priv->nextRotatedScanoutBufferIndex + i) % priv->rotatedScanoutBuffers.size();
-@@ -1852,12 +3471,15 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
+@@ -1852,12 +3529,15 @@ static DRMScanoutBuffer* nextRotatedDMABufBuffer(WPEViewDRM* view, WPEBuffer* bu
              continue;
  
          if (!candidate || !candidate->matchesRotatedDMABuf(buffer, rotation)) {
@@ -2250,7 +2319,7 @@ index 93e75f13..085d3aa2 100644
          priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
          logBufferPathOnce(DRMScanoutBuffer::Kind::DMABufRotatedDumb);
          return candidate.get();
-@@ -1888,6 +3510,8 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
+@@ -1888,6 +3568,8 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
          } else if (!candidate->copyRotatedFromSHM(buffer, rotation, error))
              return nullptr;
  
@@ -2259,7 +2328,7 @@ index 93e75f13..085d3aa2 100644
          priv->nextRotatedScanoutBufferIndex = (index + 1) % priv->rotatedScanoutBuffers.size();
          logBufferPathOnce(DRMScanoutBuffer::Kind::SHMRotatedDumb);
          return candidate.get();
-@@ -1897,6 +3521,50 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
+@@ -1897,6 +3579,50 @@ static DRMScanoutBuffer* nextRotatedSHMBuffer(WPEViewDRM* view, WPEBuffer* buffe
      return nullptr;
  }
  
@@ -2310,7 +2379,7 @@ index 93e75f13..085d3aa2 100644
  static DRMScanoutBuffer* drmScanoutBufferForRender(WPEViewDRM* view, WPEBuffer* buffer, OutputRotation rotation, GError** error)
  {
      auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
-@@ -2117,9 +3785,17 @@ static bool bufferUsesSynchronousCommit(DRMScanoutBuffer* buffer)
+@@ -2117,9 +3843,17 @@ static bool bufferUsesSynchronousCommit(DRMScanoutBuffer* buffer)
  {
      if (!buffer)
          return false;
@@ -2329,7 +2398,7 @@ index 93e75f13..085d3aa2 100644
  }
  
  static bool wpeViewDRMCommitAtomic(WPEViewDRM* view, DRMScanoutBuffer* buffer, std::optional<uint32_t> damageID, GError** error)
-@@ -2190,10 +3866,13 @@ enum : uint32_t {
+@@ -2190,10 +3924,13 @@ enum : uint32_t {
      VideoOverlayMessageFrame = 1,
      VideoOverlayMessageRect = 2,
      VideoOverlayMessageHide = 3,
@@ -2343,7 +2412,7 @@ index 93e75f13..085d3aa2 100644
      uint32_t fourcc;
      uint32_t width;
      uint32_t height;
-@@ -2207,11 +3886,48 @@ struct VideoOverlayWireMessage {
+@@ -2207,11 +3944,48 @@ struct VideoOverlayWireMessage {
      uint64_t modifier;
  };
  
@@ -2392,7 +2461,7 @@ index 93e75f13..085d3aa2 100644
  struct VideoOverlayState {
      WPEViewDRM* view { nullptr };
      int listenFD { -1 };
-@@ -2220,15 +3936,112 @@ struct VideoOverlayState {
+@@ -2220,15 +3994,112 @@ struct VideoOverlayState {
      GRefPtr<GSource> clientSource;
      const WPE::DRM::Plane* plane { nullptr };
      VideoOverlayFB current;
@@ -2506,7 +2575,7 @@ index 93e75f13..085d3aa2 100644
  static const char* videoOverlaySocketPath()
  {
      static const char* path = []() -> const char* {
-@@ -2263,22 +4076,66 @@ static void videoOverlayReleaseFB(int fd, VideoOverlayFB& fb)
+@@ -2263,22 +4134,66 @@ static void videoOverlayReleaseFB(int fd, VideoOverlayFB& fb)
          fb.handles[i] = 0;
      }
      fb.fbID = 0;
@@ -2582,7 +2651,7 @@ index 93e75f13..085d3aa2 100644
      auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
      auto* screen = WPE_SCREEN_DRM(wpeDisplayDRMGetScreen(display));
      auto& crtc = wpeScreenDRMGetCrtc(screen);
-@@ -2326,11 +4183,44 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
+@@ -2326,11 +4241,44 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
      int32_t dstX2 = rect.x2 + offsetX;
      int32_t dstY2 = rect.y2 + offsetY;
      if (dstX2 <= dstX1 || dstY2 <= dstY1)
@@ -2629,7 +2698,7 @@ index 93e75f13..085d3aa2 100644
      int32_t clipX1 = std::max<int32_t>(dstX1, contentX1);
      int32_t clipY1 = std::max<int32_t>(dstY1, contentY1);
      int32_t clipX2 = std::min<int32_t>(dstX2, contentX2);
-@@ -2339,19 +4229,32 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
+@@ -2339,19 +4287,32 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
          // 完全滚出屏幕：藏 plane 但保留帧，等矩形回来再显示。
          if (overlay->planeEnabled) {
              WPE::DRM::UniquePtr<drmModeAtomicReq> request(drmModeAtomicAlloc());
@@ -2671,7 +2740,7 @@ index 93e75f13..085d3aa2 100644
  
      auto properties = overlay->plane->properties();
      properties.crtcID.second = crtc.id();
-@@ -2372,18 +4275,28 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
+@@ -2372,18 +4333,28 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
              && properties.zpos.first && primaryPlane.properties().zpos.first;
          WPE::DRM::UniquePtr<drmModeAtomicReq> request(drmModeAtomicAlloc());
          if (!addPlaneProperties(request.get(), *overlay->plane, WPE::DRM::Plane::Properties(properties)))
@@ -2705,7 +2774,7 @@ index 93e75f13..085d3aa2 100644
          if (withZpos) {
              g_warning("WPEViewDRM video overlay: commit with zpos failed (%s), falling back to no-zpos (video above page)", strerror(errno));
              overlay->zposUnsupported = true;
-@@ -2391,9 +4304,9 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
+@@ -2391,9 +4362,9 @@ static bool videoOverlayCommit(WPEViewDRM* view, VideoOverlayState* overlay, uin
          }
          if (overlay->commitFailLogCount++ < 8)
              g_warning("WPEViewDRM video overlay: atomic commit failed: %s", strerror(errno));
@@ -2717,7 +2786,7 @@ index 93e75f13..085d3aa2 100644
  }
  
  static void videoOverlayDisable(WPEViewDRM* view)
-@@ -2413,30 +4326,33 @@ static void videoOverlayDisable(WPEViewDRM* view)
+@@ -2413,30 +4384,33 @@ static void videoOverlayDisable(WPEViewDRM* view)
              g_warning("WPEViewDRM video overlay: disable commit failed: %s", strerror(errno));
          overlay->planeEnabled = false;
      }
@@ -2756,7 +2825,7 @@ index 93e75f13..085d3aa2 100644
      uint32_t pitches[4] = { 0, };
      uint32_t offsets[4] = { 0, };
      uint32_t handles[4] = { 0, };
-@@ -2447,7 +4363,7 @@ static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMess
+@@ -2447,7 +4421,7 @@ static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMess
              if (overlay->commitFailLogCount++ < 8)
                  g_warning("WPEViewDRM video overlay: drmPrimeFDToHandle failed: %s", strerror(errno));
              videoOverlayReleaseFB(fd, fb);
@@ -2765,7 +2834,7 @@ index 93e75f13..085d3aa2 100644
          }
          fb.handles[i] = handle;
          handles[i] = handle;
-@@ -2459,18 +4375,34 @@ static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMess
+@@ -2459,18 +4433,34 @@ static void videoOverlayHandleFrame(WPEViewDRM* view, const VideoOverlayWireMess
          if (overlay->commitFailLogCount++ < 8)
              g_warning("WPEViewDRM video overlay: drmModeAddFB2 %ux%u failed: %s", frame.width, frame.height, strerror(errno));
          videoOverlayReleaseFB(fd, fb);
@@ -2804,7 +2873,7 @@ index 93e75f13..085d3aa2 100644
  }
  
  // 布局变化（工具栏动画/旋转/矩形更新）后按最新状态重新提交当前帧。
-@@ -2489,11 +4421,11 @@ static void videoOverlayDropClient(WPEViewDRM* view)
+@@ -2489,11 +4479,11 @@ static void videoOverlayDropClient(WPEViewDRM* view)
          g_source_destroy(overlay->clientSource.get());
          overlay->clientSource = nullptr;
      }
@@ -2817,7 +2886,7 @@ index 93e75f13..085d3aa2 100644
  }
  
  static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gpointer userData)
-@@ -2506,45 +4438,90 @@ static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gp
+@@ -2506,45 +4496,90 @@ static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gp
          return G_SOURCE_REMOVE;
      }
  
@@ -2935,7 +3004,7 @@ index 93e75f13..085d3aa2 100644
                  videoOverlayRecommit(view);
              }
              break;
-@@ -2556,8 +4533,8 @@ static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gp
+@@ -2556,8 +4591,8 @@ static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gp
          }
      }
  
@@ -2946,7 +3015,7 @@ index 93e75f13..085d3aa2 100644
      return G_SOURCE_CONTINUE;
  }
  
-@@ -2718,6 +4695,49 @@ static void setDamageRects(Vector<drm_mode_rect>& destination, const WPERectangl
+@@ -2718,6 +4753,49 @@ static void setDamageRects(Vector<drm_mode_rect>& destination, const WPERectangl
          destination.append({ damageRects[i].x, damageRects[i].y, damageRects[i].x + damageRects[i].width, damageRects[i].y + damageRects[i].height });
  }
  
@@ -2996,7 +3065,7 @@ index 93e75f13..085d3aa2 100644
  static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
  {
      auto* priv = view->priv;
-@@ -2727,8 +4747,22 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+@@ -2727,8 +4805,22 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
      bool needsScanoutRebuild = buffer && (rotation != OutputRotation::Rotate0
          || (priv->committedScanoutBuffer
              && (priv->committedScanoutBuffer->kind() == DRMScanoutBuffer::Kind::DMABufRotatedDumb
@@ -3020,7 +3089,7 @@ index 93e75f13..085d3aa2 100644
          gint64 copyStartUS = g_get_monotonic_time();
          if (rotation != OutputRotation::Rotate0 && priv->pendingBuffer) {
              for (auto& candidate : priv->rotatedScanoutBuffers) {
-@@ -2736,22 +4770,53 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+@@ -2736,22 +4828,53 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
                      candidate->accumulateSourceDamage(priv->damageRects);
              }
          }
@@ -3081,7 +3150,7 @@ index 93e75f13..085d3aa2 100644
      } else
          drmBuffer = priv->committedScanoutBuffer;
  
-@@ -2766,10 +4831,16 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+@@ -2766,10 +4889,16 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
          if (damageID)
              destroyDamageBlob(display, damageID.value());
          priv->damageRects.clear();
@@ -3099,7 +3168,7 @@ index 93e75f13..085d3aa2 100644
          return result;
      }
  
-@@ -2779,7 +4850,11 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+@@ -2779,7 +4908,11 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
      }
  
      auto result = wpeViewDRMCommitLegacy(WPE_VIEW_DRM(view), *drmBuffer, error);
@@ -3112,7 +3181,7 @@ index 93e75f13..085d3aa2 100644
      if (result)
          priv->lastFrameCommitUS = commitStartUS;
      return result;
-@@ -2814,11 +4889,20 @@ static gboolean wpeViewDRMRenderBuffer(WPEView* view, WPEBuffer* buffer, const W
+@@ -2814,11 +4947,20 @@ static gboolean wpeViewDRMRenderBuffer(WPEView* view, WPEBuffer* buffer, const W
      }
  
      priv->pendingBuffer = buffer;

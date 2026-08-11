@@ -36,6 +36,7 @@ typedef struct {
 typedef struct {
     char theme[8];
     gboolean toolbar_auto_hide;
+    gboolean toolbar_gesture_in_immersive;
     gboolean gpu_acceleration;
 } BrowserGlobalSettings;
 
