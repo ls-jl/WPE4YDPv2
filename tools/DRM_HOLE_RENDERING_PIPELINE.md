@@ -8,7 +8,7 @@
 
 核心链路：
 
-1. MiniApp `index` 页显示启动入口和显示模式（原生/横屏旋转）选择。
+1. MiniApp `index` 页显示启动入口，可沿用上次方向或显式选择相对系统原生方向的 `0°/90°/180°/270°`。
 2. 用户点击启动后进入 `frame` 页。
 3. `frame` 页只渲染全屏 `<hole>`，同时调用 native JSAPI 启动 WPE。
 4. JSAPI `browserPlayer.startBrowser()` fork/exec 包内 `assets/wpe-runtime/run.sh`。
@@ -52,7 +52,7 @@ flowchart LR
 `index` 页是浏览器启动页，不直接显示网页像素，也不参与 WPE 每帧刷新。它只负责：
 
 - 显示“启动浏览器”入口。
-- 提供显示模式选项：`原生模式`（跟随系统/MiniApp 框架方向）或 `横屏旋转`（在系统方向基础上旋转到横屏），只影响浏览器画面旋转，传给 WPE/DRM/触摸。
+- 提供 `last/native/rotate90/rotate180/rotate270`：`last` 读取 `$dataDir/browser/display-mode`，其余四项分别表示相对系统原生方向旋转 `0°/90°/180°/270°`。页面布局只使用已经验证的 `native` 与 `rotate270` 两套模板；最终 DRM/视频和 native 触摸方向再独立应用用户选择的角度，不旋转 MiniApp 框架。
 - 进入 `frame` 页，并把 `url/browserMode/returnPage` 作为页面参数传入；`frame` 页再结合系统显示配置解析出实际的 `rotation/panelSize/drmMode`。
 
 `index` 不 import 或调用 `browserPlayer`。native JSAPI 调用只放在 `frame` 页，避免页面切换或旋转别名导致旧 native object 被框架禁用。`index` 也不应该自动进入浏览器；自动启动会让调试和回到 MiniApp 首页时的生命周期变得不可控，也会导致 Home 后重新进入时立刻抢 DRM。
@@ -117,7 +117,7 @@ import { browserPlayer } from 'browser'
 
 ### 3.1 `prepareRuntime()`
 
-当前 `prepareRuntime({ workspace, dataDir })` 不再把 runtime tar 解压到 `$dataDir`。它做的是：
+当前 `prepareRuntime({ workspace })` 不把 runtime tar 解压到 `$dataDir`。它只做：
 
 - 组合包内 runtime 路径：`$workspace/assets/wpe-runtime`
 - 校验 runtime 必要文件存在。
@@ -186,6 +186,10 @@ WPE_MESA_DIR=$runtimePath
 WPE_VAR_DIR=$workdir
 WPE_CHROME_STATE=$workdir/browser-state.ini
 WPE_CHROME_RENDER_STATE=$workdir/chrome-render-state.ini
+WPE_BROWSER_DB=$workdir/browser.sqlite3
+WPE_PROFILES_DIR=$workdir/profiles
+WPE_PROFILE_SWITCH_FILE=$workdir/profile-switch.request
+WPE_CHROME_FONT=$runtimePath/assets/fonts/miniapp/NotoSansSC-Regular.otf
 WPE_KEYBOARD_DIR=$workdir/keyboard
 WPE_DRM_RUNTIME_DIR=$workdir/runtime-tmp
 WPE_DRM_USE_OVERLAY=1
@@ -199,6 +203,13 @@ GST_REGISTRY=$workdir/gst-registry.bin
 WPE_DEFAULT_URL=<url>
 HOME=$workdir
 ```
+
+`WPE_CHROME_STATE` 和初始 `WPE_DRM_RUNTIME_DIR` 只用于首次升级迁移。DEFAULT
+Profile 建立后，主页、标签、历史和收藏写入 `browser.sqlite3`；站点数据与 Cookie
+分别写入 `profiles/p<ID>/runtime` 和 `profiles/p<ID>/cookies.sqlite`。Profile
+切换由子进程退出码 `75` 驱动，`run.sh` 读取 `profile-switch.request` 后仅重启
+`wpe-drm-minimal`，不会结束 MiniApp watchdog 或重载浏览器拥有的 GPU 模块。
+Guest 使用 ephemeral NetworkSession，退出后删除临时目录且不会覆盖下次默认 Profile。
 
 然后执行：
 
@@ -223,9 +234,21 @@ $workdir/keyboard/responses/
 
 `assets/wpe-runtime/run.sh` 是 WPE 运行环境入口。它负责把包内 runtime 变成一个可运行的 Linux 用户态环境。
 
-### 4.1 动态库和 Mesa
+### 4.1 CPU/GPU 渲染档案
 
-脚本设置：
+默认 `WPE_GPU_MODE=auto`。启动脚本先检查 `/dev/mali0`；节点不存在时，仅在
+ARM64 `5.10.160`、模块加载未禁用、KO vermagic 匹配且有 root 权限时，按
+`x7_gpu_dt_enable`、`bifrost_kbase` 顺序尝试加载。预先存在的模块不归浏览器
+所有，退出时不会卸载；本次加载的模块按相反顺序清理。
+
+GPU 启用前，`libexec/wpe-gpu-probe` 必须确认 ARM/Mali renderer、GLES shader
+和 readback、ARGB8888 linear DMA-BUF 导出/映射及 `drmModeAddFB2` 全部成功。
+GPU profile 使用包内 `gpu/mali/lib`，通过 `libwpe-mali-gbm-compat.so` 补齐
+`gbm_bo_create_with_modifiers2` 和 `gbm_bo_get_fd_for_plane`，但继续使用 runtime
+自带的新 `libdrm.so.2`。首帧 12 秒超时或首帧前 WebProcess 崩溃时，`auto`
+只重启一次 CPU profile；Home/SIGTERM 不触发回退。
+
+CPU profile 设置：
 
 ```sh
 LD_LIBRARY_PATH=$MESA/lib:$DIR/lib
@@ -236,7 +259,9 @@ GALLIUM_DRIVER=softpipe
 MESA_LOADER_DRIVER_OVERRIDE=kms_swrast
 ```
 
-当前设备没有可用 GPU，默认走软件渲染/softpipe，但 WPE 的最终出屏仍然走 DRM plane，不经过 MiniApp canvas。
+CPU profile 走 Skia CPU + dma-heap/SHM，Mesa softpipe 仅保留兼容依赖；最终出屏
+仍走 DRM plane，不经过 MiniApp canvas。`WPE_GPU_MODE=off` 强制 CPU，
+`required` 则在任一 GPU 检查失败时退出而不回退。
 
 ### 4.2 证书、字体、GStreamer
 
@@ -363,6 +388,30 @@ drmMode=480x960
 
 这种情况下，`WPEViewDRM` 会把 `960x266` 的源画面旋转复制到 `266x960` 的 dumb framebuffer，然后在 `480x960` 的 DRM envelope 中居中或按 `WPE_DRM_ROTATED_X/WPE_PANEL_CRTC_X` 定位。
 
+页面布局和最终输出方向必须分开计算。布局只复用两套已经实机验证的模板，不允许把任意最终角度再次代入 panel reconcile：
+
+| 用户模式 | 布局模板 | 输出增量 | 触摸增量 |
+| --- | --- | ---: | ---: |
+| `native` | 旧 `native` | `0°` | `0°` |
+| `rotate90` | 旧 `rotate270` | `90°` | `90°` |
+| `rotate180` | 旧 `native` | `180°` | `180°` |
+| `rotate270` | 旧 `rotate270` | `270°` | `270°` |
+
+- `native/rotate180` 的 panel 和 viewport 必须完全一致，`rotate180` 只把最终 DRM 与触摸方向转 180 度。
+- `rotate90/rotate270` 的 panel 和 viewport 必须完全一致，两者复用旧 `rotate270` 尺寸模板，最终 DRM 与触摸方向相差 180 度。
+- `layoutRotation` 仅供旧模板完成 panel orientation reconcile；真正传给 WPE 的 `rotation` 是 `frameworkRotation + outputDelta`。
+- `drmMode` 仍只是 scanout envelope，不能参与网页布局比例计算。
+
+例如系统配置为 `936x280 / direction=270` 时，原生模式输出
+`panel=936x280, rotation=270`；旋转模式输出
+`panel=280x936, rotation=180`。两者最终 framebuffer 都与 `280x936`
+DRM envelope 同方向。启动解析器会检查 framebuffer 与 DRM mode 的横竖方向，
+只在结果唯一时交换一次 panel 宽高，并打印 `orientation_corrected=1`。
+
+横屏 native toolbar 高 `44px`。当 `panelWidth < panelHeight` 时使用 `80px`
+竖屏布局：第一行是完整地址栏，第二行是五个等宽按钮。绘制和触摸命中均读取
+launcher 输出的同一组 toolbar geometry，避免窄屏按钮越界或坐标漂移。
+
 ### 5.5 `frame` 页解析优先级
 
 `frame` 页启动 WPE 前解析显示配置，优先级是：
@@ -378,7 +427,7 @@ drmMode=480x960
 成功日志示例：
 
 ```text
-display_resolve source=dom panel=1210x568 drm_mode=568x1210 viewport=1210x568 rotation=270
+display_resolve source=system_cfg:rotate90 layout_template=rotate270 layout_rotation=90 output_rotation=270 panel=1210x568 drm_mode=568x1210 viewport=1210x568 touch_rotation=270
 ```
 
 ## 6. WPE 主程序初始化
@@ -481,9 +530,21 @@ WebKit/WPE 渲染完成后，会给 `WPEViewDRM` 一个 `WPEBuffer`。当前支�
 1. 源 buffer 仍按 WebKit viewport 尺寸产出，例如 `960x266`。
 2. 根据 panel 和 rotation 计算目标 framebuffer，例如 `266x960`。
 3. 创建目标 dumb buffer。
-4. CPU 读取源 buffer，旋转写入目标 dumb buffer。
+4. DMABuf 默认通过包内 Rockchip RGA 直接旋转到目标 dumb buffer 的 PRIME fd；
+   RGA 不可用或不支持当前几何时才回退 CPU 读取和旋转。SHM buffer 继续使用 CPU。
 5. 在目标 dumb buffer 上绘制 native chrome overlay。
 6. 提交目标 framebuffer。
+
+主线默认值：
+
+```sh
+WPE_DRM_RGA_ROTATION=auto
+WPE_DRM_RGA_LIBRARY=$RUNTIME/lib/librga.so.2
+```
+
+`auto` 在 RGA 导入或旋转失败时保留 CPU 回退；`off` 强制旧 CPU 路径；
+`required` 用于诊断，RGA 不可用时直接报错。运行时不会隐式加载系统
+`/usr/lib/librga`，因此不同设备固件不会改变包内 ABI。
 
 ### 7.4 Native toolbar/chrome 绘制
 
@@ -495,7 +556,11 @@ drawChromeOverlay(...)
 
 这一步发生在 DRM commit 前，所以工具栏和网页内容最终是同一个 WPE framebuffer。MiniApp 只负责 `<hole>`，不负责地址栏、tabs、settings 等浏览器 chrome。
 
-当前保留一个性能优先例外：`rotation=0` 且命中 `dma_heap` zero-copy 直扫路径时，buffer 直接进入 DRM commit，不经过 CPU 合成，因此不会绘制 native toolbar。这是预期行为；如果 0 度也需要 toolbar，需要改走 CPU 合成路径或后续实现独立 DRM plane toolbar。
+Native chrome 启用时，包括 `rotation=0` 在内的所有方向都进入完整
+panel dumb 合成路径：网页内容先写入内容区，再绘制 toolbar/menu，
+最后提交与 `panelSize` 一致的 framebuffer。这样在相对旋转后绝对角度恰好为
+`0` 时，toolbar 不会丢失，扣除 toolbar 高度的短内容帧也不会被直接拉伸到
+DRM mode。只有显式关闭 native chrome 时，未旋转 DMA-BUF 才保留 zero-copy 直扫。
 
 ## 8. DRM commit
 
@@ -512,6 +577,8 @@ WPE_DRM_FIT=panel-native
 - WebKit 始终按 `panelSize` 布局。
 - DRM `mode->hdisplay/vdisplay` 只作为提交 envelope。
 - 禁止 `480x960` 这类底层 mode 参与页面比例计算。
+- framebuffer 按原始像素尺寸居中或裁剪，不会隐式放大；只有
+  `WPE_DRM_FIT=stretch` 才允许铺满 mode。
 
 `WPEViewDRM` 在 `destinationRectForBuffer()` 中计算：
 
@@ -543,7 +610,8 @@ WPEViewDRM commit fit=panel-native panel=960x266 drm_mode=480x960 framebuffer=26
    - 可选 `IN_FENCE_FD`
 5. `drmModeAtomicCommit()`
 
-当前旋转是在用户态 CPU 拷贝时完成的，提交给 DRM plane 时 plane rotation 仍设置为 rotate-0。
+旋转在用户态提交前完成：DMABuf 优先使用 RGA，SHM 或 RGA fallback 使用 CPU。
+提交给 DRM plane 时 plane rotation 仍设置为 rotate-0。
 
 ### 8.3 Legacy page flip fallback
 
@@ -680,6 +748,12 @@ $workdir/keyboard/requests/
 $workdir/keyboard/responses/
 ```
 
+终态目录：
+
+```text
+$workdir/keyboard/status/
+```
+
 流程：
 
 1. WPE 发现输入触发点。
@@ -689,8 +763,10 @@ $workdir/keyboard/responses/
    ```
    请求 `id` 写在 JSON 内。固定文件名可以让 JSAPI 先 `stat` 再读取，避免每轮 `opendir/readdir`。
 3. MiniApp `frame` 页每 200ms 轮询 `browserPlayer.pollKeyboardRequest()`。
-4. MiniApp 调用 HaasUI `global.startTextEdit()` 拉起系统键盘。
-5. Y07 这类 textarea 输入法会持续把完整当前文本写入：
+4. MiniApp 根据 `$workdir/keyboard/backend.json` 选择已验证后端；未知设备先探测
+   `<textarea softInputEnable>`，1.5 秒内没有键盘切前后台、输入或确认事件时，关闭
+   textarea 后再单独调用 `global.startTextEdit()`。两个入口不会同时打开。
+5. textarea 后端会持续把完整当前文本和单调递增的 `sequence` 原子写入：
    ```text
    $workdir/keyboard/responses/<id>.update
    ```
@@ -701,8 +777,19 @@ $workdir/keyboard/responses/
    $workdir/keyboard/responses/<id>.ok
    $workdir/keyboard/responses/<id>.cancel
    ```
-8. WPE 轮询响应文件。
-9. 地址栏输入在最终 `.ok` 后才跳转；网页输入框对 `.update` 实时写入 active input，最终 `.ok` 再派发 `change`。
+8. 网页 frame 通过 `script-message-with-reply-received` 保持异步 waiter。WPE 把
+   update/commit 回复到真正发起请求的 frame，iframe 自己写入目标并在下一帧验证，
+   不再从主 frame 调用 `evaluate_javascript()` 查找输入框。
+9. WPE 删除自己创建的 `requests/current.json`，并用临时文件、`fsync`、`rename`
+   原子发布 `status/<id>.json`。`pollKeyboardCompletion()` 是非破坏读取；MiniApp
+   成功解析后调用 `ackKeyboardCompletion()` 删除终态。
+10. 地址栏输入在最终 `.ok` 后才跳转；textarea 网页输入对 `.update` 实时写入，
+    global-only 设备在最终确认时一次写入，最终 commit 再派发 `change`。
+
+网页键盘请求只由可信触摸点击触发，不监听 `focusin` 自动弹出。同一 request ID 在 MiniApp 中只允许进入一次 `opening -> active -> responding` 流程，重复的 `input/textChanged`、过期 UUID 和重复终态回调都必须忽略。
+
+`app.json` 的 `keyboard_backend` 可设为 `auto`、`textarea` 或 `global`。默认
+`auto`；人工值只用于现场调试，不进入浏览器设置 UI。
 
 ## 11. 常用调试命令
 
@@ -824,8 +911,8 @@ adb shell 'hal-screen on; hal-screen keep'
    ```
 5. 日志显示：
    ```text
-   display_resolve source=... panel=... drm_mode=... viewport=... rotation=...
-   WPE launch: ... panel=... drm_mode=... viewport=... rotation=...
+   display_resolve source=... layout_template=... layout_rotation=... output_rotation=... panel=... drm_mode=... viewport=... touch_rotation=...
+   WPE launch: ... panel=... drm_mode=... viewport=... layout_template=... layout_rotation=... output_rotation=... touch_rotation=...
    Panel: ...
    Viewport: ...
    WPEViewDRM commit fit=panel-native ...
@@ -987,7 +1074,7 @@ done
 '
 
 # 2. 启动 MiniApp index
-adb shell 'miniapp_cli start 8001779591038449 --index'
+adb shell 'miniapp_cli start 8001779591038449 index'
 
 # 3. 确认没有自动启动 WPE
 adb shell 'pidof wpe-drm-minimal WPEWebProcess WPENetworkProcess 2>/dev/null || true'
@@ -1011,8 +1098,53 @@ adb shell 'sed -n "1,220p" /sys/kernel/debug/dri/0/state'
 
 - MiniApp 不参与网页像素刷新。
 - MiniApp 不绘制浏览器 toolbar。
-- WPE native chrome 负责地址栏、tabs、settings。
+- WPE native chrome 负责地址栏、Profile、tabs、history、bookmarks、settings。
 - WPE 直接处理触摸和滚动。
 - 系统键盘必须通过 MiniApp 桥接。
 - Runtime 本体必须随 AMR 内置，不能依赖 `/userdisk/wpe-drm2`、`/userdisk/mesa`、chroot runtime。
-- `$dataDir/browser` 只用于可写状态、日志、pid、缓存、键盘请求和浏览器状态。
+- Mali 专有库和设备 KO 仅由本地 staging 加入 AMR，不进入公开 Git；缺失时 `auto` 必须仍能正常启动 CPU profile。
+- `$dataDir/browser` 只用于可写状态、日志、pid、Profile 数据库/站点数据、缓存和键盘请求。
+
+## 16. WebRTC 云游戏与完整帧诊断
+
+WebRTC 默认由包内 GStreamer backend 提供，`WPE_WEBRTC=1`，本地采集固定为
+`WPE_WEBRTC_CAPTURE=deny`。远端 H.264 应由 `mppvideodec` 解码；得到 NV12
+DMA-BUF 后，hole-punch sink 通过 unix socket 交给 UI 进程并提交到独立 Esmart
+视频 plane。云原神主机在 `WPE_INPUT_PROFILE=auto` 下使用 `game`，raw touch 的
+down/move/up 按 slot 原样发给 WebKit，不生成浏览器 scroll 或 synthetic tap。
+云游戏视频进入 `playing` 后，`WPE_GAME_MEDIA_IMMERSIVE=1` 会自动隐藏 native
+toolbar。手动显隐统一使用三次连续双指轻点，默认允许两指在 `160ms` 内落下、
+单次轻点不超过 `350ms`、相邻轻点间隔不超过 `800ms`，第三次完成后还需保持 `500ms`
+无其他触摸；旧的顶部唤出热区已删除。该手势默认也能在 game 和 Fullscreen API
+状态中临时覆盖显示 toolbar，可在“设置 → 外观”关闭其沉浸模式响应。页面滚动
+触发的自动显隐保持不变。
+视频 socket 使用带单调 sequence 的 v2 协议。DRM 同步提交新 framebuffer 后才释放
+上一 framebuffer 并回 ACK；WebProcess 收到对应 ACK 后才释放持有的 `GstSample`。
+被合并、导入失败或未提交的帧会立即 ACK，断线和 hide 会清理全部 retained sample。
+视频采用 `WPE_VIDEO_OVERLAY_FIT=contain` 时，WPEViewDRM 会发布可见视频矩形。
+只有落在该矩形内的 panel-native 触摸才反算到 DOM 视频坐标；留黑区域和网页
+覆盖控件保持原始坐标，避免全屏按钮被夹到游戏画面边缘。raw 坐标边界固定映射
+到 `0..width-1`、`0..height-1`。
+
+基础链路测试：
+
+```sh
+# 地址栏打开包内 assets/wpe-runtime/tests/webrtc-loopback.html 后
+adb shell 'grep -E "WEBRTC_TEST|PASS ICE|Denied local" \
+  /userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449/data/browser/wpe-drm.log | tail -80'
+
+# 云游戏开始推流后验证硬解和视频 plane
+adb shell 'grep -E "mppvideodec|hole-punch|video overlay" \
+  /userdisk/secondary/miniapp/data/mini_app/pkg/8001779591038449/data/browser/wpe-drm.log | tail -80'
+adb shell 'grep -E "plane\[|format=NV12|fb=|crtc-pos=" /sys/kernel/debug/dri/0/state'
+```
+
+旋转或CPU合成路径读取DMA-BUF前会等待WPE rendering fence。CPU fallback 在读取区间执行
+`DMA_BUF_IOCTL_SYNC`。`WPE_DRM_PARTIAL_COPY=0`默认强制完整帧复制；fence超时会
+丢弃未完成帧并保留上一张完整画面。每60帧的日志应检查
+`fence_timeouts=0`、`full_copies`持续增长且`partial_copies=0`。
+旋转 GPU 路径还会把完整网页帧提升为带 generation 的 CPU 底图；菜单按压、滚动
+和动画从该底图恢复后只绘制 native chrome。诊断日志中的 `page_copy_ms` 代表新网页
+帧的 DMA-BUF 读取与旋转成本，`ui_overlay_ms` 代表 UI-only 重绘成本，后者不应再次
+触发 Mali DMA-BUF map。启用 RGA 后还应看到 `rga_frames` 持续增长、
+`rga_cpu_fallback=0`，并使用 `rga_ms` 区分硬件旋转和其余 overlay 成本。

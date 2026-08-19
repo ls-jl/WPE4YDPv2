@@ -1,0 +1,241 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Janus WebRTC Receive Starting</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      color: #fff;
+      font: 15px sans-serif;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+
+    #status {
+      position: fixed;
+      left: 8px;
+      top: 8px;
+      z-index: 2;
+      max-width: calc(100% - 16px);
+      padding: 4px 6px;
+      background: rgba(0, 0, 0, 0.7);
+      white-space: pre-wrap;
+    }
+
+    #probeCanvas {
+      position: fixed;
+      right: 0;
+      bottom: 0;
+      width: 64px;
+      height: 36px;
+      opacity: 0.01;
+      pointer-events: none;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.2.3/adapter.min.js"></script>
+  <script src="https://janus.conf.meetecho.com/demos/janus.js"></script>
+</head>
+<body>
+  <div id="status">initializing</div>
+  <video id="remoteVideo" autoplay playsinline></video>
+  <canvas id="probeCanvas" width="32" height="18"></canvas>
+  <script>
+    const statusNode = document.getElementById('status');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const remoteStream = new MediaStream();
+    const probeCanvas = document.getElementById('probeCanvas');
+    const probeContext = probeCanvas.getContext('2d', { willReadFrequently: true });
+    let janus = null;
+    let streaming = null;
+    let connected = false;
+    let remoteTrackSeen = false;
+    let failed = false;
+    let lastState = '';
+    let frameCallbackCount = 0;
+    let canvasFrameCount = 0;
+    let pixelEnergy = 0;
+    let packetsReceived = 0;
+    let bytesReceived = 0;
+    let framesReceived = 0;
+    let framesDecoded = 0;
+    let keyFramesDecoded = 0;
+    let statsError = '';
+
+    function log(message) {
+      lastState = message;
+      statusNode.textContent = message;
+      console.log(`JANUS_RECV_TEST ${message}`);
+    }
+
+    function fail(error) {
+      if (failed)
+        return;
+      failed = true;
+      const message = error && error.message ? error.message : String(error);
+      document.title = 'FAIL Janus WebRTC Receive';
+      log(`FAIL ${message}`);
+    }
+
+    function attachStreamingPlugin() {
+      janus.attach({
+        plugin: 'janus.plugin.streaming',
+        opaqueId: `wpe-recv-${Janus.randomString(12)}`,
+        success(pluginHandle) {
+          streaming = pluginHandle;
+          log('plugin attached; requesting stream 1');
+          streaming.send({ message: { request: 'watch', id: 1 } });
+        },
+        error: fail,
+        iceState(state) {
+          log(`ice=${state}`);
+        },
+        webrtcState(up) {
+          connected = connected || up;
+          log(`webrtc=${up ? 'up' : 'down'}`);
+        },
+        onmessage(message, jsep) {
+          if (message.error) {
+            fail(new Error(message.error));
+            return;
+          }
+          if (!jsep)
+            return;
+          streaming.createAnswer({
+            jsep,
+            tracks: [{ type: 'data' }],
+            success(answer) {
+              log('answer created; starting stream');
+              streaming.send({ message: { request: 'start' }, jsep: answer });
+            },
+            error: fail
+          });
+        },
+        onremotetrack(track, mid, on) {
+          if (!on) {
+            if (remoteStream.getTracks().includes(track))
+              remoteStream.removeTrack(track);
+            return;
+          }
+          if (!remoteStream.getTracks().includes(track))
+            remoteStream.addTrack(track);
+          if (track.kind === 'video')
+            remoteTrackSeen = true;
+          remoteVideo.srcObject = remoteStream;
+          remoteVideo.play().catch(fail);
+          log(`remote ${track.kind} track mid=${mid} tracks=${remoteStream.getTracks().map(item => item.kind).join(',')}`);
+        },
+        oncleanup() {
+          if (!failed)
+            log('cleanup');
+        }
+      });
+    }
+
+    remoteVideo.addEventListener('playing', () => {
+      log(`playing ${remoteVideo.videoWidth}x${remoteVideo.videoHeight}`);
+    });
+
+    function armVideoFrameCallback() {
+      if (typeof remoteVideo.requestVideoFrameCallback !== 'function')
+        return;
+      remoteVideo.requestVideoFrameCallback(() => {
+        frameCallbackCount++;
+        armVideoFrameCallback();
+      });
+    }
+
+    function samplePixels() {
+      if (!probeContext || !remoteVideo.videoWidth || !remoteVideo.videoHeight)
+        return;
+      try {
+        probeContext.drawImage(remoteVideo, 0, 0, probeCanvas.width, probeCanvas.height);
+        const pixels = probeContext.getImageData(0, 0, probeCanvas.width, probeCanvas.height).data;
+        let energy = 0;
+        for (let index = 0; index < pixels.length; index += 4)
+          energy += pixels[index] + pixels[index + 1] + pixels[index + 2];
+        pixelEnergy = energy;
+        if (energy > 2000)
+          canvasFrameCount++;
+      } catch (error) {
+        statsError = `canvas:${error && error.message ? error.message : String(error)}`;
+      }
+    }
+
+    async function collectInboundStats() {
+      const peerConnection = streaming && streaming.webrtcStuff && streaming.webrtcStuff.pc;
+      if (!peerConnection || typeof peerConnection.getStats !== 'function')
+        return;
+      try {
+        const reports = await peerConnection.getStats();
+        reports.forEach((report) => {
+          const mediaKind = report.kind || report.mediaType;
+          if (report.type !== 'inbound-rtp' || mediaKind !== 'video' || report.isRemote)
+            return;
+          packetsReceived = Number(report.packetsReceived || 0);
+          bytesReceived = Number(report.bytesReceived || 0);
+          framesReceived = Number(report.framesReceived || 0);
+          framesDecoded = Number(report.framesDecoded || 0);
+          keyFramesDecoded = Number(report.keyFramesDecoded || 0);
+        });
+      } catch (error) {
+        statsError = `stats:${error && error.message ? error.message : String(error)}`;
+      }
+    }
+
+    armVideoFrameCallback();
+
+    setInterval(async () => {
+      await collectInboundStats();
+      samplePixels();
+      const state = `connected=${connected} track=${remoteTrackSeen} ready=${remoteVideo.readyState} ` +
+        `size=${remoteVideo.videoWidth}x${remoteVideo.videoHeight} time=${remoteVideo.currentTime.toFixed(2)} ` +
+        `packets=${packetsReceived} bytes=${bytesReceived} received=${framesReceived} decoded=${framesDecoded} ` +
+        `keys=${keyFramesDecoded} callbacks=${frameCallbackCount} canvas=${canvasFrameCount} ` +
+        `energy=${pixelEnergy}${statsError ? ` error=${statsError}` : ''}`;
+      const decodedEvidence = framesDecoded > 0 || frameCallbackCount >= 2;
+      const pixelEvidence = canvasFrameCount >= 2 && pixelEnergy > 2000;
+      if (connected && remoteTrackSeen && decodedEvidence && pixelEvidence) {
+        document.title = 'PASS Janus WebRTC Receive';
+        log(`PASS ${state}`);
+      } else if (!failed && state !== lastState)
+        log(state);
+    }, 1000);
+
+    setTimeout(() => {
+      if (!document.title.startsWith('PASS'))
+        fail(new Error(`timeout connected=${connected} track=${remoteTrackSeen} ready=${remoteVideo.readyState}`));
+    }, 30000);
+
+    Janus.init({
+      debug: 'all',
+      callback() {
+        if (!Janus.isWebrtcSupported()) {
+          fail(new Error('WebRTC unsupported'));
+          return;
+        }
+        janus = new Janus({
+          server: 'wss://janus.conf.meetecho.com/ws',
+          iceServers: null,
+          success: attachStreamingPlugin,
+          error: fail,
+          destroyed() {
+            if (!failed)
+              log('session destroyed');
+          }
+        });
+      }
+    });
+  </script>
+</body>
+</html>

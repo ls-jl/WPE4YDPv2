@@ -13,8 +13,11 @@
         <div class="mode-block">
           <text class="section-label">显示模式</text>
           <div class="mode-row">
-            <text :class="selectedMode === 'native' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('native')">原生模式</text>
-            <text :class="selectedMode === 'rotate270' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('rotate270')">横屏旋转</text>
+            <text :class="selectedMode === 'last' ? 'mode-option mode-option-active mode-option-last' : 'mode-option mode-option-last'" @click="setMode('last')">沿用上次</text>
+            <text :class="selectedMode === 'native' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('native')">原生</text>
+            <text :class="selectedMode === 'rotate90' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('rotate90')">90°</text>
+            <text :class="selectedMode === 'rotate180' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('rotate180')">180°</text>
+            <text :class="selectedMode === 'rotate270' ? 'mode-option mode-option-active' : 'mode-option'" @click="setMode('rotate270')">270°</text>
           </div>
         </div>
 
@@ -27,26 +30,10 @@
 </template>
 
 <script>
-const DEFAULT_URL = 'https://m.baidu.com/'
-const DEFAULT_BROWSER_MODE = 'native'
-const BROWSER_MODES = ['native', 'rotate270']
+import { DEFAULT_BROWSER_URL, normalizeLaunchUrl } from '../../utils/navigation'
+import { normalizeBrowserLaunchMode } from '../../utils/display-resolver'
 
-function normalizeBrowserMode(value) {
-  const mode = `${value || ''}`
-  return BROWSER_MODES.indexOf(mode) >= 0 ? mode : DEFAULT_BROWSER_MODE
-}
-
-function normalizeUrl(url) {
-  const value = `${url || ''}`.trim()
-  if (!value) return DEFAULT_URL
-  if (value === 'baidu') return DEFAULT_URL
-  if (value === 'bing') return 'https://www.bing.com/'
-  if (value.indexOf('://') >= 0 || value.indexOf('about:') === 0 || value.indexOf('file:') === 0) return value
-  if (/\s/.test(value) || value.indexOf('.') < 0) {
-    return `https://m.baidu.com/s?word=${encodeURIComponent(value)}`
-  }
-  return `https://${value}`
-}
+const DEFAULT_BROWSER_MODE = 'last'
 
 export default {
   name: 'index',
@@ -60,7 +47,7 @@ export default {
     }
   },
   mounted() {
-    this.applyPageOptions(this.pageOptions(), false)
+    this.applyPageOptions(this.pageOptions(), true)
   },
   onShow() {
     this.applyPageOptions(this.pageOptions(), true)
@@ -75,7 +62,7 @@ export default {
     applyPageOptions(options, resetTransient) {
       const pageOptions = options || {}
       const wasLaunching = this.busy || this.messageText === '正在进入浏览器'
-      this.selectedMode = normalizeBrowserMode(pageOptions.browserMode || this.selectedMode)
+      this.selectedMode = normalizeBrowserLaunchMode(pageOptions.browserMode || this.selectedMode)
       if (resetTransient || this.busy) {
         this.busy = false
         this.statusText = 'Ready'
@@ -88,7 +75,7 @@ export default {
       }
     },
     setMode(mode) {
-      this.selectedMode = normalizeBrowserMode(mode)
+      this.selectedMode = normalizeBrowserLaunchMode(mode)
       this.detailText = ''
     },
     readInitialUrl() {
@@ -105,13 +92,13 @@ export default {
         const raw = options.url || options.href || options.u
         if (raw) {
           try {
-            return normalizeUrl(decodeURIComponent(`${raw}`))
+            return normalizeLaunchUrl(decodeURIComponent(`${raw}`))
           } catch (err) {
-            return normalizeUrl(raw)
+            return normalizeLaunchUrl(raw)
           }
         }
       }
-      return DEFAULT_URL
+      return DEFAULT_BROWSER_URL
     },
     launchBrowser() {
       if (this.busy) return
@@ -214,8 +201,8 @@ export default {
 }
 
 .mode-option {
-  margin-right: 8px;
-  width: 96px;
+  margin-right: 6px;
+  width: 60px;
   height: 30px;
   line-height: 30px;
   text-align: center;
@@ -223,6 +210,10 @@ export default {
   font-size: 14px;
   color: #d9e6f2;
   background-color: #26323d;
+}
+
+.mode-option-last {
+  width: 88px;
 }
 
 .mode-option-active {
@@ -244,19 +235,6 @@ export default {
 .primary-button {
   color: #081018;
   background-color: #79d66b;
-}
-
-.secondary-button {
-  margin-top: 10px;
-  margin-right: 8px;
-  width: 112px;
-  height: 36px;
-  line-height: 36px;
-  text-align: center;
-  border-radius: 6px;
-  font-size: 15px;
-  color: #d9e6f2;
-  background-color: #26323d;
 }
 
 </style>

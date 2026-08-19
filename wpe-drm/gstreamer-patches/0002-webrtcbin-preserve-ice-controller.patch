@@ -1,0 +1,18 @@
+diff --git a/ext/webrtc/gstwebrtcbin.c b/ext/webrtc/gstwebrtcbin.c
+--- a/ext/webrtc/gstwebrtcbin.c
++++ b/ext/webrtc/gstwebrtcbin.c
+@@ -4737,8 +4737,12 @@ _create_answer_task (GstWebRTCBin * webrtc, const GstStructure * options,
+ 
+   /* FIXME: can we add not matched transceivers? */
+ 
+-  /* XXX: only true for the initial offerer */
+-  gst_webrtc_ice_set_is_controller (webrtc->priv->ice, FALSE);
++  /*
++   * Creating an SDP answer does not change the established ICE transport
++   * role. The initial answerer already defaults to controlled, while an
++   * explicit controlling role must survive renegotiation and platform
++   * compatibility quirks.
++   */
+ 
+ out:
+   g_strfreev (bundled);

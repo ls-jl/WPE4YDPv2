@@ -1,10 +1,33 @@
 #!/bin/sh
+umask 077
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VAR_DIR="${WPE_VAR_DIR:-$DIR/var}"
 mkdir -p "$VAR_DIR"
+EXIT_STATUS_FILE="$VAR_DIR/browser-exit.json"
+rm -f "$EXIT_STATUS_FILE"
+
+write_exit_status() {
+    reason="$1"
+    code="$2"
+    browser_mode="${3:-}"
+    tmp="$EXIT_STATUS_FILE.tmp.$$"
+    case "$browser_mode" in
+        native|rotate90|rotate180|rotate270)
+            printf '{"reason":"%s","code":%s,"browserMode":"%s","timestamp":%s}\n' \
+                "$reason" "$code" "$browser_mode" "$(date +%s 2>/dev/null || echo 0)" >"$tmp" || return 0
+            ;;
+        *)
+            printf '{"reason":"%s","code":%s,"timestamp":%s}\n' \
+                "$reason" "$code" "$(date +%s 2>/dev/null || echo 0)" >"$tmp" || return 0
+            ;;
+    esac
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$EXIT_STATUS_FILE" 2>/dev/null || rm -f "$tmp"
+}
 MESA="${WPE_MESA_DIR:-$DIR}"
 if [ ! -d "$MESA/lib" ]; then
     echo "WPE fatal: Mesa/runtime lib dir missing: $MESA/lib"
+    write_exit_status start_failed 84
     exit 84
 fi
 unset WPE_BACKEND_LIBRARY
@@ -43,79 +66,175 @@ export GIO_EXTRA_MODULES="$DIR/lib/gio/modules"
 export G_TLS_CA_FILE="${G_TLS_CA_FILE:-$DIR/etc/ssl/certs/ca-certificates.crt}"
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$DIR/etc/ssl/certs/ca-certificates.crt}"
 export WEBKIT_TLS_CAFILE_PEM="${WEBKIT_TLS_CAFILE_PEM:-$G_TLS_CA_FILE}"
+export OPENSSL_MODULES="${OPENSSL_MODULES:-$DIR/lib/ossl-modules}"
 if [ ! -f "$G_TLS_CA_FILE" ]; then
     echo "WPE fatal: CA certificates missing: $G_TLS_CA_FILE"
+    write_exit_status start_failed 85
     exit 85
 fi
 export TZDIR="${TZDIR:-$DIR/share/zoneinfo}"
 export TZ="${TZ:-Asia/Shanghai}"
 export GST_PLUGIN_SCANNER="$DIR/libexec/gstreamer-1.0/gst-plugin-scanner"
 export GST_REGISTRY="${GST_REGISTRY:-$VAR_DIR/gst-registry.bin}"
-export GST_DEBUG="${GST_DEBUG:-2,decodebin:4,uridecodebin:4,webkit*:3}"
+GST_PLUGIN_SET_FILE="$DIR/share/gstreamer-plugin-set.sha256"
+GST_PLUGIN_SET_ACTIVE="$VAR_DIR/gstreamer-plugin-set.sha256"
+if [ -s "$GST_PLUGIN_SET_FILE" ]; then
+    if ! cmp -s "$GST_PLUGIN_SET_FILE" "$GST_PLUGIN_SET_ACTIVE" 2>/dev/null; then
+        rm -f "$GST_REGISTRY"
+        cp "$GST_PLUGIN_SET_FILE" "$GST_PLUGIN_SET_ACTIVE"
+        chmod 600 "$GST_PLUGIN_SET_ACTIVE" 2>/dev/null || true
+        echo "WPE GStreamer: plugin set changed; registry reset"
+    fi
+fi
+export WEBKIT_CLOUD_FORCE_ICE_CONTROLLER="${WEBKIT_CLOUD_FORCE_ICE_CONTROLLER:-1}"
+export WPE_CLOUD_DIAGNOSTICS="${WPE_CLOUD_DIAGNOSTICS:-0}"
+export WPE_START_URL_OVERRIDE="${WPE_START_URL_OVERRIDE:-0}"
+if [ "$WPE_CLOUD_DIAGNOSTICS" = "1" ]; then
+    export WEBKIT_CLOUD_DATACHANNEL_DIAGNOSTICS=1
+    export WEBKIT_CLOUD_WEBSOCKET_DIAGNOSTICS=1
+    export WEBKIT_CLOUD_SDP_DIAGNOSTICS=1
+    export GST_DEBUG="${GST_DEBUG:-2,decodebin:4,uridecodebin:4,webkit*:3,webrtcbin:4,webrtcdatachannel:6,sctp*:6,dtlsconnection:4,dtlssrtp*:4,webrtctransport*:5}"
+else
+    export GST_DEBUG="${GST_DEBUG:-1,webkit*:2}"
+fi
+if [ "${WPE_GST_DOT:-0}" = "1" ]; then
+    GST_DOT_DIR="${WPE_GST_DOT_DIR:-$VAR_DIR/gst-dot}"
+    mkdir -p "$GST_DOT_DIR"
+    chmod 700 "$GST_DOT_DIR" 2>/dev/null || true
+    export GST_DEBUG_DUMP_DOT_DIR="$GST_DOT_DIR"
+    echo "WPE GStreamer: gst_dot=enabled dir=$GST_DOT_DIR"
+else
+    unset GST_DEBUG_DUMP_DOT_DIR
+fi
 export WEBKIT_GST_DISABLE_GL_SINK="${WEBKIT_GST_DISABLE_GL_SINK:-1}"
 export WEBKIT_WEBGL_DISABLE_GBM="${WEBKIT_WEBGL_DISABLE_GBM:-1}"
 export WEBKIT_DISABLE_DMABUF_ATLAS="${WEBKIT_DISABLE_DMABUF_ATLAS:-1}"
 export WEBKIT_FORCE_VBLANK_TIMER="${WEBKIT_FORCE_VBLANK_TIMER:-1}"
+MEMORY_RUNTIME_MODULE="$DIR/runtime/memory-runtime.sh"
+if [ ! -r "$MEMORY_RUNTIME_MODULE" ]; then
+    echo "WPE fatal: memory runtime module missing: $MEMORY_RUNTIME_MODULE"
+    write_exit_status start_failed 89
+    exit 89
+fi
+. "$MEMORY_RUNTIME_MODULE"
+memory_runtime_init
 # 低配设备（1GB/4xA53/无GPU）调优：
 # - 恢复系统级内存压力监控（关闭会同时使 tile 预取恒 2x）
 # - Skia 走原生 CPU 光栅化，不再经 softpipe 软件 GL 模拟的 GPU 路径（收益最大）
 # - 刷新节流 30 fps（须为刷新率 60 的因子）：视频是核心场景，20 会卡 25/30fps 视频
 # - JSC：FTL JIT 关（最耗内存层）、看门狗 8s 防死循环；
-#   forceRAMSize 让 JSC 按 512MB 预算做比例式堆增长（gcMaxHeapSize 非硬上限已弃用）；
+#   forceRAMSize 跟随 448/512/640MB 内存 Profile 做比例式堆增长；
 #   GC marker 降 2、mutator 时间片上调、JIT warmup 阈值上调减少编译抖动
-# - MSE_MAX_BUFFER_SIZE：MSE 每 SourceBuffer 默认 304MB，抖音多 video 同时
-#   buffer 会吃掉几百 MB，收紧到 视频40M/音频8M
+# - MSE_MAX_BUFFER_SIZE：按内存 Profile 收紧到 24/4、32/6 或 40/8MB
 export WEBKIT_SKIA_ENABLE_CPU_RENDERING="${WEBKIT_SKIA_ENABLE_CPU_RENDERING:-1}"
 export WEBKIT_SKIA_CPU_PAINTING_THREADS="${WEBKIT_SKIA_CPU_PAINTING_THREADS:-3}"
 export WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS="${WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS:-30}"
 export JSC_useFTLJIT="${JSC_useFTLJIT:-false}"
 export JSC_watchdog="${JSC_watchdog:-8000}"
-export JSC_forceRAMSize="${JSC_forceRAMSize:-536870912}"
 export JSC_numberOfGCMarkers="${JSC_numberOfGCMarkers:-2}"
 export JSC_maximumMutatorUtilization="${JSC_maximumMutatorUtilization:-0.85}"
 export JSC_thresholdForJITAfterWarmUp="${JSC_thresholdForJITAfterWarmUp:-2000}"
 export JSC_thresholdForOptimizeAfterWarmUp="${JSC_thresholdForOptimizeAfterWarmUp:-6000}"
-export MSE_MAX_BUFFER_SIZE="${MSE_MAX_BUFFER_SIZE:-V:40M,A:8M}"
 export WPE_TOUCH_HORIZONTAL_SCROLL="${WPE_TOUCH_HORIZONTAL_SCROLL:-1}"
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
+export WPE_DRM_FENCE_TIMEOUT_MS="${WPE_DRM_FENCE_TIMEOUT_MS:-2000}"
+export WPE_DRM_PARTIAL_COPY="${WPE_DRM_PARTIAL_COPY:-0}"
+# Use the packaged Rockchip RGA for rotated Mali frames. In auto mode any
+# import/rotation failure falls back to the existing CPU copy path.
+export WPE_DRM_RGA_ROTATION="${WPE_DRM_RGA_ROTATION:-auto}"
+if [ "$WPE_DRM_RGA_ROTATION" != "off" ] && [ "$WPE_DRM_RGA_ROTATION" != "0" ]; then
+    export WPE_DRM_RGA_LIBRARY="${WPE_DRM_RGA_LIBRARY:-$DIR/lib/librga.so.2}"
+else
+    unset WPE_DRM_RGA_LIBRARY
+fi
+export WPE_WEBRTC="${WPE_WEBRTC:-1}"
+export WPE_WEBRTC_CAPTURE="${WPE_WEBRTC_CAPTURE:-deny}"
+# 云原神的信令 WSS 当前在 *.mhystatic.com:5443 返回已过期证书。
+# WebKit 内核只对该域名后缀、该端口且错误仅为 EXPIRED 时放行；
+# 未知 CA、域名不匹配及其他 TLS 错误继续拒绝。设为 0 可完全关闭例外。
+export WPE_CLOUDGAME_ALLOW_EXPIRED_TLS="${WPE_CLOUDGAME_ALLOW_EXPIRED_TLS:-1}"
 
 # 视频 KMS overlay 直出（hole-punch）：mppvideodec 解码 NV12 dmabuf 经 RGA
 # 预旋转后直接放 DRM overlay plane，跳过软件颜色转换与 Skia 合成。
 # WPE_VIDEO_OVERLAY=0 一键回退纯软件视频路径。
 if [ "${WPE_VIDEO_OVERLAY:-1}" = "1" ]; then
     export WEBKIT_GST_HOLE_PUNCH_QUIRK="${WEBKIT_GST_HOLE_PUNCH_QUIRK:-rockchip}"
+    export WEBKIT_GST_HOLE_PUNCH_MEDIASTREAM_EARLY="${WEBKIT_GST_HOLE_PUNCH_MEDIASTREAM_EARLY:-1}"
     export WPE_VIDEO_OVERLAY_SOCKET="${WPE_VIDEO_OVERLAY_SOCKET:-$VAR_DIR/wpe-video-overlay.sock}"
+    export WPE_VIDEO_OVERLAY_ROTATION="${WPE_VIDEO_OVERLAY_ROTATION:-${WPE_DRM_ROTATION:-${WPE_PANEL_ROTATION:-0}}}"
+    export WPE_VIDEO_OVERLAY_FIT="${WPE_VIDEO_OVERLAY_FIT:-contain}"
 fi
 
-# 单任务内存倾斜：浏览器是前台唯一任务，把内存尽量让给它。
-# - oom_score_adj -600：内核 OOM 时优先杀其他进程（子进程继承）
-# - drop_caches：启动前释放系统攒的页缓存
-# - swappiness 100：把后台进程冷页压进 swap，物理内存留给浏览器（退出恢复）
-echo -600 > /proc/self/oom_score_adj 2>/dev/null || true
-sync 2>/dev/null || true
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-WPE_SAVED_SWAPPINESS="$(cat /proc/sys/vm/swappiness 2>/dev/null)"
-if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
-    echo 100 > /proc/sys/vm/swappiness 2>/dev/null || WPE_SAVED_SWAPPINESS=""
+# MiniApp 是 WPE 的生命周期宿主，OOM 时必须优先保住 MiniApp。WPE 退出后可由
+# watchdog 返回启动页或重新启动；MiniApp 被杀会让整套框架重启。
+WPE_OOM_SCORE_ADJ="${WPE_OOM_SCORE_ADJ:-200}"
+case "$WPE_OOM_SCORE_ADJ" in
+    -[0-9]*|[0-9]*) echo "$WPE_OOM_SCORE_ADJ" > /proc/self/oom_score_adj 2>/dev/null || true ;;
+    *) echo "WPE warn: invalid WPE_OOM_SCORE_ADJ=$WPE_OOM_SCORE_ADJ; keeping system default" ;;
+esac
+
+# 全局 VM 调优默认关闭。高 swappiness 在 512MB swap 已满的设备上会放大交互
+# 延迟；drop_caches 也会让浏览器首屏重新产生大量 I/O。仅保留显式诊断开关。
+if [ "${WPE_DROP_CACHES:-0}" = "1" ]; then
+    sync 2>/dev/null || true
+    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+fi
+WPE_SAVED_SWAPPINESS=""
+if [ -n "${WPE_SWAPPINESS:-}" ]; then
+    WPE_SAVED_SWAPPINESS="$(cat /proc/sys/vm/swappiness 2>/dev/null)"
+    if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
+        echo "$WPE_SWAPPINESS" > /proc/sys/vm/swappiness 2>/dev/null || WPE_SAVED_SWAPPINESS=""
+    fi
 fi
 restore_swappiness() {
     if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
         echo "$WPE_SAVED_SWAPPINESS" > /proc/sys/vm/swappiness 2>/dev/null || true
     fi
 }
-trap restore_swappiness EXIT INT TERM
 export WPE_CHROME_ENABLED="${WPE_CHROME_ENABLED:-1}"
 export WPE_CHROME_HEIGHT="${WPE_CHROME_HEIGHT:-44}"
+export WPE_CHROME_PORTRAIT_HEIGHT="${WPE_CHROME_PORTRAIT_HEIGHT:-80}"
 export WPE_CHROME_HIT_SLOP="${WPE_CHROME_HIT_SLOP:-6}"
-export WPE_CHROME_REVEAL_HEIGHT="${WPE_CHROME_REVEAL_HEIGHT:-22}"
 export WPE_CHROME_TAP_MAX_MOVE="${WPE_CHROME_TAP_MAX_MOVE:-32}"
 export WPE_CHROME_ANIMATION_MS="${WPE_CHROME_ANIMATION_MS:-160}"
+export WPE_CHROME_GESTURE_MOVE_PX="${WPE_CHROME_GESTURE_MOVE_PX:-28}"
+export WPE_CHROME_GESTURE_POSITION_PX="${WPE_CHROME_GESTURE_POSITION_PX:-48}"
+export WPE_CHROME_GESTURE_PAIR_MS="${WPE_CHROME_GESTURE_PAIR_MS:-160}"
+export WPE_CHROME_GESTURE_TAP_MS="${WPE_CHROME_GESTURE_TAP_MS:-350}"
+export WPE_CHROME_GESTURE_GAP_MS="${WPE_CHROME_GESTURE_GAP_MS:-800}"
+export WPE_CHROME_GESTURE_QUIET_MS="${WPE_CHROME_GESTURE_QUIET_MS:-500}"
 export WPE_CHROME_HIDE_DOWN_PX="${WPE_CHROME_HIDE_DOWN_PX:-96}"
 export WPE_CHROME_SHOW_UP_PX="${WPE_CHROME_SHOW_UP_PX:-180}"
 export WPE_CHROME_SHOW_UP_MIN_VELOCITY="${WPE_CHROME_SHOW_UP_MIN_VELOCITY:-700}"
-export WPE_CHROME_LAYOUT="${WPE_CHROME_LAYOUT:-inset}"
+WPE_CHROME_LAYOUT="${WPE_CHROME_LAYOUT:-resize}"
+# Older JSAPI builds injected the legacy overlay value before exec. Migrate it
+# at the package entry point so a stale bridge cannot cover page content.
+if [ "$WPE_CHROME_LAYOUT" = "inset" ]; then
+    echo "WPE chrome: legacy layout=inset migrated to resize"
+    WPE_CHROME_LAYOUT=resize
+fi
+export WPE_CHROME_LAYOUT
 export WPE_CHROME_STATE="${WPE_CHROME_STATE:-$VAR_DIR/browser-state.ini}"
 export WPE_CHROME_RENDER_STATE="${WPE_CHROME_RENDER_STATE:-$VAR_DIR/chrome-render-state.ini}"
+export WPE_BROWSER_DB="${WPE_BROWSER_DB:-$VAR_DIR/browser.sqlite3}"
+export WPE_PROFILES_DIR="${WPE_PROFILES_DIR:-$VAR_DIR/profiles}"
+export WPE_PROFILE_SWITCH_FILE="${WPE_PROFILE_SWITCH_FILE:-$VAR_DIR/profile-switch.request}"
+export WPE_DISPLAY_MODE_FILE="${WPE_DISPLAY_MODE_FILE:-$VAR_DIR/display-mode}"
+case "${WPE_BROWSER_MODE:-}" in
+    native|rotate90|rotate180|rotate270) ;;
+    *)
+        SAVED_DISPLAY_MODE="$(sed -n '1p' "$WPE_DISPLAY_MODE_FILE" 2>/dev/null || true)"
+        case "$SAVED_DISPLAY_MODE" in
+            native|rotate90|rotate180|rotate270) WPE_BROWSER_MODE="$SAVED_DISPLAY_MODE" ;;
+            *) WPE_BROWSER_MODE=native ;;
+        esac
+        export WPE_BROWSER_MODE
+        ;;
+esac
+export WPE_BROWSER_MODE
+export WPE_CHROME_FONT="${WPE_CHROME_FONT:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Regular.ttf}"
+export WPE_CHROME_FONT_MEDIUM="${WPE_CHROME_FONT_MEDIUM:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Medium.ttf}"
+export WPE_CHROME_FONT_BOLD="${WPE_CHROME_FONT_BOLD:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Bold.ttf}"
 export WPE_PANEL_SIZE="${WPE_PANEL_SIZE:-${WPE_VIEWPORT:-960x266}}"
 export WPE_VIEWPORT="${WPE_VIEWPORT:-$WPE_PANEL_SIZE}"
 export WPE_DRM_MODE="${WPE_DRM_MODE:-$WPE_PANEL_SIZE}"
@@ -123,6 +242,15 @@ export WPE_DRM_FIT="${WPE_DRM_FIT:-panel-native}"
 REQUESTED_ROTATION="${4:-${WPE_DRM_ROTATION:-${WPE_PANEL_ROTATION:-0}}}"
 export WPE_PANEL_ROTATION="${WPE_PANEL_ROTATION:-$REQUESTED_ROTATION}"
 export WPE_TOUCH_ROTATION="${WPE_TOUCH_ROTATION:-$WPE_PANEL_ROTATION}"
+if [ "${WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT+x}" = x ]; then
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE_SET=1
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE="$WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT"
+else
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE_SET=0
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE=
+fi
+unset WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT
+export WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS="${WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS:-0}"
 PANEL_W="${WPE_PANEL_SIZE%x*}"
 PANEL_H="${WPE_PANEL_SIZE#*x}"
 DRM_W="${WPE_DRM_MODE%x*}"
@@ -170,6 +298,7 @@ if [ "$REBUILD_FONTCONFIG" = 1 ]; then
     rm -f "$FONT_DIRS_TMP"
     if [ ! -s "$FONT_DIRS_FILE" ]; then
         echo "WPE fatal: bundled fonts missing dir=$BUNDLED_FONT_ROOT"
+        write_exit_status start_failed 86
         exit 86
     fi
     CJK_FONT="$MINIAPP_FONT_DIR/NotoSansSC-Regular.otf"
@@ -213,20 +342,45 @@ export XKB_CONFIG_ROOT="$DIR/share/X11/xkb"
 export LIBINPUT_QUIRKS_DIR="$DIR/share/libinput"
 export WEBKIT_EXEC_PATH="$DIR/libexec/wpe-webkit-2.0"
 export WEBKIT_INJECTED_BUNDLE_PATH="$DIR/lib/wpe-webkit-2.0/injected-bundle"
+# Cloud gaming uses the early H.264/Mpp path so encoded access units reach the
+# hardware decoder without blocking the final MediaStream player. Audio is
+# attached only after video preroll; disabling it remains an explicit rollback.
+export WEBKIT_GST_WEBRTC_FORCE_EARLY_VIDEO_DECODING="${WEBKIT_GST_WEBRTC_FORCE_EARLY_VIDEO_DECODING:-1}"
+export WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO="${WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO:-0}"
+export WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO="${WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO:-1}"
+export WEBKIT_GST_FORCE_DEFAULT_ALSA_SINK="${WEBKIT_GST_FORCE_DEFAULT_ALSA_SINK:-1}"
+export WEBKIT_GST_SYSTEM_VOLUME_MUTE_BRIDGE="${WEBKIT_GST_SYSTEM_VOLUME_MUTE_BRIDGE:-1}"
+export WEBKIT_GST_WEBRTC_DEFER_PLAYER_AUDIO="${WEBKIT_GST_WEBRTC_DEFER_PLAYER_AUDIO:-0}"
+export WEBKIT_GST_WEBRTC_ALLOW_EARLY_AUDIO="${WEBKIT_GST_WEBRTC_ALLOW_EARLY_AUDIO:-1}"
+export WEBKIT_GST_MEDIASTREAM_DIRECT_AUDIO_SINK="${WEBKIT_GST_MEDIASTREAM_DIRECT_AUDIO_SINK:-1}"
+export WEBKIT_GST_WEBRTC_FORCE_EARLY_AUDIO_DECODING="${WEBKIT_GST_WEBRTC_FORCE_EARLY_AUDIO_DECODING:-1}"
+export WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC="${WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC:-1}"
+export WEBKIT_GST_WEBRTC_LEAKY_RAW_VIDEO="${WEBKIT_GST_WEBRTC_LEAKY_RAW_VIDEO:-1}"
+export WEBKIT_GST_WEBRTC_COALESCE_INCOMING_VIDEO="${WEBKIT_GST_WEBRTC_COALESCE_INCOMING_VIDEO:-1}"
+export WEBKIT_GST_WEBRTC_RETIMESTAMP_INCOMING="${WEBKIT_GST_WEBRTC_RETIMESTAMP_INCOMING:-1}"
+export WEBKIT_GST_WEBRTC_COPY_DECODED_VIDEO="${WEBKIT_GST_WEBRTC_COPY_DECODED_VIDEO:-0}"
+export WEBKIT_GST_WEBRTC_REPARSE_H264="${WEBKIT_GST_WEBRTC_REPARSE_H264:-1}"
+export WEBKIT_GST_MPP_REQUIRE_H264_AU="${WEBKIT_GST_MPP_REQUIRE_H264_AU:-1}"
 # The device has no usable GPU, but dma-heap direct scanout is still much
 # faster than SHM dumb-buffer copies. Set WPE_DRM_FORCE_SHM=1 only for fallback
 # diagnostics on kernels without a working dma-heap scanout path.
 export WPE_DRM_FORCE_SHM="${WPE_DRM_FORCE_SHM:-0}"
 export WPE_DRM_BUFFER_PATH="${WPE_DRM_BUFFER_PATH:-dma_heap}"
-export WPE_DRM_RUNTIME_DIR="${WPE_DRM_RUNTIME_DIR:-$VAR_DIR/runtime}"
+export WPE_DRM_RUNTIME_DIR="${WPE_DRM_RUNTIME_DIR:-$VAR_DIR/runtime-tmp}"
 export WPE_KEYBOARD_DIR="${WPE_KEYBOARD_DIR:-$VAR_DIR/keyboard}"
 export WPE_RAW_TOUCH="${WPE_RAW_TOUCH:-1}"
-export WPE_TOUCH_DEVICE="${WPE_TOUCH_DEVICE:-/dev/input/by-path/hyn_ts}"
+export WPE_TOUCH_DEVICE="${WPE_TOUCH_DEVICE:-}"
+if [ -z "$WPE_TOUCH_DEVICE" ]; then
+    echo "Raw touch disabled: WPE_TOUCH_DEVICE was not supplied by system display config" >&2
+fi
 export WPE_TOUCH_OFFSET_X="${WPE_TOUCH_OFFSET_X:-0}"
 export WPE_TOUCH_OFFSET_Y="${WPE_TOUCH_OFFSET_Y:-0}"
-export WPE_SEND_TOUCH_EVENTS="${WPE_SEND_TOUCH_EVENTS:-0}"
+export WPE_SEND_TOUCH_EVENTS="${WPE_SEND_TOUCH_EVENTS:-1}"
 export WPE_SYNTHESIZE_POINTER_TAP="${WPE_SYNTHESIZE_POINTER_TAP:-1}"
-export WPE_TOUCH_SCROLL_FALLBACK="${WPE_TOUCH_SCROLL_FALLBACK:-1}"
+export WPE_GAME_GESTURE_DRAG_PX="${WPE_GAME_GESTURE_DRAG_PX:-8}"
+export WPE_GAME_GESTURE_HOLD_MS="${WPE_GAME_GESTURE_HOLD_MS:-80}"
+export WPE_GAME_MEDIA_IMMERSIVE="${WPE_GAME_MEDIA_IMMERSIVE:-1}"
+export WPE_TOUCH_SCROLL_FALLBACK="${WPE_TOUCH_SCROLL_FALLBACK:-0}"
 export WPE_TOUCH_NATIVE_SCROLL="${WPE_TOUCH_NATIVE_SCROLL:-1}"
 export WPE_TOUCH_JS_SCROLL="${WPE_TOUCH_JS_SCROLL:-0}"
 export WPE_TOUCH_SCROLL_INVERT_Y="${WPE_TOUCH_SCROLL_INVERT_Y:-0}"
@@ -236,6 +390,9 @@ export WPE_TOUCH_SCROLL_PENDING_LIMIT="${WPE_TOUCH_SCROLL_PENDING_LIMIT:-64}"
 export WPE_TOUCH_TAP_MAX_MOVE="${WPE_TOUCH_TAP_MAX_MOVE:-32}"
 export WPE_TOUCH_SCROLL_INTERVAL_MS="${WPE_TOUCH_SCROLL_INTERVAL_MS:-16}"
 export WPE_TOUCH_SCROLL_STOP_DELAY_MS="${WPE_TOUCH_SCROLL_STOP_DELAY_MS:-80}"
+export WPE_INPUT_PROFILE="${WPE_INPUT_PROFILE:-auto}"
+export WPE_GAME_HOSTS="${WPE_GAME_HOSTS:-ys.mihoyo.com,cloudgame.mihoyo.com}"
+export WPE_CLOUD_AUTOSTART="${WPE_CLOUD_AUTOSTART:-1}"
 export WPE_DEFAULT_URL="${WPE_DEFAULT_URL:-https://m.baidu.com/}"
 URL="${1:-$WPE_DEFAULT_URL}"
 DRM="${2:-/dev/dri/card0}"
@@ -270,24 +427,186 @@ if [ ! -e "$WPE_DRM_DMA_HEAP" ]; then
     export WPE_DRM_BUFFER_PATH=shm
 fi
 export WPE_DRM_DMA_HEAP
-printf '%s\n' "$ROTATION" >"$WPE_DRM_ROTATION_FILE" 2>/dev/null || true
-echo "WPE launch: url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP keyboard_dir=$WPE_KEYBOARD_DIR"
+CPU_BUFFER_PATH="$WPE_DRM_BUFFER_PATH"
+CPU_FORCE_SHM="$WPE_DRM_FORCE_SHM"
+CPU_DMA_HEAP="$WPE_DRM_DMA_HEAP"
+CPU_COMPOSITOR="${WEBKIT_SKIA_CPU_COMPOSITOR:-1}"
 
+BROWSER_PID=
 KEEP_PID=
+TERMINATING=0
+PROFILE_SWITCH_COUNT=0
+GPU_RESTART_COUNT=0
+rm -f "$WPE_PROFILE_SWITCH_FILE"
+
+GPU_RUNTIME_MODULE="$DIR/runtime/gpu-runtime.sh"
+if [ ! -r "$GPU_RUNTIME_MODULE" ]; then
+    echo "WPE fatal: GPU runtime module missing: $GPU_RUNTIME_MODULE"
+    write_exit_status start_failed 87
+    exit 87
+fi
+. "$GPU_RUNTIME_MODULE"
+gpu_runtime_init
+
+cleanup_runtime() {
+    if [ -n "$KEEP_PID" ]; then
+        kill "$KEEP_PID" 2>/dev/null || true
+        KEEP_PID=
+    fi
+    cleanup_gpu_modules
+    restore_swappiness
+}
+
+on_terminate() {
+    TERMINATING=1
+    if [ -n "$BROWSER_PID" ]; then
+        kill "$BROWSER_PID" 2>/dev/null || true
+    fi
+}
+
+run_browser_profile() {
+    rm -f "$GPU_READY_FILE"
+    export WPE_GPU_READY_FILE="$GPU_READY_FILE"
+    "$DIR/wpe-drm-minimal" "$URL" "$DRM" "$VIEWPORT" "$ROTATION" &
+    BROWSER_PID=$!
+    if wait "$BROWSER_PID"; then
+        BROWSER_STATUS=0
+    else
+        BROWSER_STATUS=$?
+    fi
+    if [ "$TERMINATING" != 0 ]; then
+        # A trapped signal can interrupt wait before the child is reaped. Keep
+        # the PID until one final wait completes; the JSAPI process-group
+        # watchdog remains the bounded SIGKILL fallback for a wedged child.
+        kill "$BROWSER_PID" 2>/dev/null || true
+        wait "$BROWSER_PID" 2>/dev/null || true
+        BROWSER_STATUS=0
+    fi
+    BROWSER_PID=
+    return "$BROWSER_STATUS"
+}
+
+run_profile_switch_loop() {
+    while :; do
+        if run_browser_profile; then
+            BROWSER_STATUS=0
+        else
+            BROWSER_STATUS=$?
+        fi
+        if [ "$BROWSER_STATUS" -ne 75 ] || [ "$TERMINATING" != 0 ]; then
+            return "$BROWSER_STATUS"
+        fi
+        PROFILE_SWITCH_COUNT=$((PROFILE_SWITCH_COUNT + 1))
+        if [ "$PROFILE_SWITCH_COUNT" -gt 32 ]; then
+            echo "WPE profile switch aborted: restart limit exceeded"
+            return 76
+        fi
+        if [ ! -f "$WPE_PROFILE_SWITCH_FILE" ]; then
+            echo "WPE profile switch failed: request file missing"
+            return 76
+        fi
+        PROFILE_REQUEST=$(sed -n '1p' "$WPE_PROFILE_SWITCH_FILE" 2>/dev/null || true)
+        rm -f "$WPE_PROFILE_SWITCH_FILE"
+        case "$PROFILE_REQUEST" in
+            guest) ;;
+            ''|*[!0-9]*)
+                echo "WPE profile switch failed: invalid request=$PROFILE_REQUEST"
+                return 76
+                ;;
+        esac
+        export WPE_PROFILE_OVERRIDE="$PROFILE_REQUEST"
+        echo "WPE profile restart: request=$PROFILE_REQUEST count=$PROFILE_SWITCH_COUNT profile=$SELECTED_PROFILE"
+    done
+}
+
+trap cleanup_runtime EXIT
+trap on_terminate INT TERM
+printf '%s\n' "$ROTATION" >"$WPE_DRM_ROTATION_FILE" 2>/dev/null || true
+
 if command -v hal-screen >/dev/null 2>&1; then
-    env -u LD_LIBRARY_PATH hal-screen on >/dev/null 2>&1 || true
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD hal-screen on >/dev/null 2>&1 || true
     (
         while :; do
-            env -u LD_LIBRARY_PATH hal-screen keep >/dev/null 2>&1 || true
+            env -u LD_LIBRARY_PATH -u LD_PRELOAD hal-screen keep >/dev/null 2>&1 || true
             sleep 20
         done
     ) &
     KEEP_PID=$!
 fi
 
-"$DIR/wpe-drm-minimal" "$URL" "$DRM" "$VIEWPORT" "$ROTATION"
-STATUS=$?
-if [ -n "$KEEP_PID" ]; then
-    kill "$KEEP_PID" 2>/dev/null || true
+while :; do
+    load_gpu_mode_preference
+    if select_render_profile; then
+        SELECT_STATUS=0
+    else
+        SELECT_STATUS=$?
+    fi
+    if [ "$SELECT_STATUS" -ne 0 ]; then
+        exit "$SELECT_STATUS"
+    fi
+
+    echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE gpu_status=$WPE_GPU_STATUS compositor=$WEBKIT_SKIA_CPU_COMPOSITOR full_repaint=$WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT layout_template=${WPE_LAYOUT_TEMPLATE:-unknown} layout_rotation=${WPE_LAYOUT_ROTATION:-unknown} output_rotation=$ROTATION rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT rga_rotation=$WPE_DRM_RGA_ROTATION video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
+
+    if run_profile_switch_loop; then
+        STATUS=0
+    else
+        STATUS=$?
+    fi
+    if [ "$SELECTED_PROFILE" = gpu ] && [ "$TERMINATING" = 0 ] && \
+       [ "$STATUS" -ne 72 ] && [ "$STATUS" -ne 73 ] && [ "$STATUS" -ne 74 ] && \
+       { [ "$STATUS" -eq 91 ] || [ ! -f "$GPU_READY_FILE" ]; }; then
+        if [ "$GPU_MODE" = required ]; then
+            echo "WPE fatal: required GPU launch failed status=$STATUS ready=0"
+            exit "$STATUS"
+        fi
+        echo "WPE GPU runtime failed before first frame status=$STATUS; restarting once with CPU profile"
+        cleanup_gpu_modules
+        configure_cpu_profile
+        SELECTED_PROFILE=cpu-fallback
+        export WPE_GPU_STATUS=fallback
+        if run_profile_switch_loop; then
+            STATUS=0
+        else
+            STATUS=$?
+        fi
+    fi
+
+    if [ "$STATUS" -ne 73 ]; then
+        break
+    fi
+    GPU_RESTART_COUNT=$((GPU_RESTART_COUNT + 1))
+    if [ "$GPU_RESTART_COUNT" -gt 8 ]; then
+        echo "WPE GPU mode restart aborted: restart limit exceeded"
+        STATUS=76
+        break
+    fi
+    cleanup_gpu_modules
+    load_gpu_mode_preference
+    echo "WPE GPU mode restart: mode=$GPU_MODE count=$GPU_RESTART_COUNT"
+done
+
+if [ "$TERMINATING" != 0 ]; then
+    echo "WPE external shutdown completed"
+    rm -f "$EXIT_STATUS_FILE"
+    STATUS=0
+elif [ "$STATUS" -eq 72 ]; then
+    DISPLAY_MODE="$(sed -n '1p' "$WPE_DISPLAY_MODE_FILE" 2>/dev/null || true)"
+    case "$DISPLAY_MODE" in
+        native|rotate90|rotate180|rotate270) ;;
+        *) DISPLAY_MODE="${WPE_BROWSER_MODE:-native}" ;;
+    esac
+    echo "WPE rotation change completed mode=$DISPLAY_MODE"
+    write_exit_status rotation_change 72 "$DISPLAY_MODE"
+    STATUS=0
+elif [ "$STATUS" -eq 74 ]; then
+    echo "WPE user shutdown completed"
+    write_exit_status user_shutdown 74
+    STATUS=0
+elif [ "$STATUS" -ne 0 ]; then
+    if [ -f "$GPU_READY_FILE" ]; then
+        write_exit_status crash "$STATUS"
+    else
+        write_exit_status start_failed "$STATUS"
+    fi
 fi
 exit "$STATUS"

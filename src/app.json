@@ -1,7 +1,7 @@
 {
   "pages": {
     "index": "pages/index/index.js",
-    "frame": "pages/frame/frame.vue"
+    "frame": "pages/frame/frame.js"
   },
   "props": {
     "browser_display_sku": {
@@ -10,11 +10,7 @@
         "drmMode": "480x960",
         "rotation": 270
       }
-    }
-  },
-  "options": {
-      "style": {
-          "lessPaths": ["styles"]
-      }
+    },
+    "keyboard_backend": "auto"
   }
 }

@@ -1,0 +1,902 @@
+diff --git a/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp b/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp
+index 3b21cf86..fe8b26fd 100644
+--- a/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp
++++ b/Source/WebCore/page/scrolling/coordinated/ScrollerCoordinated.cpp
+@@ -31,10 +31,12 @@
+ #if USE(COORDINATED_GRAPHICS_ASYNC_SCROLLBAR)
+ #include "BitmapTexturePool.h"
+ #include "CoordinatedPlatformLayer.h"
++#include "CoordinatedPlatformLayerBufferNativeImage.h"
+ #include "CoordinatedPlatformLayerBufferRGB.h"
+ #include "GLContext.h"
+ #include "GLFence.h"
+ #include "GraphicsContextSkia.h"
++#include "NativeImage.h"
+ #include "PlatformDisplay.h"
+ #include "ScrollerImpAdwaita.h"
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+@@ -44,6 +46,12 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ namespace WebCore {
+ 
++static bool useSkiaCPURasterCompositorForScroller()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(ScrollerPairCoordinated);
+ 
+ ScrollerCoordinated::ScrollerCoordinated(ScrollerPairCoordinated& pair, ScrollbarOrientation orientation)
+@@ -122,6 +130,41 @@ void ScrollerCoordinated::updateValues()
+     state.thumbPosition = (values.visibleSize - state.thumbLength) * values.value;
+     state.frameRect = rect;
+ 
++    float contentsScale;
++    {
++        Locker layerLocker { hostLayer->lock() };
++        contentsScale = hostLayer->contentsScale();
++    }
++
++    auto frameRect = enclosingIntRect(FloatRect(state.frameRect.x() * contentsScale, state.frameRect.y() * contentsScale,
++        state.frameRect.width() * contentsScale, state.frameRect.height() * contentsScale));
++
++    if (useSkiaCPURasterCompositorForScroller()) {
++        auto imageInfo = SkImageInfo::MakeN32Premul(frameRect.width(), frameRect.height());
++        auto surface = SkSurfaces::Raster(imageInfo);
++        if (!surface)
++            return;
++
++        auto* canvas = surface->getCanvas();
++        canvas->clear(SK_ColorTRANSPARENT);
++
++        Damage damage(state.frameRect);
++        GraphicsContextSkia context(*canvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM);
++        context.scale(contentsScale);
++        scrollerImp->paint(context, state.frameRect, state, damage);
++
++        auto image = NativeImage::create(surface->makeImageSnapshot());
++        if (!image)
++            return;
++        auto buffer = CoordinatedPlatformLayerBufferNativeImage::create(image.releaseNonNull(), nullptr);
++
++        Locker layerLocker { hostLayer->lock() };
++        hostLayer->setContentsRect(state.frameRect);
++        hostLayer->setContentsClippingRect(FloatRoundedRect(state.frameRect));
++        hostLayer->setContentsBuffer(WTF::move(buffer), WTF::move(damage));
++        return;
++    }
++
+     auto& display = PlatformDisplay::sharedDisplay();
+     auto* glContext = display.skiaGLContext();
+     if (!glContext)
+@@ -131,14 +174,6 @@ void ScrollerCoordinated::updateValues()
+     RELEASE_ASSERT(grContext);
+     GLContext::ScopedGLContextCurrent scopedCurrent(*glContext);
+ 
+-    float contentsScale;
+-    {
+-        Locker layerLocker { hostLayer->lock() };
+-        contentsScale = hostLayer->contentsScale();
+-    }
+-
+-    auto frameRect = enclosingIntRect(FloatRect(state.frameRect.x() * contentsScale, state.frameRect.y() * contentsScale,
+-        state.frameRect.width() * contentsScale, state.frameRect.height() * contentsScale));
+     Ref texture = BitmapTexturePool::singleton().acquireTexture(frameRect.size(), { BitmapTexture::Flags::SupportsAlpha });
+     auto surface = texture->createSkiaSurface(grContext);
+     if (!surface)
+diff --git a/Source/WebCore/platform/graphics/egl/GLFence.cpp b/Source/WebCore/platform/graphics/egl/GLFence.cpp
+index 06b19965..a534c19d 100644
+--- a/Source/WebCore/platform/graphics/egl/GLFence.cpp
++++ b/Source/WebCore/platform/graphics/egl/GLFence.cpp
+@@ -25,6 +25,9 @@
+ #include "GLFenceEGL.h"
+ #include "GLFenceGL.h"
+ #include "PlatformDisplay.h"
++#include <cerrno>
++#include <poll.h>
++#include <wtf/SafeStrerror.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+ #if USE(LIBEPOXY)
+@@ -37,6 +40,45 @@ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(GLFence);
+ 
++static bool useSkiaCPURasterCompositorForFences()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
++#if OS(UNIX)
++class CPUSyncFileFence final : public GLFence {
++public:
++    explicit CPUSyncFileFence(WTF::UnixFileDescriptor&& fd)
++        : m_fd(WTF::move(fd))
++    {
++    }
++
++private:
++    void wait()
++    {
++        if (!m_fd)
++            return;
++
++        pollfd descriptor = { m_fd.value(), POLLIN, 0 };
++        int result;
++        do {
++            result = poll(&descriptor, 1, 2000);
++        } while (result < 0 && errno == EINTR);
++
++        if (!result)
++            WTFLogAlways("Timed out waiting for CPU compositor sync file fd=%d", m_fd.value());
++        else if (result < 0)
++            WTFLogAlways("Failed waiting for CPU compositor sync file fd=%d: %s", m_fd.value(), safeStrerror(errno).data());
++    }
++
++    void clientWait() override { wait(); }
++    void serverWait() override { wait(); }
++
++    WTF::UnixFileDescriptor m_fd;
++};
++#endif
++
+ static inline bool eglVersionSupportsFences(const GLDisplay& display)
+ {
+     return display.checkVersion(1, 5);
+@@ -54,6 +96,12 @@ static inline bool glContextSupportsFences(GLContextWrapper* context)
+ 
+ bool GLFence::isSupported(const GLDisplay& display)
+ {
++    // CPU composition has no GL consumer. Returning false makes Skia use a
++    // synchronous submit instead of creating a fence through a vendor EGL
++    // stack that may advertise KHR_fence_sync without exporting wait APIs.
++    if (useSkiaCPURasterCompositorForFences())
++        return false;
++
+     auto* context = GLContextWrapper::currentContext();
+     if (!context)
+         return false;
+@@ -67,6 +115,9 @@ bool GLFence::isSupported(const GLDisplay& display)
+ std::unique_ptr<GLFence> GLFence::create(const GLDisplay& display)
+ {
+ #if HAVE(GL_FENCE)
++    if (useSkiaCPURasterCompositorForFences())
++        return nullptr;
++
+     auto* context = GLContextWrapper::currentContext();
+     if (!context)
+         return nullptr;
+@@ -91,6 +142,9 @@ std::unique_ptr<GLFence> GLFence::create(const GLDisplay& display)
+ std::unique_ptr<GLFence> GLFence::createExportable(const GLDisplay& display)
+ {
+ #if HAVE(GL_FENCE)
++    if (useSkiaCPURasterCompositorForFences())
++        return nullptr;
++
+     if (!GLContextWrapper::currentContext())
+         return nullptr;
+ 
+@@ -103,6 +157,9 @@ std::unique_ptr<GLFence> GLFence::createExportable(const GLDisplay& display)
+ std::unique_ptr<GLFence> GLFence::importFD(const GLDisplay& display, UnixFileDescriptor&& fd)
+ {
+ #if HAVE(GL_FENCE)
++    if (useSkiaCPURasterCompositorForFences())
++        return makeUnique<CPUSyncFileFence>(WTF::move(fd));
++
+     if (!GLContextWrapper::currentContext())
+         return nullptr;
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+index e4ba2366..65152c8f 100644
+--- a/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/GraphicsContextSkia.cpp
+@@ -69,6 +69,12 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ namespace WebCore {
+ 
++static bool useSkiaCPURasterCompositorForGraphicsContext()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ GraphicsContextSkia::GraphicsContextSkia(SkCanvas& canvas, RenderingMode renderingMode, RenderingPurpose renderingPurpose, CompletionHandler<void()>&& destroyNotify)
+     : m_canvas(canvas)
+     , m_renderingMode(renderingMode)
+@@ -208,7 +214,7 @@ sk_sp<SkImage> GraphicsContextSkia::imageForCurrentThread(const sk_sp<SkImage>&
+ 
+     auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+     if (!glContext || !glContext->makeContextCurrent())
+-        return image;
++        return renderingMode() == RenderingMode::Unaccelerated ? nullptr : image;
+ 
+     // Use the destination context (current thread's context), not nativeImage.grContext()
+     // (source context). For cross-thread transfers, we must check validity against the
+@@ -219,6 +225,8 @@ sk_sp<SkImage> GraphicsContextSkia::imageForCurrentThread(const sk_sp<SkImage>&
+     // Check if the GPU texture is valid for the current context.
+     // If the image was created in a different thread/context, we need to rewrap it.
+     sk_sp<SkImage> imageInThisThread = image->isValid(grContext->asRecorder()) ? image : SkiaUtilities::rewrapImageForContext(grContext, *image);
++    if (!imageInThisThread)
++        return nullptr;
+     if (renderingMode() == RenderingMode::Accelerated)
+         return imageInThisThread;
+ 
+@@ -276,6 +284,8 @@ void GraphicsContextSkia::drawNativeImage(const NativeImage& nativeImage, const
+ 
+     // 'imageInThisThread' is either the incoming 'image', or a wrapper around the 'image' accessible in the current thread.
+     auto imageInThisThread = imageForCurrentThread(image);
++    if (!imageInThisThread)
++        return;
+     if (m_threadSafeGrContext)
+         imageInThisThread = SkiaUtilities::createPromiseImageIfNeeded(imageInThisThread, m_threadSafeGrContext);
+     else
+@@ -693,10 +703,14 @@ void GraphicsContextSkia::clipToImageBuffer(ImageBuffer& buffer, const FloatRect
+ {
+     if (auto nativeImage = nativeImageForDrawing(buffer)) {
+         auto image = nativeImage->platformImage();
+-        if (m_threadSafeGrContext)
++        if (useSkiaCPURasterCompositorForGraphicsContext())
++            image = imageForCurrentThread(image);
++        else if (m_threadSafeGrContext)
+             image = SkiaUtilities::createPromiseImageIfNeeded(image, m_threadSafeGrContext);
+         else
+             trackAcceleratedRenderingFenceIfNeeded(image, nativeImage->grContext());
++        if (!image)
++            return;
+         auto shader = image->makeShader(SkTileMode::kDecal, SkTileMode::kDecal, { }, SkMatrix::Translate(SkFloatToScalar(destRect.x()), SkFloatToScalar(destRect.y())));
+ 
+         recordClipIfNeeded({
+@@ -1099,6 +1113,8 @@ void GraphicsContextSkia::drawPattern(const NativeImage& nativeImage, const Floa
+         return;
+ 
+     image = imageForCurrentThread(image);
++    if (!image)
++        return;
+ 
+     FloatPoint phaseOffset(tileRect.location());
+     phaseOffset.scale(patternTransform.a(), patternTransform.d());
+@@ -1246,6 +1262,14 @@ void GraphicsContextSkia::trackAcceleratedRenderingFenceIfNeeded(const sk_sp<SkI
+ {
+     ASSERT(!m_threadSafeGrContext);
+ 
++    // CPU tile recordings must only retain raster images. All known callers
++    // convert texture-backed images before recording them; do not reintroduce
++    // an EGL fence that would force the raster worker through a GL replay path.
++    if (useSkiaCPURasterCompositorForGraphicsContext()) {
++        ASSERT(!image || !image->isTextureBacked());
++        return;
++    }
++
+     if (m_contextMode != ContextMode::TileRecordingMode)
+         return;
+ 
+@@ -1260,6 +1284,11 @@ void GraphicsContextSkia::trackAcceleratedRenderingFenceIfNeeded(Pattern& patter
+ {
+     ASSERT(!m_threadSafeGrContext);
+ 
++    // PatternSkia converts the tile image to raster synchronously for the CPU
++    // compositor, so no GPU fence may be attached to the recorded picture.
++    if (useSkiaCPURasterCompositorForGraphicsContext())
++        return;
++
+     if (m_contextMode != ContextMode::TileRecordingMode)
+         return;
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/PatternSkia.cpp b/Source/WebCore/platform/graphics/skia/PatternSkia.cpp
+index fb6b13e4..661d9eb2 100644
+--- a/Source/WebCore/platform/graphics/skia/PatternSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/PatternSkia.cpp
+@@ -28,8 +28,10 @@
+ 
+ #if USE(SKIA)
+ #include "AffineTransform.h"
++#include "GLContext.h"
+ #include "ImageBuffer.h"
+ #include "NativeImage.h"
++#include "PlatformDisplay.h"
+ #include "SkiaUtilities.h"
+ 
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+@@ -41,6 +43,12 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ namespace WebCore {
+ 
++static bool useSkiaCPURasterCompositorForPattern()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ sk_sp<SkShader> Pattern::createPlatformPattern(const SkSamplingOptions& samplingOptions, const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext) const
+ {
+     auto nativeImage = tileNativeImage();
+@@ -51,7 +59,23 @@ sk_sp<SkShader> Pattern::createPlatformPattern(const SkSamplingOptions& sampling
+     if (!platformImage)
+         return nullptr;
+ 
+-    if (threadSafeGrContext)
++    if (useSkiaCPURasterCompositorForPattern() && platformImage->isTextureBacked()) {
++        auto& display = PlatformDisplay::sharedDisplay();
++        auto* glContext = display.skiaGLContext();
++        if (!glContext || !glContext->makeContextCurrent())
++            return nullptr;
++
++        auto* grContext = display.skiaGrContext();
++        if (!grContext)
++            return nullptr;
++
++        auto imageInThisThread = platformImage->isValid(grContext->asRecorder()) ? platformImage : SkiaUtilities::rewrapImageForContext(grContext, *platformImage);
++        if (!imageInThisThread)
++            return nullptr;
++        platformImage = imageInThisThread->makeRasterImage(grContext);
++        if (!platformImage)
++            return nullptr;
++    } else if (threadSafeGrContext)
+         platformImage = SkiaUtilities::createPromiseImageIfNeeded(platformImage, threadSafeGrContext);
+ 
+     return platformImage->makeShader(repeatX() ? SkTileMode::kRepeat : SkTileMode::kDecal, repeatY() ? SkTileMode::kRepeat : SkTileMode::kDecal, samplingOptions, patternSpaceTransform());
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
+index a95c9aa1..e4378e10 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
+@@ -34,6 +34,7 @@
+ #include "SkiaPaintingEngine.h"
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorSpace.h>
++#include <skia/core/SkPixmap.h>
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkImageGanesh.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
+@@ -46,6 +47,12 @@ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaBackingStore);
+ 
++static bool useSkiaCPURasterCompositorForBackingStore()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ void SkiaBackingStore::update(const FloatSize& size, float scale, CoordinatedBackingStoreProxy::Update&& update)
+ {
+     m_size = size;
+@@ -171,7 +178,7 @@ void SkiaBackingStore::Tile::ensureTexture(const IntSize& size, CoordinatedTileB
+ 
+ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer& buffer)
+ {
+-    WTFBeginSignpost(this, SkiaBackingStoreTileUpdate, "rect %ix%i+%i+%i %s", tileRect.x(), tileRect.y(), tileRect.width(), tileRect.height(), buffer.isBackedByOpenGL() ? "GPUToGPU" : "CPUToGPU");
++    WTFBeginSignpost(this, SkiaBackingStoreTileUpdate, "rect %ix%i+%i+%i %s", tileRect.x(), tileRect.y(), tileRect.width(), tileRect.height(), buffer.isBackedByOpenGL() ? "GPUToGPU" : useSkiaCPURasterCompositorForBackingStore() ? "CPUToCPU" : "CPUToGPU");
+ 
+     FloatRect unscaledTileRect(tileRect);
+     unscaledTileRect.scale(1. / m_scale);
+@@ -180,6 +187,7 @@ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& til
+         m_rect = unscaledTileRect;
+         m_texture = nullptr;
+         m_surface = nullptr;
++        m_cachedImage = nullptr;
+     }
+ 
+     if (buffer.isBackedByOpenGL()) {
+@@ -216,8 +224,25 @@ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& til
+         }
+     } else {
+         auto& unacceleratedBuffer = static_cast<CoordinatedUnacceleratedTileBuffer&>(buffer);
+-        ensureTexture(tileRect.size(), buffer);
+-        m_texture->updateContents(unacceleratedBuffer.data(), dirtyRect, { }, unacceleratedBuffer.stride(), buffer.pixelFormat());
++        if (useSkiaCPURasterCompositorForBackingStore()) {
++            if (!m_surface) {
++                auto surfaceInfo = SkImageInfo::Make(tileRect.width(), tileRect.height(), kBGRA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
++                m_surface = SkSurfaces::Raster(surfaceInfo);
++                if (m_surface)
++                    m_surface->getCanvas()->clear(SK_ColorTRANSPARENT);
++            }
++            if (m_surface) {
++                auto sourceSize = buffer.size();
++                auto sourceInfo = SkImageInfo::Make(sourceSize.width(), sourceSize.height(), kBGRA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
++                SkPixmap sourcePixels(sourceInfo, unacceleratedBuffer.data(), unacceleratedBuffer.stride());
++                m_surface->writePixels(sourcePixels, dirtyRect.x(), dirtyRect.y());
++            }
++            m_texture = nullptr;
++            m_cachedImage = nullptr;
++        } else {
++            ensureTexture(tileRect.size(), buffer);
++            m_texture->updateContents(unacceleratedBuffer.data(), dirtyRect, { }, unacceleratedBuffer.stride(), buffer.pixelFormat());
++        }
+     }
+ 
+     WTFEndSignpost(this, SkiaBackingStoreTileUpdate);
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
+index 20976a2e..e10754ca 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaCompositingLayer.cpp
+@@ -62,6 +62,12 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaCompositingLayer);
+ 
+ static constexpr float s_opacityVisibilityThreshold = 0.01;
+ 
++static bool useSkiaCPURasterCompositorForLayers()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ Ref<SkiaCompositingLayer> SkiaCompositingLayer::create()
+ {
+     return adoptRef(*new SkiaCompositingLayer());
+@@ -792,9 +798,15 @@ sk_sp<SkImage> SkiaCompositingLayer::maskImage()
+     auto rect = effectiveLayerRect();
+     rect.scale(scale);
+ 
+-    auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+     auto imageInfo = SkImageInfo::Make(rect.width(), rect.height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
+-    auto surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kNo, imageInfo, 0, kTopLeft_GrSurfaceOrigin, nullptr);
++    GrDirectContext* grContext = nullptr;
++    sk_sp<SkSurface> surface;
++    if (useSkiaCPURasterCompositorForLayers())
++        surface = SkSurfaces::Raster(imageInfo);
++    else {
++        grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
++        surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kNo, imageInfo, 0, kTopLeft_GrSurfaceOrigin, nullptr);
++    }
+     if (!surface)
+         return nullptr;
+ 
+@@ -806,7 +818,8 @@ sk_sp<SkImage> SkiaCompositingLayer::maskImage()
+     SkPaint paint;
+     surfaceCanvas->scale(scale, scale);
+     m_backingStore->paintToCanvas(*surfaceCanvas, paint);
+-    grContext->flushAndSubmit(surface.get(), GrSyncCpu::kNo);
++    if (grContext)
++        grContext->flushAndSubmit(surface.get(), GrSyncCpu::kNo);
+     m_maskImage = surface->makeImageSnapshot();
+     return m_maskImage;
+ }
+@@ -826,9 +839,15 @@ void SkiaCompositingLayer::paintWithIntermediateSurface(SkCanvas& canvas, PaintC
+         return;
+     }
+ 
+-    auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+     auto imageInfo = SkImageInfo::Make(surfaceRect.width(), surfaceRect.height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
+-    auto surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kNo, imageInfo, 0, kTopLeft_GrSurfaceOrigin, nullptr);
++    GrDirectContext* grContext = nullptr;
++    sk_sp<SkSurface> surface;
++    if (useSkiaCPURasterCompositorForLayers())
++        surface = SkSurfaces::Raster(imageInfo);
++    else {
++        grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
++        surface = SkSurfaces::RenderTarget(grContext, skgpu::Budgeted::kNo, imageInfo, 0, kTopLeft_GrSurfaceOrigin, nullptr);
++    }
+     if (!surface)
+         return;
+ 
+@@ -843,7 +862,8 @@ void SkiaCompositingLayer::paintWithIntermediateSurface(SkCanvas& canvas, PaintC
+     SetForScope scopedOffset(context.offset, toIntSize(surfaceRect.location()));
+     paintFunction(*surfaceCanvas, context);
+     context.imageSetBatch.flushIfNeeded(*surfaceCanvas);
+-    grContext->flushAndSubmit(surface.get(), GrSyncCpu::kNo);
++    if (grContext)
++        grContext->flushAndSubmit(surface.get(), GrSyncCpu::kNo);
+ 
+     canvas.drawImageRect(surface->makeImageSnapshot(), SkRect::MakeWH(surfaceRect.width(), surfaceRect.height()), SkRect::Make(surfaceRect), SkSamplingOptions(SkFilterMode::kNearest, SkMipmapMode::kNone), paint, SkCanvas::kFast_SrcRectConstraint);
+ }
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+index 106be50f..96c56938 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+@@ -71,8 +71,16 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaPaintingEngine);
+ // If WEBKIT_SKIA_ENABLE_CPU_RENDERING=1 is set, we will allocate a CPU-only worker pool with WEBKIT_SKIA_CPU_PAINTING_THREADS threads.
+ // if WEBKIT_SKIA_ENABLE_CPU_RENDERING=1 is set, and WEBKIT_SKIA_CPU_PAINTING_THREADS is set to 0, we will use CPU rendering on main thread.
+ 
++static bool useSkiaCPURasterCompositorForPainting()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ static bool canPerformAcceleratedRendering()
+ {
++    if (useSkiaCPURasterCompositorForPainting())
++        return false;
+     return ProcessCapabilities::canUseAcceleratedBuffers() && PlatformDisplay::sharedDisplay().skiaGLContext();
+ }
+ 
+@@ -236,7 +244,7 @@ Ref<SkiaRecordingResult> SkiaPaintingEngine::record(const GraphicsLayerCoordinat
+     auto result = SkiaRecordingResult::create(WTF::move(picture), WTF::move(recordingData), recordRect, renderingMode, contentsOpaque, contentsScale);
+ 
+     // Prepare GPU atlases on main thread before dispatching to workers.
+-    if (result->hasAtlasLayouts()) {
++    if (result->hasAtlasLayouts() && !useSkiaCPURasterCompositorForPainting()) {
+         auto fingerprint = result->imageSetFingerprint();
+ 
+         // Fast path: reuse cached atlases if the image set is unchanged.
+@@ -308,8 +316,11 @@ Ref<CoordinatedTileBuffer> SkiaPaintingEngine::replay(const GraphicsLayerCoordin
+ 
+             const bool isDDLBuffer = buffer->isBackedByOpenGL() && !static_cast<CoordinatedAcceleratedTileBuffer&>(buffer.get()).texture();
+             WTFBeginSignpost(canvas, PaintTile, "Skia/%s%s threaded, dirty region %ix%i+%i+%i", buffer->isBackedByOpenGL() ? "GPU" : "CPU", isDDLBuffer ? "(DDL)" : "", dirtyRect.x(), dirtyRect.y(), dirtyRect.width(), dirtyRect.height());
+-            // Use SkiaReplayCanvas if there are GPU fences or GPU atlases to handle.
+-            if (recording->hasFences() || recording->hasGPUAtlases()) {
++            // Raster recordings are fence-free and can replay directly onto
++            // their CPU surface. GPU recordings retain the existing replay
++            // canvas path for fences and atlases.
++            bool needsGPUReplay = !useSkiaCPURasterCompositorForPainting() && (recording->hasFences() || recording->hasGPUAtlases());
++            if (needsGPUReplay) {
+                 auto replayCanvas = SkiaReplayCanvas::create(tileRect.size(), recording, threadSafeGrContext);
+                 replayCanvas->addCanvas(canvas);
+                 replayPicture(replayCanvas->picture(), &replayCanvas.get(), recording->recordRect(), tileRect, dirtyRect, isDDLBuffer);
+diff --git a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferNativeImage.cpp b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferNativeImage.cpp
+index ade9a9bb..f7bb533b 100644
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferNativeImage.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferNativeImage.cpp
+@@ -162,6 +162,10 @@ sk_sp<SkImage> CoordinatedPlatformLayerBufferNativeImage::skiaImage()
+ {
+     waitForContentsIfNeeded();
+ 
++    const auto& image = m_image->platformImage();
++    if (!image->isTextureBacked())
++        return image;
++
+     if (!tryEnsureBuffer(UseSkiaForCompositing::Yes))
+         return nullptr;
+ 
+diff --git a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferRGB.cpp b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferRGB.cpp
+index d00cf821..8bfc8662 100644
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferRGB.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferRGB.cpp
+@@ -46,6 +46,12 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ namespace WebCore {
+ 
++static bool useSkiaCPURasterCompositorForRGBBuffer()
++{
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ std::unique_ptr<CoordinatedPlatformLayerBufferRGB> CoordinatedPlatformLayerBufferRGB::create(Ref<BitmapTexture>&& texture, OptionSet<TextureMapperFlags> flags, std::unique_ptr<GLFence>&& fence)
+ {
+     return makeUnique<CoordinatedPlatformLayerBufferRGB>(WTF::move(texture), flags, WTF::move(fence));
+@@ -85,6 +91,18 @@ sk_sp<SkImage> CoordinatedPlatformLayerBufferRGB::skiaImage()
+ {
+     waitForContentsIfNeeded();
+ 
++    // A raw GL texture cannot be consumed by the compositor after its GL
++    // context has intentionally been removed. CPU-profile producers must
++    // publish a raster NativeImage instead; skip unexpected buffers safely.
++    if (useSkiaCPURasterCompositorForRGBBuffer()) {
++        static bool loggedUnexpectedRGBBuffer;
++        if (!loggedUnexpectedRGBBuffer) {
++            loggedUnexpectedRGBBuffer = true;
++            WTFLogAlways("CPU compositor skipped unexpected RGB GL platform buffer");
++        }
++        return nullptr;
++    }
++
+     ASSERT(!m_texture || !m_texture->colorConvertFlags().contains(TextureMapperFlags::ShouldConvertTextureBGRAToRGBA));
+ 
+     auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index f4ee42cb..ce511d0a 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -43,6 +43,7 @@
+ #include <fcntl.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-heap.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -127,6 +128,24 @@ static bool syncDMABufForCPU(int fd, uint64_t flags)
+     }
+     return true;
+ }
++
++static bool waitForReleaseFenceOnCPU(int fd)
++{
++    pollfd descriptor = { fd, POLLIN, 0 };
++    int result;
++    do {
++        result = poll(&descriptor, 1, 2000);
++    } while (result < 0 && errno == EINTR);
++
++    if (result > 0)
++        return true;
++
++    if (!result)
++        WTFLogAlways("Timed out waiting for CPU compositor release fence fd=%d", fd);
++    else
++        WTFLogAlways("Failed waiting for CPU compositor release fence fd=%d: %s", fd, safeStrerror(errno).data());
++    return false;
++}
+ #endif
+ 
+ Ref<AcceleratedSurface> AcceleratedSurface::create(WebPage& webPage, Function<void()>&& frameCompleteHandler, RenderingPurpose renderingPurpose, bool useSkia)
+@@ -147,10 +166,20 @@ static bool useExplicitSync()
+     return extensions.ANDROID_native_fence_sync && (display.eglCheckVersion(1, 5) || extensions.KHR_fence_sync);
+ }
+ 
++static bool useSkiaCPURasterCompositor(bool useSkia)
++{
++    if (!useSkia)
++        return false;
++
++    const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
++    return value && *value && value[0] != '0';
++}
++
+ AcceleratedSurface::AcceleratedSurface(WebPage& webPage, Function<void()>&& frameCompleteHandler, RenderingPurpose renderingPurpose, bool useSkia)
+     : m_webPage(webPage)
+     , m_frameCompleteHandler(WTF::move(frameCompleteHandler))
+     , m_useSkia(useSkia)
++    , m_useSkiaCPURasterCompositor(useSkiaCPURasterCompositor(useSkia))
+     , m_id(generateID())
+     , m_renderingPurpose(renderingPurpose)
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+@@ -164,6 +193,8 @@ AcceleratedSurface::AcceleratedSurface(WebPage& webPage, Function<void()>&& fram
+     , m_damageTracker(m_swapChain)
+ #endif
+ {
++    if (m_useSkia)
++        WTFLogAlways("AcceleratedSurface purpose=%s compositor_path=%s shm_readback=%s", m_renderingPurpose == RenderingPurpose::Composited ? "composited" : "non_composited", usesGL() ? "skia_gpu" : "skia_raster_shm", usesGL() ? "enabled" : "disabled");
+ }
+ 
+ AcceleratedSurface::~AcceleratedSurface() = default;
+@@ -247,8 +278,13 @@ void AcceleratedSurface::RenderTargetShareableBuffer::sendFrame(Vector<WebCore::
+ void AcceleratedSurface::RenderTargetShareableBuffer::willRenderFrame()
+ {
+     if (m_releaseFenceFD) {
+-        if (auto fence = GLFence::importFD(PlatformDisplay::sharedDisplay().glDisplay(), WTF::move(m_releaseFenceFD)))
+-            fence->serverWait();
++        if (m_surface->usesGL()) {
++            if (auto fence = GLFence::importFD(PlatformDisplay::sharedDisplay().glDisplay(), WTF::move(m_releaseFenceFD)))
++                fence->serverWait();
++        } else {
++            waitForReleaseFenceOnCPU(m_releaseFenceFD.value());
++            m_releaseFenceFD = { };
++        }
+     }
+ 
+     if (!m_surface->useSkia()) {
+@@ -496,13 +532,13 @@ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame()
+         if (!m_skiaSurface)
+             return;
+ 
+-        SkImageInfo info = SkImageInfo::Make(m_bitmap->size().width(), m_bitmap->size().height(), SkColorType::kBGRA_8888_SkColorType, SkAlphaType::kPremul_SkAlphaType);
++        // Raster Skia writes directly into ShareableBitmap memory.
++        if (!m_surface->usesGL())
++            return;
+ 
+-        if (m_surface->usesGL()) {
+-            GLContext::ScopedGLContextCurrent scopedCurrent(*PlatformDisplay::sharedDisplay().skiaGLContext());
+-            m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+-        } else
+-            m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
++        SkImageInfo info = SkImageInfo::Make(m_bitmap->size().width(), m_bitmap->size().height(), SkColorType::kBGRA_8888_SkColorType, SkAlphaType::kPremul_SkAlphaType);
++        GLContext::ScopedGLContextCurrent scopedCurrent(*PlatformDisplay::sharedDisplay().skiaGLContext());
++        m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+         return;
+     }
+ 
+@@ -1199,8 +1235,16 @@ void AcceleratedSurface::willRenderFrame(const IntSize& size)
+     }
+ 
+     m_target = m_swapChain.nextTarget();
+-    if (m_target)
++    m_targetRequiresFullRepaint = false;
++    if (m_target) {
++#if ENABLE(DAMAGE_TRACKING)
++        m_targetRequiresFullRepaint = m_target->requiresFullRepaint();
++        if (m_targetRequiresFullRepaint)
++            WTFLogAlways("AcceleratedSurface full_repaint=1 target=%llu size=%dx%d",
++                static_cast<unsigned long long>(m_target->id()), size.width(), size.height());
++#endif
+         m_target->willRenderFrame();
++    }
+ 
+     if (sizeDidChange && !m_useSkia)
+         glViewport(0, 0, size.width(), size.height());
+@@ -1216,7 +1260,12 @@ void AcceleratedSurface::clear(const OptionSet<WebCore::CompositionReason>& reas
+ 
+     if (m_useSkia) {
+         if (auto* canvas = this->canvas()) {
+-            if (backgroundColor && !backgroundColor->isOpaque())
++            if (m_targetRequiresFullRepaint) {
++                if (backgroundColor && !backgroundColor->isOpaque())
++                    canvas->clear(SK_ColorTRANSPARENT);
++                else
++                    canvas->clear(backgroundColor ? SkColor(*backgroundColor) : SK_ColorWHITE);
++            } else if (backgroundColor && !backgroundColor->isOpaque())
+                 canvas->clear(SK_ColorTRANSPARENT);
+             else if (reasons.contains(CompositionReason::AsyncScrolling))
+                 canvas->clear(backgroundColor ? SkColor(*backgroundColor) : SK_ColorWHITE);
+@@ -1265,6 +1314,7 @@ void AcceleratedSurface::didRenderFrame()
+     m_target->didRenderFrame();
+     m_pendingFrameNotifyTargets.insert(0, { m_target, WTF::move(damageRects) });
+     m_target = nullptr;
++    m_targetRequiresFullRepaint = false;
+ }
+ 
+ void AcceleratedSurface::sendFrame()
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index 28e1a2fe..e48d1c0a 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -118,9 +118,9 @@ public:
+     }
+ 
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+-    bool usesGL() const { return m_renderingPurpose == RenderingPurpose::Composited || m_hardwareAccelerationEnabled; }
++    bool usesGL() const { return !m_useSkiaCPURasterCompositor && (m_renderingPurpose == RenderingPurpose::Composited || m_hardwareAccelerationEnabled); }
+ #elif PLATFORM(WPE)
+-    constexpr bool usesGL() const { return true; }
++    bool usesGL() const { return !m_useSkiaCPURasterCompositor; }
+ #endif
+ 
+     SkCanvas* canvas();
+@@ -186,6 +186,7 @@ private:
+ #if ENABLE(DAMAGE_TRACKING)
+         void setDamage(WebCore::Damage&& damage) { m_damage = WTF::move(damage); }
+         const std::optional<WebCore::Damage>& damage() LIFETIME_BOUND { return m_damage; }
++        bool requiresFullRepaint() const { return !m_damage; }
+         void addDamage(const std::optional<WebCore::Damage>&);
+ #endif
+ 
+@@ -458,6 +459,7 @@ private:
+     const WeakRef<WebPage> m_webPage;
+     Function<void()> m_frameCompleteHandler;
+     bool m_useSkia { false };
++    bool m_useSkiaCPURasterCompositor { false };
+     uint64_t m_id { 0 };
+     RenderingPurpose m_renderingPurpose { RenderingPurpose::Composited };
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+@@ -467,6 +469,7 @@ private:
+     std::optional<WebCore::Color> m_backgroundColor WTF_GUARDED_BY_LOCK(m_backgroundColorLock);
+     SwapChain m_swapChain;
+     RenderTarget* m_target { nullptr };
++    bool m_targetRequiresFullRepaint { false };
+     Vector<std::pair<RenderTarget*, Vector<WebCore::IntRect, 1>>, 1> m_pendingFrameNotifyTargets;
+     bool m_isVisible { false };
+     bool m_useExplicitSync { false };
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+index 0ee86209..7e85cfea 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -110,6 +110,12 @@ ThreadedCompositor::ThreadedCompositor(WebPage& webPage, LayerTreeHost& layerTre
+     m_surface->didCreateCompositingRunLoop(m_workQueue->runLoop());
+ 
+     m_workQueue->dispatchSync([this] {
++        if (m_useSkia && !m_surface->usesGL()) {
++            m_maxTextureSize = 4096;
++            WTFLogAlways("ThreadedCompositor compositor_path=skia_raster_shm max_texture_size=%d", m_maxTextureSize);
++            return;
++        }
++
+         // GLNativeWindowType depends on the EGL implementation: reinterpret_cast works
+         // for pointers (only if they are 64-bit wide and not for other cases), and static_cast for
+         // numeric types (and when needed they get extended to 64-bit) but not for pointers. Using
+@@ -169,7 +175,7 @@ void ThreadedCompositor::invalidate()
+         m_textureMapper = nullptr;
+         m_surface->willDestroyGLContext();
+         m_context = nullptr;
+-        if (m_useSkia)
++        if (m_useSkia && m_surface->usesGL())
+             PlatformDisplay::sharedDisplay().setSkiaGLContextForCurrentThread(nullptr);
+     });
+     m_sceneState = nullptr;
+@@ -424,8 +430,10 @@ void ThreadedCompositor::paintToSkiaCanvas(const TransformationMatrix& matrix, c
+     if (m_fpsCounter.drawsFPS)
+         drawFPSCounter(*canvas);
+ 
+-    if (auto* surface = canvas->getSurface())
+-        PlatformDisplay::sharedDisplay().skiaGrContext()->flushAndSubmit(surface, GrSyncCpu::kNo);
++    if (m_surface->usesGL()) {
++        if (auto* surface = canvas->getSurface())
++            PlatformDisplay::sharedDisplay().skiaGrContext()->flushAndSubmit(surface, GrSyncCpu::kNo);
++    }
+ 
+     if (sceneHasRunningAnimations)
+         requestComposition(CompositionReason::Animation);
+@@ -455,6 +463,8 @@ void ThreadedCompositor::renderLayerTree()
+     if (m_suspendedCount > 0)
+         return;
+ 
++    auto frameStart = MonotonicTime::now();
++
+     OptionSet<CompositionReason> reasons;
+     bool shouldNotifiyDidComposite = false;
+     {
+@@ -523,11 +533,12 @@ void ThreadedCompositor::renderLayerTree()
+ 
+     if (m_context)
+         m_context->swapBuffers();
+-    else
++    else if (m_surface->usesGL())
+         PlatformDisplay::sharedDisplay().skiaGLContext()->swapBuffers();
+ 
+     m_surface->didRenderFrame();
+     m_surface->sendFrame();
++    updateCompositorStatistics(MonotonicTime::now() - frameStart);
+ 
+     RunLoop::mainSingleton().dispatch([this, protectedThis = Ref { *this }] {
+         if (m_layerTreeHost)
+@@ -535,6 +546,33 @@ void ThreadedCompositor::renderLayerTree()
+     });
+ }
+ 
++void ThreadedCompositor::updateCompositorStatistics(Seconds composeDuration)
++{
++    auto now = MonotonicTime::now();
++    if (!m_compositorStatistics.windowStart)
++        m_compositorStatistics.windowStart = now;
++
++    ++m_compositorStatistics.frameCount;
++    m_compositorStatistics.composeTotal += composeDuration;
++    if (composeDuration > m_compositorStatistics.composeMax)
++        m_compositorStatistics.composeMax = composeDuration;
++
++    auto elapsed = now - m_compositorStatistics.windowStart;
++    if (elapsed < 2_s)
++        return;
++
++    auto frameCount = m_compositorStatistics.frameCount;
++    auto fps = frameCount / elapsed.seconds();
++    auto averageMS = frameCount ? m_compositorStatistics.composeTotal.milliseconds() / frameCount : 0.;
++    WTFLogAlways("ThreadedCompositor window compositor_path=%s fps=%.1f compose_avg_ms=%.2f compose_max_ms=%.2f frames=%u",
++        m_surface->usesGL() ? "skia_gpu" : "skia_raster_shm", fps, averageMS, m_compositorStatistics.composeMax.milliseconds(), frameCount);
++
++    m_compositorStatistics.windowStart = now;
++    m_compositorStatistics.frameCount = 0;
++    m_compositorStatistics.composeTotal = 0_s;
++    m_compositorStatistics.composeMax = 0_s;
++}
++
+ void ThreadedCompositor::requestCompositionForRenderingUpdate(Function<void()>&& didCompositeFunction)
+ {
+     ASSERT(RunLoop::isMain());
+@@ -752,6 +790,14 @@ void ThreadedCompositor::drawSkiaDamage(SkCanvas& canvas, const std::optional<We
+ void ThreadedCompositor::fillGLInformation(RenderProcessInfo&& info, CompletionHandler<void(RenderProcessInfo&&)>&& completionHandler)
+ {
+     m_workQueue->dispatchSync([protectedThis = Ref { *this }, info = WTF::move(info), completionHandler = WTF::move(completionHandler)]() mutable {
++        if (!protectedThis->m_surface->usesGL()) {
++            info.glRenderer = "Skia CPU Raster"_s;
++            RunLoop::mainSingleton().dispatch([info = WTF::move(info), completionHandler = WTF::move(completionHandler)]() mutable {
++                completionHandler(WTF::move(info));
++            });
++            return;
++        }
++
+         info.glRenderer = String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+         info.glVendor = String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_VENDOR)));
+         info.glVersion = String::fromUTF8(reinterpret_cast<const char*>(glGetString(GL_VERSION)));
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h
+index f5ac605b..43903aad 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.h
+@@ -126,6 +126,7 @@ private:
+ 
+     void initializeFPSCounter();
+     void updateFPSCounter();
++    void updateCompositorStatistics(Seconds);
+     void drawFPSCounter(SkCanvas&);
+ #if ENABLE(DAMAGE_TRACKING)
+     void drawSkiaDamage(SkCanvas&, const std::optional<WebCore::Damage>&);
+@@ -187,6 +188,13 @@ private:
+         float textBaseline { 0 };
+     } m_fpsCounter;
+ 
++    struct {
++        MonotonicTime windowStart;
++        unsigned frameCount { 0 };
++        Seconds composeTotal;
++        Seconds composeMax;
++    } m_compositorStatistics;
++
+ #if ENABLE(DAMAGE_TRACKING)
+     struct {
+         std::optional<OptionSet<DamagePropagationFlags>> flags;
+@@ -206,4 +214,3 @@ private:
+ } // namespace WebKit
+ 
+ #endif // USE(COORDINATED_GRAPHICS)
+-

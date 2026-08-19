@@ -1,0 +1,89 @@
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index ce511d0a..7bd69de1 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -1250,6 +1250,15 @@ void AcceleratedSurface::willRenderFrame(const IntSize& size)
+         glViewport(0, 0, size.width(), size.height());
+ }
+ 
++void AcceleratedSurface::forceFullRepaintForCurrentTarget()
++{
++#if ENABLE(DAMAGE_TRACKING)
++    if (m_target)
++        m_target->setDamage(Damage(m_swapChain.size(), Damage::Mode::Full));
++#endif
++    m_targetRequiresFullRepaint = true;
++}
++
+ void AcceleratedSurface::clear(const OptionSet<WebCore::CompositionReason>& reasons)
+ {
+     std::optional<Color> backgroundColor;
+@@ -1308,7 +1317,13 @@ void AcceleratedSurface::didRenderFrame()
+     // better resolution is pointless as the bounds are the same in such case.
+     // FIXME: If we start to consume fine-grained damage in the Skia compositor, we will need to relax the usesGL condition.
+-    m_target->setDamage(Damage(m_swapChain.size(), usesGL() ? Damage::Mode::BoundingBox : Damage::Mode::Rectangles, m_damageTracker.rectangleThreshold()));
+-    damageRects = m_damageTracker.takeFrameDamageRects();
++    if (m_targetRequiresFullRepaint) {
++        m_target->setDamage(Damage(m_swapChain.size(), Damage::Mode::Full));
++        m_damageTracker.takeFrameDamageRects();
++        damageRects.append({ { }, m_swapChain.size() });
++    } else {
++        m_target->setDamage(Damage(m_swapChain.size(), usesGL() ? Damage::Mode::BoundingBox : Damage::Mode::Rectangles, m_damageTracker.rectangleThreshold()));
++        damageRects = m_damageTracker.takeFrameDamageRects();
++    }
+ #endif
+ 
+     m_target->didRenderFrame();
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index e48d1c0a..c0968b94 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -128,7 +128,8 @@ public:
+     void willRenderFrame(const WebCore::IntSize&);
+     void didRenderFrame();
+     void sendFrame();
++    void forceFullRepaintForCurrentTarget();
+     void clear(const OptionSet<WebCore::CompositionReason>&);
+ 
+ #if ENABLE(DAMAGE_TRACKING)
+     void setFrameDamage(WebCore::Damage&& damage) { m_damageTracker.recordFrameDamage(WTF::move(damage)); }
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+index c1d3f96d..4fb2b77e 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -391,5 +391,24 @@ void ThreadedCompositor::paintToSkiaCanvas(const TransformationMatrix& matrix, c
+     auto& rootLayer = m_sceneState->rootLayer().ensureSkiaTarget();
+     rootLayer.setTransform(matrix);
+ 
++    static bool forceFullRepaintOnMotion = [] {
++        const char* value = getenv("WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT");
++        bool enabled = value && value[0] && value[0] != '0';
++        if (enabled)
++            WTFLogAlways("AcceleratedSurface full_compositor_repaint_on_motion=1");
++        return enabled;
++    }();
++    static bool forceFullRepaintOnAnimation = [] {
++        const char* value = getenv("WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS");
++        bool enabled = value && value[0] && value[0] != '0';
++        if (enabled)
++            WTFLogAlways("AcceleratedSurface full_compositor_repaint_on_animation=1");
++        return enabled;
++    }();
++    bool forceFullRepaint = forceFullRepaintOnMotion
++        && (reasons.contains(CompositionReason::AsyncScrolling)
++            || (forceFullRepaintOnAnimation && reasons.contains(CompositionReason::Animation)));
++    if (forceFullRepaint)
++        m_surface->forceFullRepaintForCurrentTarget();
+     m_surface->clear(reasons);
+ 
+@@ -400,7 +419,9 @@ void ThreadedCompositor::paintToSkiaCanvas(const TransformationMatrix& matrix, c
+ 
+     std::optional<Damage> frameDamage;
+ #if ENABLE(DAMAGE_TRACKING)
+-    if (m_damage.flags)
++    if (forceFullRepaint)
++        frameDamage = Damage(size, Damage::Mode::Full);
++    else if (m_damage.flags)
+         frameDamage = Damage(size, m_damage.flags->contains(DamagePropagationFlags::Unified) ? Damage::Mode::BoundingBox : Damage::Mode::Rectangles);
+ #endif
+ 

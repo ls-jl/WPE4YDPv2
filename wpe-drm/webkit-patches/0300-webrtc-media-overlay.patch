@@ -1,0 +1,1689 @@
+diff --git a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp
+index e2f36b7d..1cff8806 100644
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerDataChannelHandler.cpp
+@@ -49,6 +49,13 @@ GST_DEBUG_CATEGORY(webkit_webrtc_data_channel_debug);
+ #define DC_MEMDUMP(...) GST_MEMDUMP(__VA_ARGS__)
+ #endif
+ 
++// Keep cloud-game diagnostics payload-free. This is deliberately opt-in so
++// normal data-channel traffic is not promoted to warning-level logging.
++#define DC_CLOUD_DIAGNOSTIC(...) do { \
++    if (!g_strcmp0(g_getenv("WEBKIT_CLOUD_DATACHANNEL_DIAGNOSTICS"), "1")) \
++        GST_WARNING(__VA_ARGS__); \
++} while (0)
++
+ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(GStreamerDataChannelHandler);
+@@ -103,6 +110,7 @@ GStreamerDataChannelHandler::GStreamerDataChannelHandler(GRefPtr<GstWebRTCDataCh
+         Locker locker { m_clientLock };
+         checkState();
+     }
++    DC_CLOUD_DIAGNOSTIC("DataChannel created id=%s", m_channelId.ascii().data());
+ 
+     m_signalHandlers.append(g_signal_connect_data(m_channel.get(), "notify::ready-state", G_CALLBACK(+[](GstWebRTCDataChannel*, GParamSpec*, DataChannelNotifier* notifier) {
+         notifier->m_handler.readyStateChanged();
+@@ -263,6 +271,7 @@ bool GStreamerDataChannelHandler::checkState()
+ 
+     GstWebRTCDataChannelState channelState;
+     g_object_get(m_channel.get(), "ready-state", &channelState, nullptr);
++    DC_CLOUD_DIAGNOSTIC("DataChannel state id=%s state=%d", m_channelId.ascii().data(), static_cast<int>(channelState));
+     if (!channelState) {
+         DC_DEBUG("Data-channel ready-state hasn't been set yet.");
+         return false;
+@@ -355,6 +364,7 @@ void GStreamerDataChannelHandler::bufferedAmountChanged(size_t bufferedAmount)
+ 
+ void GStreamerDataChannelHandler::onMessageData(GBytes* bytes)
+ {
++    DC_CLOUD_DIAGNOSTIC("DataChannel received binary id=%s bytes=%zu", m_channelId.ascii().data(), g_bytes_get_size(bytes));
+     DC_DEBUG("Incoming data of size: %zu", g_bytes_get_size(bytes));
+     Locker locker { m_clientLock };
+ 
+@@ -379,6 +389,7 @@ void GStreamerDataChannelHandler::onMessageData(GBytes* bytes)
+ 
+ void GStreamerDataChannelHandler::onMessageString(CStringView message)
+ {
++    DC_CLOUD_DIAGNOSTIC("DataChannel received string id=%s bytes=%zu", m_channelId.ascii().data(), message.lengthInBytes());
+     Locker locker { m_clientLock };
+ 
+     DC_TRACE("Incoming string: %s", message.utf8());
+@@ -421,6 +432,7 @@ void GStreamerDataChannelHandler::onError(GError* error)
+ 
+ void GStreamerDataChannelHandler::onClose()
+ {
++    DC_CLOUD_DIAGNOSTIC("DataChannel closed id=%s", m_channelId.ascii().data());
+     Locker locker { m_clientLock };
+     DC_DEBUG("Channel %p closed!", m_channel.get());
+     checkState();
+@@ -437,6 +449,7 @@ void GStreamerDataChannelHandler::postTask(Function<void()>&& function)
+     ScriptExecutionContext::postTaskTo(*m_contextIdentifier, WTF::move(function));
+ }
+ 
++#undef DC_CLOUD_DIAGNOSTIC
+ #undef GST_CAT_DEFAULT
+ 
+ } // namespace WebCore
+diff --git a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+index 6a8dc599..bd29cd29 100644
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+@@ -418,6 +418,69 @@ void GStreamerMediaEndpoint::disposeElementChain(GstElement* element)
+     gst_element_release_request_pad(m_webrtcBin.get(), peer.get());
+ }
+ 
++static bool needsCloudGameIceController(const Document& document)
++{
++    static bool enabled = g_strcmp0(g_getenv("WEBKIT_CLOUD_FORCE_ICE_CONTROLLER"), "0");
++    return enabled && (document.url().isMatchingDomain("www.xbox.com"_s)
++        || document.url().isMatchingDomain("mihoyo.com"_s));
++}
++
++static void forceCloudGameIceController(GstElement* webrtcBin, GstElement* pipeline, ASCIILiteral phase)
++{
++    GRefPtr<GstWebRTCICE> ice;
++    g_object_get(webrtcBin, "ice-agent", &ice.outPtr(), nullptr);
++    if (!ice) {
++        GST_WARNING_OBJECT(pipeline, "Unable to apply cloud-game ICE quirk at %s: missing ICE agent",
++            phase.characters());
++        return;
++    }
++
++    gst_webrtc_ice_set_is_controller(ice.get(), true);
++    GST_INFO_OBJECT(pipeline, "Applying cloud-game ICE quirk at %s: forcing controlling role for candidate nomination",
++        phase.characters());
++}
++
++static bool cloudGameSDPDiagnosticsEnabled()
++{
++    static bool enabled = !g_strcmp0(g_getenv("WEBKIT_CLOUD_SDP_DIAGNOSTICS"), "1");
++    return enabled;
++}
++
++static void logCloudGameSDPSummary(GstElement* pipeline, const GstSDPMessage* message, const char* phase)
++{
++    if (!cloudGameSDPDiagnosticsEnabled() || !message)
++        return;
++
++    auto mediaCount = gst_sdp_message_medias_len(message);
++    const char* bundleGroup = gst_sdp_message_get_attribute_val(message, "group");
++    GST_WARNING_OBJECT(pipeline, "Cloud SDP: phase=%s mlines=%u bundle=%s", phase, mediaCount, bundleGroup ? bundleGroup : "(none)");
++    for (unsigned index = 0; index < mediaCount; ++index) {
++        const auto* media = gst_sdp_message_get_media(message, index);
++        bool hasRtcpMux = false;
++        const char* direction = "sendrecv";
++        const char* mid = "(none)";
++        const char* setup = "(none)";
++        const char* sctpPort = "(none)";
++        unsigned attributeCount = gst_sdp_media_attributes_len(media);
++        for (unsigned attributeIndex = 0; attributeIndex < attributeCount; ++attributeIndex) {
++            const auto* attribute = gst_sdp_media_get_attribute(media, attributeIndex);
++            if (!g_strcmp0(attribute->key, "rtcp-mux"))
++                hasRtcpMux = true;
++            else if (!g_strcmp0(attribute->key, "mid"))
++                mid = attribute->value;
++            else if (!g_strcmp0(attribute->key, "setup"))
++                setup = attribute->value;
++            else if (!g_strcmp0(attribute->key, "sctp-port"))
++                sctpPort = attribute->value;
++            else if (!g_strcmp0(attribute->key, "sendonly") || !g_strcmp0(attribute->key, "recvonly") || !g_strcmp0(attribute->key, "inactive") || !g_strcmp0(attribute->key, "sendrecv"))
++                direction = attribute->key;
++        }
++        GST_WARNING_OBJECT(pipeline, "Cloud SDP media=%u type=%s proto=%s port=%u formats=%u mid=%s setup=%s sctp_port=%s direction=%s rtcp_mux=%d",
++            index, gst_sdp_media_get_media(media), gst_sdp_media_get_proto(media), gst_sdp_media_get_port(media),
++            gst_sdp_media_formats_len(media), mid, setup, sctpPort, direction, hasRtcpMux);
++    }
++}
++
+ bool GStreamerMediaEndpoint::setConfiguration(MediaEndpointConfiguration& configuration)
+ {
+     auto peerConnectionBackend = this->peerConnectionBackend();
+@@ -429,17 +492,28 @@ bool GStreamerMediaEndpoint::setConfiguration(MediaEndpointConfiguration& config
+ 
+     auto& document = downcast<Document>(*peerConnectionBackend->connection().scriptExecutionContext());
+     GST_DEBUG_OBJECT(m_pipeline.get(), "Configuring webrtcbin for PeerConnection created by %s", document.url().string().utf8().data());
+-    GstWebRTCBundlePolicy bundlePolicy;
+-    if (document.url().isMatchingDomain("www.xbox.com"_s)) {
+-        GST_DEBUG_OBJECT(m_pipeline.get(), "Applying XBox-play quirk, forcing max-bundle policy");
++    auto bundlePolicy = bundlePolicyFromConfiguration(configuration);
++    if (document.url().isMatchingDomain("www.xbox.com"_s) || document.url().isMatchingDomain("mihoyo.com"_s)) {
++        GST_DEBUG_OBJECT(m_pipeline.get(), "Applying cloud-game quirk, forcing max-bundle policy");
+         bundlePolicy = GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE;
+-    } else
+-        bundlePolicy = bundlePolicyFromConfiguration(configuration);
++    } else if (bundlePolicy == GST_WEBRTC_BUNDLE_POLICY_BALANCED) {
++        // GStreamer 1.22 accepts this value but cannot generate a balanced
++        // Answer, which drops a=group:BUNDLE and leaves bundled video payloads
++        // without an RTP clock-rate map.
++        GST_INFO_OBJECT(m_pipeline.get(), "Mapping unsupported balanced bundle policy to max-bundle");
++        bundlePolicy = GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE;
++    }
+     g_object_set(m_webrtcBin.get(), "bundle-policy", bundlePolicy, nullptr);
+ 
+     auto iceTransportPolicy = iceTransportPolicyFromConfiguration(configuration);
+     g_object_set(m_webrtcBin.get(), "ice-transport-policy", iceTransportPolicy, nullptr);
+ 
++    // libnice only applies controlling-mode immediately before candidate
++    // gathering starts. Setting it from set-description callbacks is too late:
++    // the change is deferred until a future ICE restart.
++    if (needsCloudGameIceController(document))
++        forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "initial configuration"_s);
++
+     bool stunSet = false;
+     for (auto& server : configuration.iceServers) {
+         for (auto& url : server.urls) {
+@@ -841,6 +915,8 @@ void GStreamerMediaEndpoint::doSetLocalDescription(const RTCSessionDescription*
+             return;
+         }
+ 
++        logCloudGameSDPSummary(m_pipeline.get(), sdpMessage.get(), "local-input");
++
+         // Make sure each outgoing media source is configured using the proposed codec and linked to webrtcbin.
+         linkOutgoingSources(sdpMessage.get());
+     }
+@@ -856,6 +932,12 @@ void GStreamerMediaEndpoint::doSetLocalDescription(const RTCSessionDescription*
+         if (!peerConnectionBackend)
+             return;
+ 
++        auto& document = downcast<Document>(*peerConnectionBackend->connection().scriptExecutionContext());
++        if (needsCloudGameIceController(document))
++            forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "local description"_s);
++
++        logCloudGameSDPSummary(m_pipeline.get(), &message, "local-applied");
++
+         auto descriptions = descriptionsFromWebRTCBin(m_webrtcBin.get(), GatherSignalingState::Yes);
+ 
+         // The initial description we pass to webrtcbin might actually be invalid or empty SDP, so
+@@ -947,6 +1029,8 @@ void GStreamerMediaEndpoint::doSetRemoteDescription(const RTCSessionDescription&
+             return;
+         }
+ 
++        logCloudGameSDPSummary(m_pipeline.get(), sdpMessage.get(), "remote-input");
++
+         if (unsigned totalMedias = gst_sdp_message_medias_len(sdpMessage.get())) {
+             bool hasInvalidFormat = false;
+             bool hasRtcpMuxAttribute = false;
+@@ -989,6 +1073,7 @@ void GStreamerMediaEndpoint::doSetRemoteDescription(const RTCSessionDescription&
+                 peerConnectionBackend->setRemoteDescriptionFailed(Exception { ExceptionCode::InvalidAccessError, "Invalid SDP, PT is in 64-95 range"_s });
+                 return;
+             }
++
+         }
+         // Make sure each outgoing media source is configured using the proposed codec and linked to webrtcbin.
+         linkOutgoingSources(sdpMessage.get());
+@@ -1000,6 +1085,23 @@ void GStreamerMediaEndpoint::doSetRemoteDescription(const RTCSessionDescription&
+         auto peerConnectionBackend = this->peerConnectionBackend();
+         if (!peerConnectionBackend)
+             return;
++
++        auto& document = downcast<Document>(*peerConnectionBackend->connection().scriptExecutionContext());
++        if (needsCloudGameIceController(document)) {
++            /*
++             * Some cloud-game ICE endpoints answer connectivity checks but
++             * never nominate a pair after sending the Offer. GStreamer 1.22
++             * normally makes the answerer controlled, leaving both peers
++             * waiting until libnice times out. Set the role after the remote
++             * Offer, then set it again after the local Answer because
++             * webrtcbin reapplies its default answerer role while processing
++             * the local description.
++             */
++            forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "remote description"_s);
++        }
++
++        logCloudGameSDPSummary(m_pipeline.get(), &message, "remote-applied");
++
+         processSDPMessage(&message, [this](unsigned, CStringView mid, const auto* media) {
+             auto mediaType = CStringView::unsafeFromUTF8(gst_sdp_media_get_media(media));
+             m_mediaForMid.set(mid.span(), mediaType == "audio"_s ? RealtimeMediaSource::Type::Audio : RealtimeMediaSource::Type::Video);
+@@ -1145,6 +1247,14 @@ void GStreamerMediaEndpoint::setDescription(const RTCSessionDescription* descrip
+ #endif
+ 
+     GUniquePtr<GstWebRTCSessionDescription> sessionDescription(gst_webrtc_session_description_new(type, message.release()));
++    if (descriptionType == DescriptionType::Remote && sdpType == RTCSdpType::Offer) {
++        auto peerConnectionBackend = this->peerConnectionBackend();
++        auto* context = peerConnectionBackend
++            ? peerConnectionBackend->connection().scriptExecutionContext()
++            : nullptr;
++        if (context && needsCloudGameIceController(downcast<Document>(*context)))
++            forceCloudGameIceController(m_webrtcBin.get(), m_pipeline.get(), "before remote description"_s);
++    }
+     g_signal_emit_by_name(m_webrtcBin.get(), signalName.ascii().data(), sessionDescription.get(), gst_promise_new_with_change_func([](GstPromise* rawPromise, gpointer userData) {
+         auto* data = static_cast<SetDescriptionCallData*>(userData);
+         auto promise = adoptGRef(rawPromise);
+@@ -1683,7 +1793,8 @@ void GStreamerMediaEndpoint::connectPad(GstPad* pad)
+ 
+     auto sinkPad = adoptGRef(gst_element_get_static_pad(bin, "sink"));
+     gst_pad_link(pad, sinkPad.get());
+-    gst_element_set_state(bin, GST_STATE_PAUSED);
++    if (!trackProcessor->scheduleStaticAudioTrackBeforeStart())
++        gst_element_set_state(bin, GST_STATE_PAUSED);
+ 
+ #ifndef GST_DISABLE_GST_DEBUG
+     auto dotFileName = makeString(unsafeSpan(GST_OBJECT_NAME(m_pipeline.get())), ".pending-"_s, unsafeSpan(GST_OBJECT_NAME(pad)));
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+index 80859eb8..534f6cfb 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+@@ -351,13 +351,11 @@ GStreamerRegistryScanner::RegistryLookupResult GStreamerRegistryScanner::Element
+             auto metadata = String::fromLatin1(gst_element_factory_get_metadata(factory.get(), GST_ELEMENT_METADATA_KLASS));
+             auto components = metadata.split('/');
+             auto& quirksManager = GStreamerQuirksManager::singleton();
+-            if (quirksManager.isEnabled()) {
+-                auto isAccelerated = quirksManager.isHardwareAccelerated(factory.get());
+-                if (isAccelerated && *isAccelerated) {
+-                    isUsingHardware = true;
+-                    selectedFactory = factory;
+-                    break;
+-                }
++            auto isAccelerated = quirksManager.isHardwareAccelerated(factory.get());
++            if (isAccelerated && *isAccelerated) {
++                isUsingHardware = true;
++                selectedFactory = factory;
++                break;
+             }
+             if (components.contains("Hardware"_s)) {
+                 isUsingHardware = true;
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+index ad58feb5..7021ddac 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -1620,6 +1620,16 @@ GstElement* MediaPlayerPrivateGStreamer::createAudioSink()
+         return nullptr;
+ 
+ #if ENABLE(WEB_AUDIO)
++    const char* directMediaStreamAudio = g_getenv("WEBKIT_GST_MEDIASTREAM_DIRECT_AUDIO_SINK");
++    bool useDirectAudioSink = directMediaStreamAudio
++        ? g_strcmp0(directMediaStreamAudio, "0")
++        : isMediaStreamPlayer();
++    if (useDirectAudioSink) {
++        GST_WARNING_OBJECT(pipeline(), "Using direct platform audio sink for playback (forced=%d)",
++            !!directMediaStreamAudio);
++        return audioSink;
++    }
++
+     GstElement* audioSinkBin = gst_bin_new("audio-sink");
+     ensureAudioSourceProvider();
+     m_audioSourceProvider->configureAudioBin(audioSinkBin, audioSink);
+@@ -3620,7 +3630,8 @@ void MediaPlayerPrivateGStreamer::createGSTPlayBin(const URL& url)
+             g_object_set(m_pipeline.get(), "audio-filter", scale, nullptr);
+     }
+ 
+-    managePlayerSuspend();
++    if (!isMediaStream)
++        managePlayerSuspend();
+ #if ENABLE(MEDIA_TELEMETRY)
+     MediaTelemetryReport::singleton().reportDrmInfo(getDrm());
+     MediaTelemetryReport::singleton().reportPlaybackState(MediaTelemetryReport::AVPipelineState::Create);
+@@ -4175,7 +4186,7 @@ void MediaPlayerPrivateGStreamer::managePlayerSuspend()
+     // this using an environment variable, set from the webkitpy glib port sub-classes.
+     auto allowPlaybackOfInvisibleVideos = CStringView::unsafeFromUTF8(g_getenv("WEBKIT_GST_ALLOW_PLAYBACK_OF_INVISIBLE_VIDEOS"));
+     bool muted = isMuted();
+-    bool shouldBeSuspended = (player && player->isVideoPlayer()) && muted && !m_isVisibleInViewport && allowPlaybackOfInvisibleVideos != "1"_s;
++    bool shouldBeSuspended = !isMediaStreamPlayer() && (player && player->isVideoPlayer()) && muted && !m_isVisibleInViewport && allowPlaybackOfInvisibleVideos != "1"_s;
+     GST_INFO_OBJECT(m_pipeline.get(), "%s %s player %svisible in viewport", muted ? "Muted" : "Un-muted", (player && player->isVideoPlayer()) ? "video" : "audio", m_isVisibleInViewport ? "" : "not ");
+ 
+     if (shouldBeSuspended && !isSuspended()) {
+@@ -4360,8 +4371,17 @@ bool MediaPlayerPrivateGStreamer::isHolePunchRenderingEnabled() const
+ #if ENABLE(MEDIA_STREAM)
+     if (m_streamPrivate) {
+         auto* videoTrack = m_streamPrivate->activeVideoTrack();
+-        if (!videoTrack)
+-            return false;
++        if (!videoTrack) {
++            /*
++             * Remote WebRTC tracks are registered after playbin asks for its
++             * sink. Without this opt-in the initial sink is permanently the
++             * software WebKitAppSink, even though the video track becomes
++             * eligible for hole-punch rendering a moment later.
++             */
++            const char* earlyHolePunch = g_getenv("WEBKIT_GST_HOLE_PUNCH_MEDIASTREAM_EARLY");
++            return earlyHolePunch && !g_strcmp0(earlyHolePunch, "1")
++                && GStreamerQuirksManager::singleton().supportsVideoHolePunchRendering();
++        }
+ 
+         return videoTrack->deviceType() != CaptureDevice::DeviceType::Canvas && GStreamerQuirksManager::singleton().supportsVideoHolePunchRendering();
+     }
+diff --git a/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp b/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
+index d44a449e..cfef2d47 100644
+--- a/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
++++ b/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
+@@ -24,9 +24,11 @@
+ 
+ #include "GStreamerCommon.h"
+ #include "IntRect.h"
++#include <algorithm>
+ #include <gst/allocators/gstdmabuf.h>
+ #include <gst/app/gstappsink.h>
+ #include <gst/video/video.h>
++#include <poll.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ #include <unistd.h>
+@@ -43,10 +45,13 @@ enum : uint32_t {
+     VideoOverlayMessageFrame = 1,
+     VideoOverlayMessageRect = 2,
+     VideoOverlayMessageHide = 3,
++    VideoOverlayMessageRelease = 4,
+ };
+ 
+ struct VideoOverlayWireMessage {
++    uint32_t version;
+     uint32_t type;
++    uint64_t sequence;
+     uint32_t fourcc;
+     uint32_t width;
+     uint32_t height;
+@@ -60,13 +65,25 @@ struct VideoOverlayWireMessage {
+     uint64_t modifier;
+ };
+ 
++static constexpr uint32_t videoOverlayProtocolVersion = 2;
++
+ #ifndef DRM_FORMAT_NV12
+ #define DRM_FORMAT_NV12 0x3231564e // 'NV12' little-endian，避免引 drm_fourcc.h
+ #endif
+ 
+-// UI 进程 NONBLOCK commit 后旧帧可能还有一个 vblank 在屏上，多押两级；
+-// 解码器缓冲池通常 16+ 个 buffer，扣 4 个不会饿到解码。
+-static constexpr size_t retainedSampleCount = 4;
++static constexpr size_t maximumInFlightSamples = 4;
++
++struct VideoOverlayInFlightSample {
++    uint64_t sequence { 0 };
++    GRefPtr<GstSample> sample;
++    gint64 sentUS { 0 };
++};
++
++struct RockchipVideoOverlaySinkContext {
++    Lock lock;
++    IntRect rect;
++    bool loggedOwnerBusy { false };
++};
+ 
+ class RockchipVideoOverlayChannel {
+ public:
+@@ -76,55 +93,51 @@ public:
+         return channel;
+     }
+ 
+-    bool tryAcquire()
+-    {
+-        Locker locker { m_lock };
+-        if (m_acquired)
+-            return false;
+-        m_acquired = true;
+-        return true;
+-    }
+-
+-    void release()
++    void release(RockchipVideoOverlaySinkContext* owner)
+     {
+         Locker locker { m_lock };
++        if (m_owner != owner)
++            return;
+         sendSimpleMessageLocked(VideoOverlayMessageHide);
+-        m_retainedSamples.clear();
++        waitForReleaseAcksLocked(100);
++        m_inFlightSamples.clear();
+         closeLocked();
+-        m_acquired = false;
++        m_owner = nullptr;
++        g_message("Rockchip video overlay: owner=%p released", owner);
+     }
+ 
+-    void setRectangle(const IntRect& rect)
++    void setRectangle(RockchipVideoOverlaySinkContext* owner, const IntRect& rect)
+     {
+         Locker locker { m_lock };
++        if (m_owner != owner)
++            return;
+         if (m_rect == rect)
+             return;
+         m_rect = rect;
+         if (m_socket < 0)
+             return;
+         VideoOverlayWireMessage message = { };
++        message.version = videoOverlayProtocolVersion;
+         message.type = VideoOverlayMessageRect;
+         fillRectLocked(message);
+         sendLocked(message, -1);
+     }
+ 
+-    void sendFrame(GstSample* sample)
++    void sendFrame(RockchipVideoOverlaySinkContext* owner, const IntRect& rect, GstSample* sample)
+     {
+-        Locker locker { m_lock };
+-        if (!ensureConnectedLocked())
+-            return;
+-
+         auto* buffer = gst_sample_get_buffer(sample);
+         auto* caps = gst_sample_get_caps(sample);
+         if (!buffer || !caps)
+             return;
+ 
+         if (gst_buffer_n_memory(buffer) != 1) {
++            Locker locker { m_lock };
+             warnOnceLocked("multi-memory buffers not supported");
+             return;
+         }
+         auto* memory = gst_buffer_peek_memory(buffer, 0);
+         if (!gst_is_dmabuf_memory(memory)) {
++            Locker locker { m_lock };
+             warnOnceLocked("non-dmabuf frame, video overlay inactive");
+             return;
+         }
+@@ -133,8 +146,36 @@ public:
+         if (!gst_video_info_from_caps(&info, caps) || GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12)
+             return;
+ 
++        Locker locker { m_lock };
++        if (m_owner != owner) {
++            if (m_owner) {
++                if (!owner->loggedOwnerBusy) {
++                    owner->loggedOwnerBusy = true;
++                    g_message("Rockchip video overlay: contender=%p blocked by owner=%p", owner, m_owner);
++                }
++                return;
++            }
++            g_message("Rockchip video overlay: owner=%p acquired frame=%ux%u rect=%dx%d+%d+%d",
++                owner, GST_VIDEO_INFO_WIDTH(&info), GST_VIDEO_INFO_HEIGHT(&info),
++                rect.width(), rect.height(), rect.x(), rect.y());
++            m_owner = owner;
++            m_rect = rect;
++        } else if (m_rect != rect)
++            m_rect = rect;
++
++        if (!ensureConnectedLocked())
++            return;
++        drainReleaseAcksLocked();
++        if (m_inFlightSamples.size() >= maximumInFlightSamples) {
++            m_droppedInFlight++;
++            logStatsLocked();
++            return;
++        }
++
+         VideoOverlayWireMessage message = { };
++        message.version = videoOverlayProtocolVersion;
+         message.type = VideoOverlayMessageFrame;
++        message.sequence = m_nextSequence++;
+         message.fourcc = DRM_FORMAT_NV12;
+         message.width = GST_VIDEO_INFO_WIDTH(&info);
+         message.height = GST_VIDEO_INFO_HEIGHT(&info);
+@@ -149,10 +190,13 @@ public:
+         if (!sendLocked(message, gst_dmabuf_memory_get_fd(memory)))
+             return;
+ 
+-        // 押住样本，防止解码器在 VOP 还在扫描时复写这块 dmabuf。
+-        if (m_retainedSamples.size() >= retainedSampleCount)
+-            m_retainedSamples.removeAt(0);
+-        m_retainedSamples.append(GRefPtr<GstSample>(sample));
++        VideoOverlayInFlightSample retained;
++        retained.sequence = message.sequence;
++        retained.sample = GRefPtr<GstSample>(sample);
++        retained.sentUS = g_get_monotonic_time();
++        m_inFlightSamples.append(WTF::move(retained));
++        m_sentFrames++;
++        logStatsLocked();
+     }
+ 
+ private:
+@@ -238,9 +282,67 @@ private:
+         return true;
+     }
+ 
++    void drainReleaseAcksLocked()
++    {
++        if (m_socket < 0)
++            return;
++        while (true) {
++            VideoOverlayWireMessage message = { };
++            ssize_t received = recv(m_socket, &message, sizeof(message), MSG_DONTWAIT);
++            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
++                return;
++            if (received != sizeof(message)) {
++                if (!received)
++                    closeLocked();
++                return;
++            }
++            if (message.version != videoOverlayProtocolVersion
++                || message.type != VideoOverlayMessageRelease || !message.sequence)
++                continue;
++            for (size_t index = 0; index < m_inFlightSamples.size(); ++index) {
++                if (m_inFlightSamples[index].sequence != message.sequence)
++                    continue;
++                gint64 latencyUS = g_get_monotonic_time() - m_inFlightSamples[index].sentUS;
++                m_ackLatencyTotalUS += std::max<gint64>(0, latencyUS);
++                m_ackLatencyMaxUS = std::max(m_ackLatencyMaxUS, latencyUS);
++                m_inFlightSamples.removeAt(index);
++                m_ackedFrames++;
++                break;
++            }
++        }
++    }
++
++    void waitForReleaseAcksLocked(int timeoutMS)
++    {
++        if (m_socket < 0 || m_inFlightSamples.isEmpty())
++            return;
++        gint64 deadlineUS = g_get_monotonic_time() + timeoutMS * 1000;
++        while (!m_inFlightSamples.isEmpty() && g_get_monotonic_time() < deadlineUS) {
++            struct pollfd descriptor = { m_socket, POLLIN, 0 };
++            int remainingMS = std::max(1, static_cast<int>((deadlineUS - g_get_monotonic_time()) / 1000));
++            if (poll(&descriptor, 1, remainingMS) <= 0)
++                break;
++            drainReleaseAcksLocked();
++        }
++    }
++
++    void logStatsLocked()
++    {
++        if (m_sentFrames < m_nextStatsFrame)
++            return;
++        double averageACKMS = m_ackedFrames ? m_ackLatencyTotalUS / 1000. / m_ackedFrames : 0.;
++        g_message("Rockchip video overlay v2: sent=%" G_GUINT64_FORMAT
++            " acked=%" G_GUINT64_FORMAT " inflight=%zu dropped=%" G_GUINT64_FORMAT
++            " ack_avg_ms=%.2f ack_max_ms=%.2f",
++            m_sentFrames, m_ackedFrames, m_inFlightSamples.size(), m_droppedInFlight,
++            averageACKMS, m_ackLatencyMaxUS / 1000.);
++        m_nextStatsFrame += 120;
++    }
++
+     void sendSimpleMessageLocked(uint32_t type)
+     {
+         VideoOverlayWireMessage message = { };
++        message.version = videoOverlayProtocolVersion;
+         message.type = type;
+         sendLocked(message, -1);
+     }
+@@ -251,45 +353,62 @@ private:
+             close(m_socket);
+             m_socket = -1;
+         }
++        // No release ACK can arrive after disconnect. Clearing retained
++        // samples also gives a later connection a fresh in-flight window.
++        m_inFlightSamples.clear();
+     }
+ 
+     Lock m_lock;
+     int m_socket { -1 };
+-    bool m_acquired { false };
++    RockchipVideoOverlaySinkContext* m_owner { nullptr };
+     bool m_warned { false };
+     gint64 m_lastConnectAttemptUS { 0 };
+     IntRect m_rect;
+-    Vector<GRefPtr<GstSample>> m_retainedSamples;
++    Vector<VideoOverlayInFlightSample> m_inFlightSamples;
++    uint64_t m_nextSequence { 1 };
++    uint64_t m_sentFrames { 0 };
++    uint64_t m_ackedFrames { 0 };
++    uint64_t m_droppedInFlight { 0 };
++    uint64_t m_nextStatsFrame { 120 };
++    gint64 m_ackLatencyTotalUS { 0 };
++    gint64 m_ackLatencyMaxUS { 0 };
+ };
+ 
+-static GstFlowReturn rockchipOverlayNewPreroll(GstAppSink* appsink, gpointer)
++static IntRect rockchipOverlayRectangle(RockchipVideoOverlaySinkContext* context)
++{
++    Locker locker { context->lock };
++    return context->rect;
++}
++
++static GstFlowReturn rockchipOverlayNewPreroll(GstAppSink* appsink, gpointer userData)
+ {
+     auto sample = adoptGRef(gst_app_sink_pull_preroll(appsink));
+     if (sample)
+-        RockchipVideoOverlayChannel::singleton().sendFrame(sample.get());
++        RockchipVideoOverlayChannel::singleton().sendFrame(
++            static_cast<RockchipVideoOverlaySinkContext*>(userData),
++            rockchipOverlayRectangle(static_cast<RockchipVideoOverlaySinkContext*>(userData)),
++            sample.get());
+     return GST_FLOW_OK;
+ }
+ 
+-static GstFlowReturn rockchipOverlayNewSample(GstAppSink* appsink, gpointer)
++static GstFlowReturn rockchipOverlayNewSample(GstAppSink* appsink, gpointer userData)
+ {
+     auto sample = adoptGRef(gst_app_sink_pull_sample(appsink));
+     if (sample)
+-        RockchipVideoOverlayChannel::singleton().sendFrame(sample.get());
++        RockchipVideoOverlayChannel::singleton().sendFrame(
++            static_cast<RockchipVideoOverlaySinkContext*>(userData),
++            rockchipOverlayRectangle(static_cast<RockchipVideoOverlaySinkContext*>(userData)),
++            sample.get());
+     return GST_FLOW_OK;
+ }
+ 
+ GstElement* GStreamerHolePunchQuirkRockchip::createHolePunchVideoSink(bool, const MediaPlayer*)
+ {
+-    auto& channel = RockchipVideoOverlayChannel::singleton();
+-    // 单路直出：已有播放器占用 overlay 时返回 null，其余管线自动回退软件路径。
+-    if (!channel.tryAcquire())
+-        return nullptr;
+-
+     auto* sink = makeGStreamerElement("appsink"_s);
+-    if (!sink) {
+-        channel.release();
++    if (!sink)
+         return nullptr;
+-    }
++
++    auto* context = new RockchipVideoOverlaySinkContext;
+ 
+     // 不声明 memory:DMABuf caps feature：rockchip mppvideodec 不一定在 caps
+     // 上标注 feature，但底层分配的就是 dmabuf，运行期用 gst_is_dmabuf_memory 判断。
+@@ -308,7 +427,12 @@ GstElement* GStreamerHolePunchQuirkRockchip::createHolePunchVideoSink(bool, cons
+ #endif
+         { nullptr }
+     };
+-    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, nullptr, nullptr);
++    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, context, [](gpointer userData) {
++        auto* context = static_cast<RockchipVideoOverlaySinkContext*>(userData);
++        RockchipVideoOverlayChannel::singleton().release(context);
++        delete context;
++    });
++    g_object_set_data(G_OBJECT(sink), "wpe-rockchip-overlay-context", context);
+ 
+     // 面板旋转角：MediaPlayerPrivateGStreamer::configureElement 检测到本管线
+     // 挂了 hole-punch sink 时，把它设给 mppvideodec 的 rotation（RGA 预旋转）。
+@@ -318,16 +442,20 @@ GstElement* GStreamerHolePunchQuirkRockchip::createHolePunchVideoSink(bool, cons
+     if (rotation && *rotation && g_strcmp0(rotation, "0"))
+         g_object_set_data_full(G_OBJECT(sink), "wpe-holepunch-rotation", g_strdup(rotation), g_free);
+ 
+-    g_object_weak_ref(G_OBJECT(sink), [](gpointer, GObject*) {
+-        RockchipVideoOverlayChannel::singleton().release();
+-    }, nullptr);
+-
++    g_message("Rockchip hole-punch sink created; overlay ownership deferred until first frame");
+     return sink;
+ }
+ 
+-bool GStreamerHolePunchQuirkRockchip::setHolePunchVideoRectangle(GstElement*, const IntRect& rect)
++bool GStreamerHolePunchQuirkRockchip::setHolePunchVideoRectangle(GstElement* sink, const IntRect& rect)
+ {
+-    RockchipVideoOverlayChannel::singleton().setRectangle(rect);
++    auto* context = static_cast<RockchipVideoOverlaySinkContext*>(g_object_get_data(G_OBJECT(sink), "wpe-rockchip-overlay-context"));
++    if (!context)
++        return false;
++    {
++        Locker locker { context->lock };
++        context->rect = rect;
++    }
++    RockchipVideoOverlayChannel::singleton().setRectangle(context, rect);
+     return true;
+ }
+ 
+diff --git a/Source/WebCore/platform/gstreamer/GStreamerQuirks.cpp b/Source/WebCore/platform/gstreamer/GStreamerQuirks.cpp
+index 4c0a686b..5ff23cf8 100644
+--- a/Source/WebCore/platform/gstreamer/GStreamerQuirks.cpp
++++ b/Source/WebCore/platform/gstreamer/GStreamerQuirks.cpp
+@@ -244,6 +244,13 @@ void GStreamerQuirksManager::configureElement(GstElement* element, OptionSet<Ele
+ 
+ std::optional<bool> GStreamerQuirksManager::isHardwareAccelerated(GstElementFactory* factory) const
+ {
++    if (factory) {
++        const char* factoryName = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
++        if (factoryName && !g_strcmp0(factoryName, "mppvideodec")) {
++            GST_DEBUG("Setting %" GST_PTR_FORMAT " as hardware accelerated Rockchip MPP decoder", factory);
++            return true;
++        }
++    }
+     for (const auto& quirk : m_quirks) {
+         auto result = quirk->isHardwareAccelerated(factory);
+         if (!result)
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+index 79794919..aaea4c91 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.cpp
+@@ -25,6 +25,7 @@
+ #include "GStreamerQuirks.h"
+ #include "GStreamerRegistryScanner.h"
+ #include "VideoFrameMetadataGStreamer.h"
++#include <wtf/RunLoop.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/glib/GMallocString.h>
+ 
+@@ -35,6 +36,116 @@ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(GStreamerIncomingTrackProcessor);
+ 
++static bool requireRockchipMppH264AccessUnits()
++{
++    const char* value = g_getenv("WEBKIT_GST_MPP_REQUIRE_H264_AU");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool useDirectRemoteAudioSink()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static void configureRockchipEarlyVideoRotation(GstElement* element)
++{
++    const char* quirk = g_getenv("WEBKIT_GST_HOLE_PUNCH_QUIRK");
++    if (g_strcmp0(quirk, "rockchip"))
++        return;
++
++    auto* factory = gst_element_get_factory(element);
++    if (!factory || g_strcmp0(GST_OBJECT_NAME(factory), "mppvideodec")
++        || !gstObjectHasProperty(element, "rotation"_s))
++        return;
++
++    const char* rotation = g_getenv("WPE_VIDEO_OVERLAY_ROTATION");
++    if (!rotation || !*rotation)
++        rotation = g_getenv("WPE_DRM_ROTATION");
++    if (!rotation || (!g_str_equal(rotation, "90") && !g_str_equal(rotation, "180") && !g_str_equal(rotation, "270")))
++        return;
++
++    gst_util_set_object_arg(G_OBJECT(element), "rotation", rotation);
++    GST_WARNING_OBJECT(element, "Applying Rockchip overlay rotation %s to early WebRTC decoder", rotation);
++}
++
++static void configureLeakyAudioQueue(GstElement* queue)
++{
++    g_object_set(queue,
++        "max-size-buffers", guint(4),
++        "max-size-bytes", guint(0),
++        "max-size-time", guint64(0),
++        "leaky", gint(2),
++        "silent", TRUE,
++        nullptr);
++}
++
++static void discardFloatingElement(GstElement* element)
++{
++    if (!element)
++        return;
++    gst_object_ref_sink(element);
++    gst_object_unref(element);
++}
++
++static void constrainH264ParserToAccessUnits(GstElement* parser)
++{
++    if (!requireRockchipMppH264AccessUnits()
++        || g_object_get_data(G_OBJECT(parser), "webkit-mpp-early-h264-au-probe"))
++        return;
++
++    auto srcPad = adoptGRef(gst_element_get_static_pad(parser, "src"));
++    if (!srcPad)
++        return;
++
++    gst_pad_add_probe(srcPad.get(), GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
++        +[](GstPad*, GstPadProbeInfo* info, gpointer) -> GstPadProbeReturn {
++            auto* query = GST_PAD_PROBE_INFO_QUERY(info);
++            if (!query)
++                return GST_PAD_PROBE_OK;
++
++            if (GST_QUERY_TYPE(query) == GST_QUERY_ACCEPT_CAPS) {
++                GstCaps* caps = nullptr;
++                gst_query_parse_accept_caps(query, &caps);
++                if (!caps || !doCapsHaveType(caps, "video/x-h264"_s))
++                    return GST_PAD_PROBE_OK;
++
++                bool accepted = true;
++                for (unsigned i = 0; i < gst_caps_get_size(caps); ++i) {
++                    auto* structure = gst_caps_get_structure(caps, i);
++                    const char* alignment = gst_structure_get_string(structure, "alignment");
++                    const char* streamFormat = gst_structure_get_string(structure, "stream-format");
++                    gboolean parsed = FALSE;
++                    accepted &= alignment && !g_strcmp0(alignment, "au");
++                    accepted &= streamFormat && !g_strcmp0(streamFormat, "byte-stream");
++                    accepted &= gst_structure_get_boolean(structure, "parsed", &parsed) && parsed;
++                }
++                gst_query_set_accept_caps_result(query, accepted);
++                return GST_PAD_PROBE_HANDLED;
++            }
++
++            if (GST_QUERY_TYPE(query) != GST_QUERY_CAPS)
++                return GST_PAD_PROBE_OK;
++
++            GstCaps* filter = nullptr;
++            gst_query_parse_caps(query, &filter);
++            if (filter && !gst_caps_is_any(filter) && !doCapsHaveType(filter, "video/x-h264"_s))
++                return GST_PAD_PROBE_OK;
++
++            auto requiredCaps = adoptGRef(gst_caps_new_simple("video/x-h264",
++                "parsed", G_TYPE_BOOLEAN, TRUE,
++                "stream-format", G_TYPE_STRING, "byte-stream",
++                "alignment", G_TYPE_STRING, "au", nullptr));
++            if (filter)
++                requiredCaps = adoptGRef(gst_caps_intersect_full(filter, requiredCaps.get(), GST_CAPS_INTERSECT_FIRST));
++            gst_query_set_caps_result(query, requiredCaps.get());
++            return GST_PAD_PROBE_HANDLED;
++        }, nullptr, nullptr);
++
++    g_object_set_data(G_OBJECT(parser), "webkit-mpp-early-h264-au-probe", GINT_TO_POINTER(1));
++    GST_WARNING_OBJECT(parser, "Requiring H.264 access units for early Rockchip MPP decoding");
++}
++
+ GStreamerIncomingTrackProcessor::GStreamerIncomingTrackProcessor()
+ {
+     static std::once_flag debugRegisteredFlag;
+@@ -102,14 +213,87 @@ void GStreamerIncomingTrackProcessor::configure(ThreadSafeWeakPtr<GStreamerMedia
+     if (!m_sdpMsIdAndTrackId.second.isEmpty())
+         m_data.trackId = m_sdpMsIdAndTrackId.second;
+ 
++    bool synchronizeIncomingSamples = g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_DISABLE_INCOMING_SYNC"), "1");
+     m_sink = gst_element_factory_make("fakesink", "sink");
+-    g_object_set(m_sink.get(), "sync", TRUE, "enable-last-sample", FALSE, "qos", TRUE, nullptr);
+-    auto queue = gst_element_factory_make("queue", "queue");
++    bool asynchronousStateChanges = m_data.type != RealtimeMediaSource::Type::Audio;
++    g_object_set(m_sink.get(), "sync", synchronizeIncomingSamples, "async", asynchronousStateChanges,
++        "enable-last-sample", FALSE, "qos", TRUE, nullptr);
++    GST_INFO_OBJECT(m_sink.get(), "Intermediate incoming-track clock synchronization: %s, async state changes: %s",
++        synchronizeIncomingSamples ? "enabled" : "disabled", asynchronousStateChanges ? "enabled" : "disabled");
+ 
+     auto trackProcessor = incomingTrackProcessor();
++    auto queue = gst_element_factory_make("queue", "queue");
++    bool directRemoteAudio = m_data.type == RealtimeMediaSource::Type::Audio
++        && m_isDecoding && useDirectRemoteAudioSink();
++    GstElement* tee = nullptr;
++    GstElement* directAudioQueue = nullptr;
++    GstElement* directAudioSink = nullptr;
++    bool trackProcessorLinked = false;
++
++    if (directRemoteAudio) {
++        tee = gst_element_factory_make("tee", "direct-remote-audio-tee");
++        directAudioQueue = gst_element_factory_make("queue", "direct-remote-audio-queue");
++        if (tee && directAudioQueue)
++            directAudioSink = createPlatformAudioSink("video"_s);
++        if (!tee || !directAudioQueue || !directAudioSink) {
++            GST_ERROR_OBJECT(m_bin.get(), "Direct remote audio elements unavailable; using MediaStream player audio");
++            discardFloatingElement(tee);
++            discardFloatingElement(directAudioQueue);
++            discardFloatingElement(directAudioSink);
++            tee = nullptr;
++            directAudioQueue = nullptr;
++            directAudioSink = nullptr;
++            directRemoteAudio = false;
++        }
++    }
++
++    if (directRemoteAudio) {
++        configureLeakyAudioQueue(queue);
++        configureLeakyAudioQueue(directAudioQueue);
++        g_object_set(m_sink.get(), "sync", FALSE, "async", FALSE, nullptr);
++        if (gstObjectHasProperty(directAudioSink, "sync"_s))
++            g_object_set(directAudioSink, "sync", FALSE, nullptr);
++        if (gstObjectHasProperty(directAudioSink, "async"_s))
++            g_object_set(directAudioSink, "async", FALSE, nullptr);
++
++        gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), tee, queue, m_sink.get(),
++            directAudioQueue, directAudioSink, nullptr);
++        bool linked = gst_element_link(trackProcessor.get(), tee)
++            && gst_element_link(tee, queue)
++            && gst_element_link(queue, m_sink.get())
++            && gst_element_link(tee, directAudioQueue)
++            && gst_element_link(directAudioQueue, directAudioSink);
++        RELEASE_ASSERT(linked);
++        trackProcessorLinked = true;
++        GST_WARNING_OBJECT(m_bin.get(), "Using direct remote audio sink with isolated leaky branches");
++    } else {
++        gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), queue, m_sink.get(), nullptr);
++        gst_element_link(queue, m_sink.get());
++    }
+ 
+-    gst_bin_add_many(GST_BIN_CAST(m_bin.get()), trackProcessor.get(), queue, m_sink.get(), nullptr);
+-    gst_element_link(queue, m_sink.get());
++    auto trackProcessorSrcPad = adoptGRef(gst_element_get_static_pad(trackProcessor.get(), "src"));
++    if (trackProcessorSrcPad) {
++        if (!trackProcessorLinked) {
++            auto queueSinkPad = adoptGRef(gst_element_get_static_pad(queue, "sink"));
++            trackProcessorLinked = gst_pad_link(trackProcessorSrcPad.get(), queueSinkPad.get()) == GST_PAD_LINK_OK;
++        }
++        if (!trackProcessorLinked)
++            GST_ERROR_OBJECT(m_bin.get(), "Failed to link static incoming track processor to queue");
++        else if (directRemoteAudio)
++            GST_INFO_OBJECT(m_bin.get(), "Direct remote audio stays in the endpoint pipeline and is not exposed to RealtimeIncomingSource");
++        else if (m_data.type == RealtimeMediaSource::Type::Audio && m_isDecoding
++            && g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_DEFER_STATIC_AUDIO_READY"), "0")) {
++            /*
++             * connectPad() adds and links this bin before setting it PAUSED.
++             * Install the incoming source callbacks on the main thread in that
++             * pre-start window, so setBin() never races an active streaming
++             * thread touching the same fakesink and pad.
++             */
++            m_staticAudioNeedsPreStartConnection = true;
++            GST_INFO_OBJECT(m_bin.get(), "Deferring static decoded audio track ready to pre-start connection window");
++        } else
++            trackReady();
++    }
+ 
+     auto sinkPad = adoptGRef(gst_element_get_static_pad(trackProcessor.get(), "sink"));
+     gst_element_add_pad(m_bin.get(), gst_ghost_pad_new("sink", sinkPad.get()));
+@@ -185,8 +369,42 @@ void GStreamerIncomingTrackProcessor::retrieveMediaStreamAndTrackIdFromSDP()
+ 
+ GRefPtr<GstElement> GStreamerIncomingTrackProcessor::incomingTrackProcessor()
+ {
+-    if (m_data.type == RealtimeMediaSource::Type::Audio)
+-        return createParser();
++    if (m_data.type == RealtimeMediaSource::Type::Audio) {
++        bool forceEarlyAudioDecoding = !g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_FORCE_EARLY_AUDIO_DECODING"), "1");
++        if (!forceEarlyAudioDecoding)
++            return createParser();
++
++        auto structure = gst_caps_get_structure(m_data.caps.get(), 0);
++        const char* encodingName = gst_structure_get_string(structure, "encoding-name");
++        if (!encodingName || g_ascii_strcasecmp(encodingName, "OPUS"))
++            return createParser();
++
++        GST_WARNING_OBJECT(m_bin.get(), "Using static rtpopusdepay -> opusdec WebRTC audio chain");
++        auto* processor = gst_bin_new("webkit-opus-decoder");
++        gst_object_ref_sink(processor);
++        auto* depayloader = gst_element_factory_make("rtpopusdepay", nullptr);
++        auto* decoder = gst_element_factory_make("opusdec", nullptr);
++        auto* converter = gst_element_factory_make("audioconvert", nullptr);
++        auto* resampler = gst_element_factory_make("audioresample", nullptr);
++
++        RELEASE_ASSERT(depayloader && decoder && converter && resampler);
++        configureMediaStreamAudioDecoder(decoder);
++        gst_bin_add_many(GST_BIN_CAST(processor), depayloader, decoder, converter, resampler, nullptr);
++        if (!gst_element_link_many(depayloader, decoder, converter, resampler, nullptr)) {
++            GST_ERROR_OBJECT(m_bin.get(), "Failed to link static WebRTC Opus decoder chain");
++            gst_object_unref(processor);
++            return createParser();
++        }
++
++        auto depayloaderSinkPad = adoptGRef(gst_element_get_static_pad(depayloader, "sink"));
++        installRtpBufferPadProbe(depayloaderSinkPad);
++        gst_element_add_pad(processor, gst_ghost_pad_new("sink", depayloaderSinkPad.get()));
++
++        auto resamplerSrcPad = adoptGRef(gst_element_get_static_pad(resampler, "src"));
++        gst_element_add_pad(processor, gst_ghost_pad_new("src", resamplerSrcPad.get()));
++        m_isDecoding = true;
++        return adoptGRef(processor);
++    }
+ 
+     if (m_data.type == RealtimeMediaSource::Type::Video) {
+         GST_DEBUG_OBJECT(m_bin.get(), "Requesting a key-frame");
+@@ -214,6 +432,10 @@ GRefPtr<GstElement> GStreamerIncomingTrackProcessor::incomingTrackProcessor()
+     m_isDecoding = true;
+ 
+     g_signal_connect_data(decodebin.get(), "deep-element-added", G_CALLBACK(+[](GstBin*, GstBin*, GstElement* element, gpointer userData) {
++        auto* factory = gst_element_get_factory(element);
++        if (factory && !g_strcmp0(GST_OBJECT_NAME(factory), "h264parse"))
++            constrainH264ParserToAccessUnits(element);
++
+         String elementClass = unsafeSpan(gst_element_get_metadata(element, GST_ELEMENT_METADATA_KLASS));
+         auto classifiers = elementClass.split('/');
+         if (!classifiers.contains("Depayloader"_s))
+@@ -241,6 +463,7 @@ GRefPtr<GstElement> GStreamerIncomingTrackProcessor::incomingTrackProcessor()
+             return;
+ 
+         self->m_videoDecoderName = configureMediaStreamVideoDecoder(element);
++        configureRockchipEarlyVideoRotation(element);
+         webkitGstTraceProcessingTimeForElement(element);
+ 
+         auto sinkPad = adoptGRef(gst_element_get_static_pad(element, "sink"));
+@@ -406,18 +629,67 @@ void GStreamerIncomingTrackProcessor::installRtpBufferPadProbe(const GRefPtr<Gst
+     }));
+ }
+ 
++bool GStreamerIncomingTrackProcessor::scheduleStaticAudioTrackBeforeStart()
++{
++    if (!std::exchange(m_staticAudioNeedsPreStartConnection, false))
++        return false;
++
++    auto endPoint = m_endPoint.get();
++    if (!endPoint || endPoint->isStopped())
++        return false;
++
++    m_isReady = true;
++    GST_INFO_OBJECT(m_bin.get(), "Scheduling static decoded audio track connection after pad-added unwinds");
++    RunLoop::mainSingleton().dispatchAfter(Seconds::fromMilliseconds(50),
++        [endPoint = protect(*endPoint), protectedThis = Ref { *this }] {
++            if (endPoint->isStopped())
++                return;
++            endPoint->connectIncomingTrack(protectedThis->m_data);
++            gst_element_sync_state_with_parent(protectedThis->m_bin.get());
++            GST_INFO_OBJECT(protectedThis->m_bin.get(), "Static decoded audio track connected; bin synchronized with parent");
++        });
++    return true;
++}
++
+ void GStreamerIncomingTrackProcessor::trackReady()
+ {
+     auto endPoint = m_endPoint.get();
+     if (!endPoint || endPoint->isStopped())
+         return;
+ 
++    bool wasReady = m_isReady;
+     m_isReady = true;
+     GST_DEBUG_OBJECT(m_bin.get(), "MediaStream %s track %s on pad %" GST_PTR_FORMAT " is ready", m_data.mediaStreamId.utf8().data(), m_data.trackId.utf8().data(), m_pad.get());
+-    callOnMainThread([endPoint = protect(*endPoint), this] {
+-        if (endPoint->isStopped())
+-            return;
+-        endPoint->connectIncomingTrack(m_data);
++    if (!wasReady && m_data.type == RealtimeMediaSource::Type::Video && g_strcmp0(g_getenv("WEBKIT_GST_WEBRTC_LATE_KEYFRAME_RETRY"), "0")) {
++        struct DelayedKeyFrameRequest {
++            ThreadSafeWeakPtr<GStreamerIncomingTrackProcessor> processor;
++            unsigned delayMilliseconds;
++        };
++
++        auto scheduleRequest = [this](unsigned delayMilliseconds) {
++            auto* request = new DelayedKeyFrameRequest { ThreadSafeWeakPtr { *this }, delayMilliseconds };
++            g_timeout_add_full(G_PRIORITY_DEFAULT, delayMilliseconds, +[](gpointer userData) -> gboolean {
++                auto* request = static_cast<DelayedKeyFrameRequest*>(userData);
++                RefPtr processor = request->processor.get();
++                if (!processor || !processor->m_pad)
++                    return G_SOURCE_REMOVE;
++
++                auto requested = gst_pad_send_event(processor->m_pad.get(), gst_video_event_new_upstream_force_key_unit(GST_CLOCK_TIME_NONE, TRUE, 1));
++                GST_INFO_OBJECT(processor->m_bin.get(), "Late consumer key-frame request +%ums: %s", request->delayMilliseconds, requested ? "sent" : "rejected");
++                return G_SOURCE_REMOVE;
++            }, request, +[](gpointer userData) {
++                delete static_cast<DelayedKeyFrameRequest*>(userData);
++            });
++        };
++
++        scheduleRequest(250);
++        scheduleRequest(750);
++        scheduleRequest(1500);
++    }
++
++    callOnMainThread([endPoint = protect(*endPoint), protectedThis = Ref { *this }] {
++        if (!endPoint->isStopped())
++            endPoint->connectIncomingTrack(protectedThis->m_data);
+     });
+ }
+ 
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.h b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.h
+index 10811a76..d437fa48 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.h
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerIncomingTrackProcessor.h
+@@ -39,6 +39,7 @@ public:
+     ~GStreamerIncomingTrackProcessor() = default;
+ 
+     void configure(ThreadSafeWeakPtr<GStreamerMediaEndpoint>&&, GRefPtr<GstPad>&&);
++    bool scheduleStaticAudioTrackBeforeStart();
+     const GRefPtr<GstPad>& pad() const { return m_pad; }
+ 
+     GstElement* bin() const { return m_bin.get(); }
+@@ -88,6 +89,7 @@ private:
+     GRefPtr<GstCaps> m_ntpCaps;
+ 
+     bool m_hasReceivedFirstPacket { false };
++    bool m_staticAudioNeedsPreStartConnection { false };
+ };
+ 
+ } // namespace WebCore
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+index 6b6278c4..236ea67c 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerMediaStreamSource.cpp
+@@ -64,6 +64,46 @@ static GstStaticPadTemplate audioSrcTemplate = GST_STATIC_PAD_TEMPLATE("audio_sr
+ GST_DEBUG_CATEGORY_STATIC(webkitMediaStreamSrcDebug);
+ #define GST_CAT_DEFAULT webkitMediaStreamSrcDebug
+ 
++static bool useLeakyIncomingVideoQueue()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_LEAKY_RAW_VIDEO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool retimestampIncomingMedia()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_RETIMESTAMP_INCOMING");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool reparseIncomingH264()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_REPARSE_H264");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool disableMediaStreamPlayerAudio()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_DISABLE_PLAYER_AUDIO");
++    if (value && !g_strcmp0(value, "1"))
++        return true;
++
++    value = g_getenv("WEBKIT_GST_WEBRTC_DIRECT_REMOTE_AUDIO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool deferMediaStreamPlayerAudio()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_DEFER_PLAYER_AUDIO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool allowIncomingPlayerAudioBeforeVideo()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_ALLOW_EARLY_AUDIO");
++    return value && !g_strcmp0(value, "1");
++}
++
+ [[nodiscard]] GRefPtr<GstTagList> mediaStreamTrackPrivateGetTags(const RefPtr<MediaStreamTrackPrivate>& track)
+ {
+     auto tagList = adoptGRef(gst_tag_list_new_empty());
+@@ -113,6 +153,7 @@ public:
+ 
+     void ref() const final { RefCounted::ref(); }
+     void deref() const final { RefCounted::deref(); }
++    void setConsumerIsVideoPlayer(bool value) { m_consumerIsVideoPlayer = value; }
+ 
+     void characteristicsChanged() final
+     {
+@@ -130,7 +171,13 @@ public:
+         if (!src)
+             return;
+ 
+-        webkitMediaStreamSrcAddTrack(WEBKIT_MEDIA_STREAM_SRC_CAST(src.get()), &track);
++        auto* mediaStreamSrc = WEBKIT_MEDIA_STREAM_SRC_CAST(src.get());
++        if (m_consumerIsVideoPlayer && track.isAudio() && disableMediaStreamPlayerAudio()) {
++            GST_WARNING_OBJECT(mediaStreamSrc, "Skipping dynamically added MediaStream player audio source because audio is handled outside the player pipeline");
++            return;
++        }
++
++        webkitMediaStreamSrcAddTrack(mediaStreamSrc, &track, m_consumerIsVideoPlayer);
+     }
+ 
+     void didRemoveTrack(MediaStreamTrackPrivate&) final;
+@@ -142,6 +189,7 @@ private:
+     }
+ 
+     GThreadSafeWeakPtr<GstElement> m_src;
++    bool m_consumerIsVideoPlayer { false };
+ };
+ 
+ static void webkitMediaStreamSrcEnsureStreamCollectionPosted(WebKitMediaStreamSrc*, bool isEmpty = false);
+@@ -362,8 +410,53 @@ public:
+ 
+         GST_TRACE_OBJECT(m_src.get(), "%s", logMessage.characters());
+ 
+-        bool drop = m_enoughData;
+-        auto buffer = gst_sample_get_buffer(sample.get());
++        GRefPtr<GstSample> sampleToPush = sample;
++        if (m_retimestampIncomingMedia) {
++            auto* sourceBuffer = gst_sample_get_buffer(sample.get());
++            auto buffer = adoptGRef(gst_buffer_copy(sourceBuffer));
++            if (!buffer)
++                GST_WARNING_OBJECT(m_src.get(), "Unable to copy incoming buffer for pipeline-clock timestamping");
++            else {
++                if (m_isVideoTrack) {
++                    GST_BUFFER_PTS(buffer.get()) = GST_CLOCK_TIME_NONE;
++                    GST_BUFFER_DTS(buffer.get()) = GST_CLOCK_TIME_NONE;
++                } else {
++                    auto now = gst_util_get_timestamp();
++                    if (!GST_CLOCK_TIME_IS_VALID(m_retimestampOrigin))
++                        m_retimestampOrigin = now;
++                    GST_BUFFER_PTS(buffer.get()) = now - m_retimestampOrigin;
++                    GST_BUFFER_DTS(buffer.get()) = GST_BUFFER_PTS(buffer.get());
++                }
++                const auto* info = gst_sample_get_info(sample.get());
++                sampleToPush = adoptGRef(gst_sample_new(buffer.get(), gst_sample_get_caps(sample.get()),
++                    gst_sample_get_segment(sample.get()), info ? gst_structure_copy(info) : nullptr));
++            }
++        }
++
++        if (m_reparseIncomingH264) {
++            auto* caps = gst_sample_get_caps(sampleToPush.get());
++            if (caps && doCapsHaveType(caps, "video/x-h264"_s)) {
++                auto parserInputCaps = adoptGRef(gst_caps_copy(caps));
++                for (unsigned i = 0; i < gst_caps_get_size(parserInputCaps.get()); ++i)
++                    gst_structure_set(gst_caps_get_structure(parserInputCaps.get(), i), "parsed", G_TYPE_BOOLEAN, FALSE, nullptr);
++
++                auto* currentBuffer = gst_sample_get_buffer(sampleToPush.get());
++                const auto* currentInfo = gst_sample_get_info(sampleToPush.get());
++                sampleToPush = adoptGRef(gst_sample_new(currentBuffer, parserInputCaps.get(),
++                    gst_sample_get_segment(sampleToPush.get()),
++                    currentInfo ? gst_structure_copy(currentInfo) : nullptr));
++
++                static std::once_flag logged;
++                std::call_once(logged, [this, caps] {
++                    GST_WARNING_OBJECT(m_src.get(),
++                        "Forcing incoming H.264 reparse before player decoder; input caps: %" GST_PTR_FORMAT,
++                        caps);
++                });
++            }
++        }
++
++        bool drop = m_enoughData && !m_useLeakyIncomingVideoQueue;
++        auto buffer = gst_sample_get_buffer(sampleToPush.get());
+ 
+         if (!m_hasPushedInitialTags) {
+             auto pad = adoptGRef(gst_element_get_static_pad(m_src.get(), "src"));
+@@ -373,7 +466,11 @@ public:
+ 
+         if (m_isVideoTrack && drop) {
+             auto* caps = gst_sample_get_caps(sample.get());
+-            drop = doCapsHaveType(caps, "video"_s) || GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
++            bool isRawVideo = doCapsHaveType(caps, "video/x-raw"_s);
++            bool isDeltaUnit = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
++            drop = isRawVideo || isDeltaUnit;
++            if (!drop)
++                GST_INFO_OBJECT(m_src.get(), "Queue full; preserving encoded video key frame");
+         }
+ 
+         if (drop) {
+@@ -388,9 +485,11 @@ public:
+         }
+ 
+         m_hasPushedInitialSample = true;
+-        gst_app_src_push_sample(GST_APP_SRC(m_src.get()), sample.get());
++        auto flowReturn = gst_app_src_push_sample(GST_APP_SRC(m_src.get()), sampleToPush.get());
++        if (flowReturn != GST_FLOW_OK)
++            GST_WARNING_OBJECT(m_src.get(), "Failed to push sample: %s", gst_flow_get_name(flowReturn));
+ 
+-        updateStats(sample.get());
++        updateStats(sampleToPush.get());
+     }
+ 
+     void trackStarted(MediaStreamTrackPrivate&) final { };
+@@ -575,6 +674,11 @@ private:
+         auto& trackSource = m_track->source();
+         m_isIncomingVideoSource = trackSource.isIncomingVideoSource();
+         m_isVideoTrack = m_track->isVideo();
++        m_useLeakyIncomingVideoQueue = m_isIncomingVideoSource && m_consumerIsVideoPlayer && useLeakyIncomingVideoQueue();
++        m_retimestampIncomingMedia = (m_isIncomingVideoSource || trackSource.isIncomingAudioSource())
++            && retimestampIncomingMedia();
++        m_reparseIncomingH264 = m_consumerIsVideoPlayer && m_isIncomingVideoSource
++            && reparseIncomingH264();
+ 
+         ASCIILiteral namePrefix;
+         if (trackSource.isIncomingAudioSource() || m_isIncomingVideoSource)
+@@ -600,9 +704,21 @@ private:
+         m_src = makeGStreamerElement("appsrc"_s, elementName);
+ 
+         g_object_set(m_src.get(), "is-live", TRUE, "format", GST_FORMAT_TIME, "min-percent", 100,
+-            "do-timestamp", isCaptureTrack, "handle-segment-change", TRUE, nullptr);
+-        if (track.isVideo())
+-            g_object_set(m_src.get(), "max-bytes", static_cast<guint64>(2 * MB), nullptr);
++            "do-timestamp", isCaptureTrack || (m_retimestampIncomingMedia && m_isVideoTrack),
++            "handle-segment-change", TRUE, nullptr);
++        if (m_retimestampIncomingMedia)
++            GST_WARNING_OBJECT(m_src.get(), "Using pipeline-clock timestamps for incoming WebRTC media");
++        if (track.isVideo()) {
++            if (m_useLeakyIncomingVideoQueue) {
++                g_object_set(m_src.get(),
++                    "max-bytes", static_cast<guint64>(0),
++                    "max-buffers", static_cast<guint64>(1),
++                    "leaky-type", GST_APP_LEAKY_TYPE_DOWNSTREAM,
++                    nullptr);
++                GST_WARNING_OBJECT(m_src.get(), "Using single-buffer leaky queue for incoming raw WebRTC video");
++            } else
++                g_object_set(m_src.get(), "max-bytes", static_cast<guint64>(2 * MB), nullptr);
++        }
+         gst_base_src_set_automatic_eos(GST_BASE_SRC_CAST(m_src.get()), FALSE);
+ 
+         static GstAppSrcCallbacks callbacks = {
+@@ -842,6 +958,10 @@ private:
+     bool m_hasPushedInitialTags { false };
+     bool m_hasPushedInitialSample { false };
+     bool m_enoughData { false };
++    bool m_useLeakyIncomingVideoQueue { false };
++    bool m_retimestampIncomingMedia { false };
++    GstClockTime m_retimestampOrigin { GST_CLOCK_TIME_NONE };
++    bool m_reparseIncomingH264 { false };
+     bool m_needsDiscont { false };
+     String m_padName;
+     bool m_isObserving { false };
+@@ -918,6 +1038,10 @@ struct _WebKitMediaStreamSrcPrivate {
+     bool firstVideoSampleSeen { false };
+     Vector<RefPtr<PadProbeHandle<PadProbeData>>> probes;
+     Vector<RefPtr<PadProbeData>> probeData;
++    Vector<RefPtr<MediaStreamTrackPrivate>> deferredPlayerAudioTracks;
++    guint deferredPlayerAudioTimer { 0 };
++    unsigned deferredPlayerAudioPolls { 0 };
++    unsigned deferredPlayerAudioReadyPolls { 0 };
+ };
+ 
+ enum {
+@@ -936,6 +1060,13 @@ bool InternalSource::receivedAudioSampleBeforeVideo()
+ {
+     auto src = WEBKIT_MEDIA_STREAM_SRC_CAST(m_parent);
+ 
++    if (!m_consumerIsVideoPlayer)
++        return false;
++
++    if (m_consumerIsVideoPlayer && m_track && m_track->source().isIncomingAudioSource()
++        && allowIncomingPlayerAudioBeforeVideo())
++        return false;
++
+     if (src->priv->firstVideoSampleSeen)
+         return false;
+ 
+@@ -1136,6 +1267,11 @@ static void webkitMediaStreamSrcDispose(GObject* object)
+     auto priv = self->priv;
+ 
+     GST_DEBUG_OBJECT(self, "Disposing");
++    if (priv->deferredPlayerAudioTimer) {
++        g_source_remove(priv->deferredPlayerAudioTimer);
++        priv->deferredPlayerAudioTimer = 0;
++    }
++    priv->deferredPlayerAudioTracks.clear();
+     for (auto& source : priv->sources.values())
+         webkitMediaStreamSrcCleanup(self, source);
+ 
+@@ -1453,6 +1589,50 @@ bool webkitMediaStreamSrcHasPrerolled(WebKitMediaStreamSrc* self)
+     return true;
+ }
+ 
++static gboolean webkitMediaStreamSrcAttachDeferredPlayerAudio(gpointer userData)
++{
++    auto self = WEBKIT_MEDIA_STREAM_SRC_CAST(userData);
++    auto priv = self->priv;
++    if (priv->deferredPlayerAudioTracks.isEmpty()) {
++        priv->deferredPlayerAudioTimer = 0;
++        return G_SOURCE_REMOVE;
++    }
++
++    bool videoReady = false;
++    for (auto& source : priv->sources.values()) {
++        auto track = source->track();
++        if (track && track->isVideo() && source->hasPrerolled()) {
++            videoReady = true;
++            break;
++        }
++    }
++
++    ++priv->deferredPlayerAudioPolls;
++    if (!videoReady) {
++        if (priv->deferredPlayerAudioPolls < 200)
++            return G_SOURCE_CONTINUE;
++
++        g_print("WebRTC player audio defer timed out after 10s; keeping video-only playback\n");
++        priv->deferredPlayerAudioTracks.clear();
++        priv->deferredPlayerAudioTimer = 0;
++        return G_SOURCE_REMOVE;
++    }
++
++    if (++priv->deferredPlayerAudioReadyPolls < 5)
++        return G_SOURCE_CONTINUE;
++
++    auto tracks = WTF::move(priv->deferredPlayerAudioTracks);
++    priv->deferredPlayerAudioTimer = 0;
++    g_print("WebRTC player audio attaching after video preroll: tracks=%zu delay_polls=%u\n",
++        tracks.size(), priv->deferredPlayerAudioPolls);
++    for (auto& track : tracks) {
++        if (track)
++            webkitMediaStreamSrcAddTrack(self, track.get(), true);
++    }
++    webkitMediaStreamSrcEnsureStreamCollectionPosted(self);
++    return G_SOURCE_REMOVE;
++}
++
+ void webkitMediaStreamSrcCharacteristicsChanged([[maybe_unused]] WebKitMediaStreamSrc* self)
+ {
+     GST_DEBUG_OBJECT(self, "MediaStream characteristics changed");
+@@ -1462,14 +1642,31 @@ void webkitMediaStreamSrcSetStream(WebKitMediaStreamSrc* self, MediaStreamPrivat
+ {
+     ASSERT(WEBKIT_IS_MEDIA_STREAM_SRC(self));
+     ASSERT(!self->priv->stream);
++    self->priv->mediaStreamObserver->setConsumerIsVideoPlayer(isVideoPlayer);
+     self->priv->stream = stream;
+ 
+     GST_DEBUG_OBJECT(self, "Associating with MediaStream");
+     self->priv->stream->addObserver(*self->priv->mediaStreamObserver.get());
+     auto tracks = stream->tracks();
++    bool hasVideoTrack = false;
++    for (auto& track : tracks) {
++        if (track->isVideo()) {
++            hasVideoTrack = true;
++            break;
++        }
++    }
++    bool shouldDeferPlayerAudio = isVideoPlayer && hasVideoTrack && deferMediaStreamPlayerAudio();
+     for (auto& track : tracks) {
+         if (!isVideoPlayer && track->isVideo())
+             continue;
++        if (isVideoPlayer && track->isAudio() && disableMediaStreamPlayerAudio()) {
++            GST_WARNING_OBJECT(self, "Skipping MediaStream player audio source because audio is handled outside the player pipeline");
++            continue;
++        }
++        if (shouldDeferPlayerAudio && track->isAudio()) {
++            self->priv->deferredPlayerAudioTracks.append(track.ptr());
++            continue;
++        }
+         webkitMediaStreamSrcAddTrack(self, track.ptr(), isVideoPlayer);
+     }
+ 
+@@ -1479,6 +1676,12 @@ void webkitMediaStreamSrcSetStream(WebKitMediaStreamSrc* self, MediaStreamPrivat
+         return;
+ 
+     webkitMediaStreamSrcEnsureStreamCollectionPosted(self);
++    if (!self->priv->deferredPlayerAudioTracks.isEmpty()) {
++        g_print("WebRTC player audio deferred until video preroll: tracks=%zu\n",
++            self->priv->deferredPlayerAudioTracks.size());
++        self->priv->deferredPlayerAudioTimer = g_timeout_add(50,
++            webkitMediaStreamSrcAttachDeferredPlayerAudio, self);
++    }
+ }
+ 
+ void webkitMediaStreamSrcConfigureAudioTracks(WebKitMediaStreamSrc* self, float volume, bool isMuted, bool isPlaying)
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp b/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp
+index bb9cf73a..31c536b1 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.cpp
+@@ -25,6 +25,8 @@
+ #include "GStreamerCommon.h"
+ #include "NotImplemented.h"
+ #include <gst/app/gstappsink.h>
++#include <gst/video/gstvideometa.h>
++#include <wtf/Vector.h>
+ #include <wtf/text/MakeString.h>
+ #include <wtf/text/WTFString.h>
+ 
+@@ -33,6 +35,59 @@ GST_DEBUG_CATEGORY(webkit_webrtc_incoming_media_debug);
+ 
+ namespace WebCore {
+ 
++static bool coalesceIncomingVideoSamples()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_COALESCE_INCOMING_VIDEO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static bool copyIncomingDecodedVideoSamples()
++{
++    const char* value = g_getenv("WEBKIT_GST_WEBRTC_COPY_DECODED_VIDEO");
++    return value && !g_strcmp0(value, "1");
++}
++
++static GRefPtr<GstBuffer> copyVideoBufferToSystemMemory(GstBuffer* source)
++{
++    const auto size = gst_buffer_get_size(source);
++    auto copy = adoptGRef(gst_buffer_new_allocate(nullptr, size, nullptr));
++    if (!copy)
++        return nullptr;
++
++    GstMapInfo sourceMap = GST_MAP_INFO_INIT;
++    GstMapInfo destinationMap = GST_MAP_INFO_INIT;
++    if (!gst_buffer_map(source, &sourceMap, GST_MAP_READ))
++        return nullptr;
++    if (!gst_buffer_map(copy.get(), &destinationMap, GST_MAP_WRITE)) {
++        gst_buffer_unmap(source, &sourceMap);
++        return nullptr;
++    }
++
++    bool copied = sourceMap.size <= destinationMap.size;
++    if (copied)
++        std::memcpy(destinationMap.data, sourceMap.data, sourceMap.size);
++    gst_buffer_unmap(copy.get(), &destinationMap);
++    gst_buffer_unmap(source, &sourceMap);
++    if (!copied)
++        return nullptr;
++
++    // Copy timing and flags, but not parent-buffer or allocator metadata that
++    // could retain the MPP DMA-BUF output pool.
++    if (!gst_buffer_copy_into(copy.get(), source,
++            static_cast<GstBufferCopyFlags>(GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS),
++            0, -1))
++        return nullptr;
++
++    if (auto* videoMeta = gst_buffer_get_video_meta(source)) {
++        if (!gst_buffer_add_video_meta_full(copy.get(), videoMeta->flags,
++                videoMeta->format, videoMeta->width, videoMeta->height,
++                videoMeta->n_planes, videoMeta->offset, videoMeta->stride))
++            return nullptr;
++    }
++
++    return copy;
++}
++
+ RealtimeIncomingSourceGStreamer::RealtimeIncomingSourceGStreamer(const CaptureDevice& device)
+     : RealtimeMediaSource(device)
+ {
+@@ -56,13 +111,26 @@ bool RealtimeIncomingSourceGStreamer::setBin(GRefPtr<GstElement>&& bin)
+ 
+     auto handoffCallback = G_CALLBACK(+[](GstElement*, GstBuffer* buffer, GstPad* pad, gpointer userData) {
+         auto source = reinterpret_cast<RealtimeIncomingSourceGStreamer*>(userData);
++        GstBuffer* sampleBuffer = buffer;
++        GRefPtr<GstBuffer> copiedBuffer;
++        if (source->isIncomingVideoSource() && copyIncomingDecodedVideoSamples()) {
++            copiedBuffer = copyVideoBufferToSystemMemory(buffer);
++            if (!copiedBuffer) {
++                GST_ERROR_OBJECT(source->m_bin.get(), "Failed to copy decoded incoming video sample");
++                return;
++            }
++            sampleBuffer = copiedBuffer.get();
++
++            static std::once_flag logged;
++            std::call_once(logged, [source] {
++                GST_WARNING_OBJECT(source->m_bin.get(),
++                    "Copying decoded incoming video into system memory to release the DMA-BUF output pool");
++            });
++        }
++
+         auto caps = adoptGRef(gst_pad_get_current_caps(pad));
+-        auto sample = adoptGRef(gst_sample_new(buffer, caps.get(), nullptr, nullptr));
+-        // dispatchSample might trigger RealtimeMediaSource::notifySettingsDidChangeObservers()
+-        // which expects to run in the main thread.
+-        callOnMainThread([source, sample = WTF::move(sample)]() mutable {
+-            source->dispatchSample(WTF::move(sample));
+-        });
++        auto sample = adoptGRef(gst_sample_new(sampleBuffer, caps.get(), nullptr, nullptr));
++        source->enqueueSample(WTF::move(sample));
+     });
+     g_signal_connect(m_sink.get(), "preroll-handoff", handoffCallback, this);
+     g_signal_connect(m_sink.get(), "handoff", handoffCallback, this);
+@@ -85,11 +153,68 @@ bool RealtimeIncomingSourceGStreamer::setBin(GRefPtr<GstElement>&& bin)
+     return true;
+ }
+ 
++void RealtimeIncomingSourceGStreamer::enqueueSample(GRefPtr<GstSample>&& sample)
++{
++    // dispatchSample might trigger RealtimeMediaSource::notifySettingsDidChangeObservers(),
++    // which expects to run on the main thread.
++    if (!isIncomingVideoSource() || !coalesceIncomingVideoSamples()) {
++        callOnMainThread([protectedThis = Ref { *this }, sample = WTF::move(sample)]() mutable {
++            protectedThis->dispatchSample(WTF::move(sample));
++        });
++        return;
++    }
++
++    bool shouldSchedule = false;
++    {
++        Locker locker { m_pendingSampleLock };
++        if (m_isTearingDown)
++            return;
++
++        if (m_pendingVideoSample && !(++m_coalescedVideoSampleCount % 60))
++            GST_INFO_OBJECT(m_bin.get(), "Coalesced %" PRIu64 " incoming video samples waiting for the main thread", m_coalescedVideoSampleCount);
++        m_pendingVideoSample = WTF::move(sample);
++        if (!m_pendingVideoSampleDispatchScheduled) {
++            m_pendingVideoSampleDispatchScheduled = true;
++            shouldSchedule = true;
++        }
++    }
++
++    if (!shouldSchedule)
++        return;
++
++    callOnMainThread([protectedThis = Ref { *this }] {
++        protectedThis->dispatchPendingVideoSample();
++    });
++}
++
++void RealtimeIncomingSourceGStreamer::dispatchPendingVideoSample()
++{
++    GRefPtr<GstSample> sample;
++    {
++        Locker locker { m_pendingSampleLock };
++        m_pendingVideoSampleDispatchScheduled = false;
++        if (m_isTearingDown) {
++            m_pendingVideoSample = nullptr;
++            return;
++        }
++        sample = std::exchange(m_pendingVideoSample, nullptr);
++    }
++
++    if (sample)
++        dispatchSample(WTF::move(sample));
++}
++
+ void RealtimeIncomingSourceGStreamer::tearDown()
+ {
+     if (!m_bin)
+         return;
+ 
++    {
++        Locker locker { m_pendingSampleLock };
++        m_isTearingDown = true;
++        m_pendingVideoSample = nullptr;
++    }
++
+     g_object_set(m_sink.get(), "signal-handoffs", FALSE, nullptr);
+ 
+     auto sinkPad = adoptGRef(gst_element_get_static_pad(m_sink.get(), "sink"));
+@@ -134,8 +259,15 @@ void RealtimeIncomingSourceGStreamer::unregisterClient(int clientId)
+ 
+ void RealtimeIncomingSourceGStreamer::forEachClient(Function<void(GstElement*)>&& applyFunction)
+ {
+-    Locker lock { m_clientLock };
+-    for (auto& client : m_clients.values())
++    Vector<GRefPtr<GstElement>> clients;
++    {
++        Locker lock { m_clientLock };
++        clients.reserveInitialCapacity(m_clients.size());
++        for (auto& client : m_clients.values())
++            clients.append(client);
++    }
++
++    for (auto& client : clients)
+         applyFunction(client.get());
+ }
+ 
+@@ -170,6 +302,14 @@ GstPadProbeReturn RealtimeIncomingSourceGStreamer::handleDownstreamEvent(GRefPtr
+     case GST_EVENT_SEGMENT:
+     case GST_EVENT_STREAM_COLLECTION:
+         return GST_PAD_PROBE_OK;
++    case GST_EVENT_FLUSH_START:
++    case GST_EVENT_FLUSH_STOP:
++        // Flush events belong to the endpoint pipeline. Forwarding them
++        // synchronously into a MediaPlayer appsrc can deadlock while both
++        // pipelines are changing state during RTCPeerConnection::close().
++        GST_INFO_OBJECT(m_sink.get(), "Keeping pipeline-local %s event out of client appsrc pipelines",
++            GST_EVENT_TYPE_NAME(event.get()));
++        return GST_PAD_PROBE_OK;
+     case GST_EVENT_LATENCY: {
+         GstClockTime minLatency, maxLatency;
+         if (gst_base_sink_query_latency(GST_BASE_SINK(m_sink.get()), nullptr, nullptr, &minLatency, &maxLatency)) {
+diff --git a/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.h b/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.h
+index 11c1cf15..354cb1dd 100644
+--- a/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.h
++++ b/Source/WebCore/platform/mediastream/gstreamer/RealtimeIncomingSourceGStreamer.h
+@@ -52,6 +52,8 @@ private:
+ 
+     virtual void dispatchSample(GRefPtr<GstSample>&&) = 0;
+ 
++    void enqueueSample(GRefPtr<GstSample>&&);
++    void dispatchPendingVideoSample();
+     void forEachClient(Function<void(GstElement*)>&&);
+ 
+     GRefPtr<GstElement> m_bin;
+@@ -59,6 +61,11 @@ private:
+     unsigned long m_sinkPadProbeId;
+     Lock m_clientLock;
+     HashMap<int, GRefPtr<GstElement>> m_clients WTF_GUARDED_BY_LOCK(m_clientLock);
++    Lock m_pendingSampleLock;
++    GRefPtr<GstSample> m_pendingVideoSample WTF_GUARDED_BY_LOCK(m_pendingSampleLock);
++    bool m_pendingVideoSampleDispatchScheduled WTF_GUARDED_BY_LOCK(m_pendingSampleLock) { false };
++    bool m_isTearingDown WTF_GUARDED_BY_LOCK(m_pendingSampleLock) { false };
++    uint64_t m_coalescedVideoSampleCount WTF_GUARDED_BY_LOCK(m_pendingSampleLock) { 0 };
+     MonotonicTime m_lastTagUpdate;
+ };
+ 

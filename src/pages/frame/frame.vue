@@ -18,7 +18,7 @@
       @input="onKeyboardTextareaInput"
       @confirm="onKeyboardTextareaConfirm"
       @textChanged="onKeyboardTextareaInput"
-      @textEditFinished="onKeyboardTextareaConfirm"
+      @textEditFinished="onKeyboardTextareaFinished"
       @focus="onKeyboardTextareaFocus"
       @blur="onKeyboardTextareaBlur"
     ></textarea>
@@ -39,15 +39,15 @@ export default {
       keyboard: createKeyboardBridgeState(),
       browserLifecycle: null,
       keyboardBridge: null,
+      pageVisible: true,
+      keyboardHideTimer: null,
     }
   },
   mounted() {
     this.ensureControllers()
-    if (this.isStopOnly()) {
-      this.browserLifecycle.stopOnlyAndReturn()
-      return
+    if (this.browserWorkdir()) {
+      this.keyboardBridge.setup()
     }
-    this.keyboardBridge.setup()
     this.browserLifecycle.start()
   },
   beforeDestroy() {
@@ -68,6 +68,10 @@ export default {
       }
     },
     teardownControllers() {
+      this.clearKeyboardHideTimer()
+      if (this.browserLifecycle) {
+        this.browserLifecycle.stop()
+      }
       if (this.keyboardBridge) {
         this.keyboardBridge.teardown()
       }
@@ -77,10 +81,6 @@ export default {
     },
     pageOptions() {
       return this.$page && this.$page.options ? this.$page.options : {}
-    },
-    isStopOnly() {
-      const options = this.pageOptions()
-      return options.stopOnly === 1 || options.stopOnly === '1' || options.stopOnly === true || options.stopOnly === 'true'
     },
     browserWorkdir() {
       const options = this.pageOptions()
@@ -94,6 +94,10 @@ export default {
       this.ensureControllers()
       this.keyboardBridge.onTextareaConfirm(value)
     },
+    onKeyboardTextareaFinished(value) {
+      this.ensureControllers()
+      this.keyboardBridge.onTextareaFinished(value)
+    },
     onKeyboardTextareaFocus() {
       this.ensureControllers()
       this.keyboardBridge.onTextareaFocus()
@@ -102,9 +106,26 @@ export default {
       this.ensureControllers()
       this.keyboardBridge.onTextareaBlur()
     },
+    clearKeyboardHideTimer() {
+      if (!this.keyboardHideTimer) return
+      clearTimeout(this.keyboardHideTimer)
+      this.keyboardHideTimer = null
+    },
+    onKeyboardBridgeInactive() {
+      this.clearKeyboardHideTimer()
+      this.keyboardHideTimer = setTimeout(() => {
+        this.keyboardHideTimer = null
+        if (this.pageVisible || this.keyboardBridge.isActive()) return
+        console.warn('wpe hidden after keyboard closed; stopping browser')
+        this.browserLifecycle.stop()
+      }, 15000)
+    },
     onShow() {
-      if (this.isStopOnly()) return
       this.ensureControllers()
+      this.pageVisible = true
+      this.clearKeyboardHideTimer()
+      this.keyboardBridge.onPageShow()
+      this.keyboardBridge.reconcileActiveRequest()
       if (!this.browser.leaving) {
         this.browserLifecycle.start()
       }
@@ -112,7 +133,8 @@ export default {
     onHide() {
       console.warn('wpe frame onHide')
       this.ensureControllers()
-      if (this.keyboardBridge.isActive()) {
+      this.pageVisible = false
+      if (this.keyboardBridge.onPageHide()) {
         console.warn('wpe frame onHide ignored while keyboard active')
         return
       }
@@ -121,7 +143,8 @@ export default {
     onUnload() {
       console.warn('wpe frame onUnload')
       this.ensureControllers()
-      this.browserLifecycle.stop()
+      this.pageVisible = false
+      this.clearKeyboardHideTimer()
       this.teardownControllers()
     },
   },

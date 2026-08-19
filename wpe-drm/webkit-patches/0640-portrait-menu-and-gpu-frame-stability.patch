@@ -1,0 +1,351 @@
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -27,6 +27,7 @@
+ 
+ #if USE(COORDINATED_GRAPHICS)
+ 
++#include "GPUFrameValidity.h"
+ #include "MessageReceiver.h"
+ #include <WebCore/Color.h>
+ #include <WebCore/CoordinatedCompositionReason.h>
+@@ -188,6 +189,14 @@
+         void setDamage(WebCore::Damage&& damage) { m_damage = WTF::move(damage); }
+         const std::optional<WebCore::Damage>& damage() LIFETIME_BOUND { return m_damage; }
+         bool requiresFullRepaint() const { return !m_damage; }
++        bool requiresFullGPURepaint(const WebCore::IntSize& size, uint64_t generation) const
++        {
++            return m_gpuFrameValidity.requiresFullRepaint(size.width(), size.height(), !!m_damage, generation);
++        }
++        void didRenderGPUFrame(const WebCore::IntSize& size, uint64_t generation, bool wasFullRepaint)
++        {
++            m_gpuFrameValidity.didRender(size.width(), size.height(), generation, wasFullRepaint);
++        }
+         void addDamage(const std::optional<WebCore::Damage>&);
+ #endif
+ 
+@@ -201,6 +210,7 @@
+         sk_sp<SkSurface> m_skiaSurface;
+ #if ENABLE(DAMAGE_TRACKING)
+         std::optional<WebCore::Damage> m_damage;
++        GPUFrameValidity m_gpuFrameValidity;
+ #endif
+     };
+ 
+@@ -471,6 +481,10 @@
+     SwapChain m_swapChain;
+     RenderTarget* m_target { nullptr };
+     bool m_targetRequiresFullRepaint { false };
++    uint64_t m_gpuFrameGeneration { 0 };
++    uint64_t m_currentGPUFrameGeneration { 0 };
++    uint64_t m_gpuFullRepaintCount { 0 };
++    uint64_t m_gpuIncrementalRepaintCount { 0 };
+     Vector<std::pair<RenderTarget*, Vector<WebCore::IntRect, 1>>, 1> m_pendingFrameNotifyTargets;
+     bool m_isVisible { false };
+     bool m_useExplicitSync { false };
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -1195,6 +1195,7 @@
+     m_pendingFrameNotifyTargets.clear();
+     m_target = nullptr;
+     m_swapChain.reset();
++    m_currentGPUFrameGeneration = 0;
+ }
+ 
+ uint64_t AcceleratedSurface::window()
+@@ -1225,6 +1226,8 @@
+ 
+ void AcceleratedSurface::willRenderFrame(const IntSize& size)
+ {
++    bool isGPUFrame = usesGL();
++    m_currentGPUFrameGeneration = isGPUFrame ? ++m_gpuFrameGeneration : 0;
+     bool sizeDidChange = m_swapChain.resize(size);
+     bool bufferFormatChanged = m_swapChain.handleBufferFormatChangeIfNeeded();
+     if (sizeDidChange || bufferFormatChanged) {
+@@ -1238,10 +1241,13 @@
+     m_targetRequiresFullRepaint = false;
+     if (m_target) {
+ #if ENABLE(DAMAGE_TRACKING)
+-        m_targetRequiresFullRepaint = m_target->requiresFullRepaint();
++        m_targetRequiresFullRepaint = isGPUFrame
++            ? m_target->requiresFullGPURepaint(size, m_currentGPUFrameGeneration)
++            : m_target->requiresFullRepaint();
+         if (m_targetRequiresFullRepaint)
+-            WTFLogAlways("AcceleratedSurface full_repaint=1 target=%llu size=%dx%d",
+-                static_cast<unsigned long long>(m_target->id()), size.width(), size.height());
++            WTFLogAlways("AcceleratedSurface full_repaint=1 target=%llu size=%dx%d gpu=%d generation=%llu",
++                static_cast<unsigned long long>(m_target->id()), size.width(), size.height(), isGPUFrame,
++                static_cast<unsigned long long>(m_currentGPUFrameGeneration));
+ #endif
+         m_target->willRenderFrame();
+     }
+@@ -1327,9 +1333,26 @@
+ #endif
+ 
+     m_target->didRenderFrame();
++#if ENABLE(DAMAGE_TRACKING)
++    if (usesGL()) {
++        m_target->didRenderGPUFrame(m_swapChain.size(), m_currentGPUFrameGeneration, m_targetRequiresFullRepaint);
++        if (m_targetRequiresFullRepaint)
++            ++m_gpuFullRepaintCount;
++        else
++            ++m_gpuIncrementalRepaintCount;
++        auto totalGPUFrames = m_gpuFullRepaintCount + m_gpuIncrementalRepaintCount;
++        if (!(totalGPUFrames % 120))
++            WTFLogAlways("AcceleratedSurface gpu_target_stats generation=%llu full=%llu incremental=%llu target=%llu",
++                static_cast<unsigned long long>(m_currentGPUFrameGeneration),
++                static_cast<unsigned long long>(m_gpuFullRepaintCount),
++                static_cast<unsigned long long>(m_gpuIncrementalRepaintCount),
++                static_cast<unsigned long long>(m_target->id()));
++    }
++#endif
+     m_pendingFrameNotifyTargets.insert(0, { m_target, WTF::move(damageRects) });
+     m_target = nullptr;
+     m_targetRequiresFullRepaint = false;
++    m_currentGPUFrameGeneration = 0;
+ }
+ 
+ void AcceleratedSurface::sendFrame()
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -140,6 +140,12 @@
+     uint32_t format;
+ };
+ 
++struct RGACachedHandle {
++    int fd { -1 };
++    RGAHandleParameters parameters { };
++    RGABufferHandle handle { 0 };
++};
++
+ struct RGARect {
+     int x;
+     int y;
+@@ -172,7 +178,8 @@
+         uint32_t sourceStride, uint32_t sourceFormat, int destinationFD,
+         uint32_t destinationWidth, uint32_t destinationHeight,
+         uint32_t destinationStride, OutputRotation rotation, gint64& durationUS,
+-        RGARect destinationRect = { })
++        RGARect destinationRect = { }, RGACachedHandle* sourceCache = nullptr,
++        RGACachedHandle* destinationCache = nullptr)
+     {
+         durationUS = 0;
+         if (!shouldAttempt())
+@@ -180,7 +187,7 @@
+ 
+         int sourceRGAFormat = drmFormatToRGA(sourceFormat);
+         int transform = rotationToRGA(rotation);
+-        if (sourceRGAFormat < 0 || !transform)
++        if (sourceRGAFormat < 0 || (rotation != OutputRotation::Rotate0 && !transform))
+             return fail("unsupported format or rotation");
+ 
+         RGAHandleParameters sourceParameters {
+@@ -193,13 +200,18 @@
+             destinationHeight,
+             static_cast<uint32_t>(rkFormatBGRA8888),
+         };
+-        RGABufferHandle sourceHandle = m_importBufferFD(sourceFD, &sourceParameters);
+-        RGABufferHandle destinationHandle = m_importBufferFD(destinationFD, &destinationParameters);
++        RGACachedHandle localSource;
++        RGACachedHandle localDestination;
++        auto& cachedSource = sourceCache ? *sourceCache : localSource;
++        auto& cachedDestination = destinationCache ? *destinationCache : localDestination;
++        RGABufferHandle sourceHandle = importHandle(sourceFD, sourceParameters, cachedSource);
++        RGABufferHandle destinationHandle = importHandle(destinationFD,
++            destinationParameters, cachedDestination);
+         if (!sourceHandle || !destinationHandle) {
+-            if (destinationHandle)
+-                m_releaseBufferHandle(destinationHandle);
+-            if (sourceHandle)
+-                m_releaseBufferHandle(sourceHandle);
++            if (!sourceCache)
++                releaseCachedHandle(cachedSource);
++            if (!destinationCache)
++                releaseCachedHandle(cachedDestination);
+             return fail("importbuffer_fd failed");
+         }
+ 
+@@ -216,28 +228,43 @@
+         bool useDestinationRect = destinationRect.x || destinationRect.y
+             || destinationRect.width != static_cast<int>(destinationWidth)
+             || destinationRect.height != static_cast<int>(destinationHeight);
+-        if (useDestinationRect && m_process) {
++        bool useProcess = m_process
++            && (rotation == OutputRotation::Rotate0 || useDestinationRect);
++        if (useProcess) {
+             RGABuffer pattern { };
+             RGARect sourceRect { 0, 0, static_cast<int>(sourceWidth),
+                 static_cast<int>(sourceHeight) };
+             RGARect patternRect { };
+             result = m_process(source, destination, pattern, sourceRect,
+                 destinationRect, patternRect, transform);
+-        } else if (!useDestinationRect)
++        } else if (!useDestinationRect && rotation != OutputRotation::Rotate0)
+             result = m_rotate(source, destination, transform, 1);
+         else
+             result = 0;
+         durationUS = g_get_monotonic_time() - startUS;
+-        m_releaseBufferHandle(destinationHandle);
+-        m_releaseBufferHandle(sourceHandle);
++        if (!sourceCache)
++            releaseCachedHandle(cachedSource);
++        if (!destinationCache)
++            releaseCachedHandle(cachedDestination);
+         if (result <= 0)
+-            return fail(useDestinationRect
+-                ? "improcess inset rotation failed" : "imrotate_t failed", result);
++            return fail(useProcess ? "improcess blit failed"
++                : useDestinationRect ? "improcess inset rotation unavailable"
++                                     : "imrotate_t failed", result);
+ 
+         m_consecutiveFailures = 0;
+         return true;
+     }
+ 
++    void releaseCachedHandle(RGACachedHandle& cache)
++    {
++        if (cache.handle && m_releaseBufferHandle)
++            m_releaseBufferHandle(cache.handle);
++        cache = { };
++    }
++
++    uint64_t importCount() const { return m_importCount; }
++    uint64_t reuseCount() const { return m_reuseCount; }
++
+ private:
+     using ImportBufferFDFunction = RGABufferHandle (*)(int, RGAHandleParameters*);
+     using WrapBufferHandleFunction = RGABuffer (*)(RGABufferHandle, int, int, int, int, int);
+@@ -281,6 +308,28 @@
+             return 0;
+         }
+         return 0;
++    }
++
++    RGABufferHandle importHandle(int fd, const RGAHandleParameters& parameters,
++        RGACachedHandle& cache)
++    {
++        bool matches = cache.handle && cache.fd == fd
++            && cache.parameters.width == parameters.width
++            && cache.parameters.height == parameters.height
++            && cache.parameters.format == parameters.format;
++        if (matches) {
++            m_reuseCount++;
++            return cache.handle;
++        }
++        releaseCachedHandle(cache);
++        cache.fd = fd;
++        cache.parameters = parameters;
++        cache.handle = m_importBufferFD(fd, &cache.parameters);
++        if (cache.handle)
++            m_importCount++;
++        else
++            cache = { };
++        return cache.handle;
+     }
+ 
+     bool load()
+@@ -336,6 +385,8 @@
+     ReleaseBufferHandleFunction m_releaseBufferHandle { nullptr };
+     RotateFunction m_rotate { nullptr };
+     ProcessFunction m_process { nullptr };
++    uint64_t m_importCount { 0 };
++    uint64_t m_reuseCount { 0 };
+ };
+ 
+ struct ChromeGlyph {
+@@ -2297,6 +2348,7 @@
+     void* sourceMapping { nullptr };
+     size_t sourceMappingSize { 0 };
+     uint32_t sourceMappingStride { 0 };
++    RGACachedHandle rgaSourceHandle;
+     void resetSourceMapping();
+     ~WPEBufferDRMUserData();
+ };
+@@ -2452,6 +2504,7 @@
+     ~DRMScanoutBuffer()
+     {
+         finishRGAAccess();
++        RockchipRGA::singleton().releaseCachedHandle(m_rgaDestinationHandle);
+         if (m_rgaPrimeFD >= 0)
+             close(m_rgaPrimeFD);
+ 
+@@ -2715,9 +2768,11 @@
+                 struct dma_buf_sync clearEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
+                 ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &clearEnd);
+             }
++            auto* userData = ensureBufferUserData(buffer);
+             if (m_rgaPrimeFD >= 0 && rga.rotate(sourceFD, sourceWidth, sourceHeight,
+                     sourceStride, sourceFormat, m_rgaPrimeFD, m_width, m_height,
+-                    m_pitch, rotation, m_lastRGADurationUS, destinationRect)) {
++                    m_pitch, rotation, m_lastRGADurationUS, destinationRect,
++                    &userData->rgaSourceHandle, &m_rgaDestinationHandle)) {
+                 struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
+                 if (ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &syncStart) < 0)
+                     g_warning("WPEViewDRM rga destination sync start failed: %s", strerror(errno));
+@@ -3006,6 +3061,7 @@
+     uint32_t m_frameBufferID { 0 };
+     void* m_mapping { nullptr };
+     int m_rgaPrimeFD { -1 };
++    RGACachedHandle m_rgaDestinationHandle;
+     bool m_rgaCPUAccessActive { false };
+     bool m_lastCopyUsedRGA { false };
+     bool m_lastCopyFellBackFromRGA { false };
+@@ -3031,6 +3087,7 @@
+ WPEBufferDRMUserData::~WPEBufferDRMUserData()
+ {
+     delete scanoutBuffer;
++    RockchipRGA::singleton().releaseCachedHandle(rgaSourceHandle);
+     resetSourceMapping();
+ }
+ 
+@@ -3202,10 +3259,16 @@
+     if (committedWebFrame) {
+         priv->committedFrameGeneration++;
+         if (priv->preparedBaseGeneration) {
+-            priv->chromeBasePixels = WTF::move(priv->preparedChromeBasePixels);
+-            priv->chromeBaseWidth = std::exchange(priv->preparedChromeBaseWidth, 0);
+-            priv->chromeBaseHeight = std::exchange(priv->preparedChromeBaseHeight, 0);
+-            priv->chromeBasePitch = std::exchange(priv->preparedChromeBasePitch, 0);
++            // Swap the storage instead of moving it one way. The previous
++            // committed base becomes the next prepared buffer, so animated
++            // pages do not allocate a full-panel vector every frame.
++            std::swap(priv->chromeBasePixels, priv->preparedChromeBasePixels);
++            priv->chromeBaseWidth = priv->preparedChromeBaseWidth;
++            priv->chromeBaseHeight = priv->preparedChromeBaseHeight;
++            priv->chromeBasePitch = priv->preparedChromeBasePitch;
++            priv->preparedChromeBaseWidth = 0;
++            priv->preparedChromeBaseHeight = 0;
++            priv->preparedChromeBasePitch = 0;
+             priv->chromeBaseGeneration = priv->committedFrameGeneration;
+             priv->preparedBaseGeneration = 0;
+         }
+@@ -3228,10 +3291,12 @@
+     auto commitAverageMS = priv->commitWindowCount ? priv->commitWindowTotalUS / 1000. / priv->commitWindowCount : 0.;
+     auto rgaAverageMS = priv->rgaRotateWindowCount
+         ? priv->rgaRotateWindowTotalUS / 1000. / priv->rgaRotateWindowCount : 0.;
+-    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f frame_generation=%" G_GUINT64_FORMAT " chrome_base_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
++    auto& rga = RockchipRGA::singleton();
++    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " rga_imports=%" G_GUINT64_FORMAT " rga_reuses=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f frame_generation=%" G_GUINT64_FORMAT " chrome_base_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+         fps, copyAverageMS, priv->copyWindowMaxUS / 1000., rgaAverageMS,
+         priv->rgaRotateWindowMaxUS / 1000., priv->rgaRotateWindowCount,
+-        priv->rgaCPUFallbackWindowCount, commitAverageMS, priv->commitWindowMaxUS / 1000.,
++        priv->rgaCPUFallbackWindowCount, rga.importCount(), rga.reuseCount(),
++        commitAverageMS, priv->commitWindowMaxUS / 1000.,
+         priv->committedFrameGeneration, priv->chromeBaseGeneration,
+         priv->staleChromeRedrawCount, priv->retainedBaseFrameCount, priv->queuedWindowCount,
+         priv->replacedQueuedWindowCount, priv->droppedWindowCount,
+@@ -3718,6 +3783,15 @@
+ static bool captureCommittedChromeBase(WPEViewDRM* view)
+ {
+     auto* priv = view->priv;
++    const auto& chrome = cachedChromeRenderState();
++    bool panelOpen = chrome.panel[0] && strcmp(chrome.panel, "none");
++    // A committed buffer with visible chrome already contains the old
++    // toolbar/menu. Recapturing it as a page base would resurrect that UI on
++    // the next animation frame. Wait for a fresh WebKit frame instead.
++    if (chrome.visible || panelOpen || chromeAnimationActive()) {
++        g_message("WPEViewDRM chrome base capture deferred: committed frame contains native chrome");
++        return false;
++    }
+     auto* buffer = priv->committedScanoutBuffer;
+     priv->chromeBasePixels.clear();
+     priv->chromeBaseWidth = 0;

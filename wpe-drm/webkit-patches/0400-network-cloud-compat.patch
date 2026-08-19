@@ -1,0 +1,236 @@
+diff --git a/Source/WebKit/NetworkProcess/soup/NetworkSessionSoup.cpp b/Source/WebKit/NetworkProcess/soup/NetworkSessionSoup.cpp
+index ef44bcfd..0de7ca05 100644
+--- a/Source/WebKit/NetworkProcess/soup/NetworkSessionSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/NetworkSessionSoup.cpp
+@@ -34,6 +34,7 @@
+ #include <WebCore/NetworkStorageSession.h>
+ #include <WebCore/ResourceRequest.h>
+ #include <WebCore/SoupNetworkSession.h>
++#include <cstring>
+ #include <libsoup/soup.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+@@ -42,6 +43,29 @@ using namespace WebCore;
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(NetworkSessionSoup);
+ 
++static bool allowExpiredCloudGameWebSocketCertificate(SoupMessage* message, GTlsCertificateFlags errors)
++{
++    const char* enabled = g_getenv("WPE_CLOUDGAME_ALLOW_EXPIRED_TLS");
++    if (!enabled || strcmp(enabled, "1") || errors != G_TLS_CERTIFICATE_EXPIRED)
++        return false;
++
++    GUri* uri = soup_message_get_uri(message);
++    const char* host = uri ? g_uri_get_host(uri) : nullptr;
++    static constexpr char suffix[] = ".mhystatic.com";
++    if (!host || g_uri_get_port(uri) != 5443)
++        return false;
++
++    size_t hostLength = strlen(host);
++    constexpr size_t suffixLength = sizeof(suffix) - 1;
++    if (hostLength <= suffixLength
++        || g_ascii_strcasecmp(host + hostLength - suffixLength, suffix))
++        return false;
++
++    g_warning("Allowing expired cloud-game WSS certificate for host=%s port=5443 errors=0x%x",
++        host, static_cast<unsigned>(errors));
++    return true;
++}
++
+ NetworkSessionSoup::NetworkSessionSoup(NetworkProcess& networkProcess, const NetworkSessionCreationParameters& parameters)
+     : NetworkSession(networkProcess, parameters)
+     , m_networkSession(makeUnique<SoupNetworkSession>(m_sessionID))
+@@ -108,6 +132,8 @@ RefPtr<WebSocketTask> NetworkSessionSoup::createWebSocketTask(WebPageProxyIdenti
+         g_signal_connect(soupMessage.get(), "accept-certificate", G_CALLBACK(+[](SoupMessage* message, GTlsCertificate* certificate, GTlsCertificateFlags errors,  NetworkSessionSoup* session) -> gboolean {
+             if (DeprecatedGlobalSettings::allowsAnySSLCertificate())
+                 return TRUE;
++            if (allowExpiredCloudGameWebSocketCertificate(message, errors))
++                return TRUE;
+ 
+             return !session->soupNetworkSession().checkTLSErrors(soup_message_get_uri(message), certificate, errors);
+         }), this);
+diff --git a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+index a06ddeb2..50c5cb90 100644
+--- a/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/WebSocketTaskSoup.cpp
+@@ -34,6 +34,7 @@
+ #include <WebCore/ResourceRequest.h>
+ #include <WebCore/ResourceResponse.h>
+ #include <WebCore/ThreadableWebSocketChannel.h>
++#include <cstring>
+ #include <wtf/RunLoop.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/glib/GSpanExtras.h>
+@@ -49,6 +50,45 @@ static inline bool isConnectionError(GError* error)
+     return error && !g_error_matches(error, SOUP_WEBSOCKET_ERROR, SOUP_WEBSOCKET_ERROR_NOT_WEBSOCKET);
+ }
+ 
++static bool cloudWebSocketDiagnosticsEnabled()
++{
++    static bool enabled = !g_strcmp0(g_getenv("WEBKIT_CLOUD_WEBSOCKET_DIAGNOSTICS"), "1");
++    return enabled;
++}
++
++static void logCloudWebSocketPayload(SoupWebsocketConnection* connection, const char* direction, const char* type, size_t byteCount)
++{
++    if (!cloudWebSocketDiagnosticsEnabled())
++        return;
++
++    GUri* uri = connection ? soup_websocket_connection_get_uri(connection) : nullptr;
++    g_message("WebSocket %s: host=%s port=%d type=%s bytes=%zu",
++        direction,
++        uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++        uri ? g_uri_get_port(uri) : -1,
++        type,
++        byteCount);
++}
++
++static void logCloudWebSocketRequestMetadata(SoupMessageHeaders* headers)
++{
++    if (!cloudWebSocketDiagnosticsEnabled() || !headers)
++        return;
++
++    auto present = [headers](const char* name) {
++        return !!soup_message_headers_get_one(headers, name);
++    };
++    g_message("WebSocket request metadata: host-header=%d extensions=%d fetch-site=%d fetch-mode=%d fetch-dest=%d client-hints=%d accept-language=%d accept-encoding=%d",
++        present("Host"),
++        present("Sec-WebSocket-Extensions"),
++        present("Sec-Fetch-Site"),
++        present("Sec-Fetch-Mode"),
++        present("Sec-Fetch-Dest"),
++        present("Sec-CH-UA"),
++        present("Accept-Language"),
++        present("Accept-Encoding"));
++}
++
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(WebSocketTask);
+ 
+ Ref<WebSocketTask> WebSocketTask::create(NetworkSocketChannel& channel, const WebCore::ResourceRequest& request, SoupSession* session, SoupMessage* msg, const String& protocol)
+@@ -100,10 +140,57 @@ WebSocketTask::WebSocketTask(NetworkSocketChannel& channel, const WebCore::Resou
+                 task->m_delayFailTimer.startOneShot(NetworkProcess::randomClosedPortDelay());
+                 return;
+             }
+-            if (connection)
++            if (connection) {
++                SoupMessage* message = task->m_handshakeMessage.get();
++                GUri* uri = message ? soup_message_get_uri(message) : nullptr;
++                SoupMessageHeaders* requestHeaders = message ? soup_message_get_request_headers(message) : nullptr;
++                const char* protocol = soup_websocket_connection_get_protocol(connection.get());
++                const char* cookie = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Cookie") : nullptr;
++                if (cloudWebSocketDiagnosticsEnabled())
++                    g_message("WebSocket handshake connected: host=%s port=%d protocol=%s cookie-present=%d",
++                        uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++                        uri ? g_uri_get_port(uri) : -1,
++                        protocol ? protocol : "(none)",
++                        !!cookie);
+                 task->didConnect(WTF::move(connection));
+-            else
++            } else {
++                SoupMessage* message = task->m_handshakeMessage.get();
++                GUri* uri = message ? soup_message_get_uri(message) : nullptr;
++                unsigned status = message ? soup_message_get_status(message) : 0;
++                const char* reason = message ? soup_message_get_reason_phrase(message) : nullptr;
++                SoupMessageHeaders* requestHeaders = message ? soup_message_get_request_headers(message) : nullptr;
++                SoupMessageHeaders* responseHeaders = message ? soup_message_get_response_headers(message) : nullptr;
++                const char* origin = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Origin") : nullptr;
++                const char* requestedProtocol = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Sec-WebSocket-Protocol") : nullptr;
++                const char* userAgent = requestHeaders ? soup_message_headers_get_one(requestHeaders, "User-Agent") : nullptr;
++                const char* cookie = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Cookie") : nullptr;
++                const char* authorization = requestHeaders ? soup_message_headers_get_one(requestHeaders, "Authorization") : nullptr;
++                const char* server = responseHeaders ? soup_message_headers_get_one(responseHeaders, "Server") : nullptr;
++                const char* contentType = responseHeaders ? soup_message_headers_get_content_type(responseHeaders, nullptr) : nullptr;
++                const char* setCookie = responseHeaders ? soup_message_headers_get_one(responseHeaders, "Set-Cookie") : nullptr;
++                g_warning("WebSocket handshake failed: host=%s port=%d status=%u reason=%s error-domain=%s error-code=%d error=%s",
++                    uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++                    uri ? g_uri_get_port(uri) : -1,
++                    status,
++                    reason ? reason : "(none)",
++                    error.get() ? g_quark_to_string(error->domain) : "(none)",
++                    error.get() ? error->code : 0,
++                    error.get() ? error->message : "(none)");
++                g_warning("WebSocket handshake request metadata: origin=%s protocol=%s user-agent=%s cookie-present=%d cookie-bytes=%zu authorization-present=%d",
++                    origin ? origin : "(none)",
++                    requestedProtocol ? requestedProtocol : "(none)",
++                    userAgent ? userAgent : "(none)",
++                    !!cookie,
++                    cookie ? strlen(cookie) : 0,
++                    !!authorization);
++                g_warning("WebSocket handshake response metadata: server=%s content-type=%s content-length=%" G_GOFFSET_FORMAT " set-cookie-present=%d",
++                    server ? server : "(none)",
++                    contentType ? contentType : "(none)",
++                    responseHeaders ? soup_message_headers_get_content_length(responseHeaders) : static_cast<goffset>(-1),
++                    !!setCookie);
++                logCloudWebSocketRequestMetadata(requestHeaders);
+                 task->didFail(String::fromUTF8(error->message));
++            }
+         }, this);
+ 
+     g_signal_connect(msg, "starting", G_CALLBACK(+[](SoupMessage* msg, WebSocketTask* task) {
+@@ -164,6 +251,8 @@ void WebSocketTask::didReceiveMessageCallback(WebSocketTask* task, SoupWebsocket
+         return;
+ 
+     std::span data = span(message);
++    logCloudWebSocketPayload(task->m_connection.get(), "inbound",
++        dataType == SOUP_WEBSOCKET_DATA_TEXT ? "text" : "binary", data.size());
+     switch (dataType) {
+     case SOUP_WEBSOCKET_DATA_TEXT:
+         protect(task->m_channel)->didReceiveText(String::fromUTF8(data));
+@@ -179,6 +268,10 @@ void WebSocketTask::didReceiveErrorCallback(WebSocketTask* task, GError* error)
+     if (g_cancellable_is_cancelled(task->m_cancellable.get()))
+         return;
+ 
++    g_warning("WebSocket connection error: domain=%s code=%d message=%s",
++        error ? g_quark_to_string(error->domain) : "(none)",
++        error ? error->code : 0,
++        error ? error->message : "(none)");
+     task->didFail(String::fromUTF8(error->message));
+ }
+ 
+@@ -214,7 +307,15 @@ void WebSocketTask::didCloseCallback(WebSocketTask* task)
+         // The connection was closed but close frame was not received or sent.
+         code = SOUP_WEBSOCKET_CLOSE_ABNORMAL;
+     }
+-    task->didClose(code, String::fromUTF8(soup_websocket_connection_get_close_data(task->m_connection.get())));
++    auto reason = String::fromUTF8(soup_websocket_connection_get_close_data(task->m_connection.get()));
++    if (cloudWebSocketDiagnosticsEnabled()) {
++        GUri* uri = task->m_connection ? soup_websocket_connection_get_uri(task->m_connection.get()) : nullptr;
++        g_message("WebSocket closed: host=%s port=%d code=%u reason_bytes=%u",
++            uri && g_uri_get_host(uri) ? g_uri_get_host(uri) : "(unknown)",
++            uri ? g_uri_get_port(uri) : -1,
++            code, reason.sizeInBytes());
++    }
++    task->didClose(code, WTF::move(reason));
+ }
+ 
+ void WebSocketTask::didClose(unsigned short code, const String& reason)
+@@ -229,6 +330,7 @@ void WebSocketTask::didClose(unsigned short code, const String& reason)
+ void WebSocketTask::sendString(std::span<const uint8_t> utf8, CompletionHandler<void()>&& callback)
+ {
+     if (m_connection && soup_websocket_connection_get_state(m_connection.get()) == SOUP_WEBSOCKET_STATE_OPEN) {
++        logCloudWebSocketPayload(m_connection.get(), "outbound", "text", utf8.size());
+         // Soup is going to copy the data immediately, so we can use g_bytes_new_static() here to avoid more data copies.
+         GRefPtr<GBytes> bytes = adoptGRef(g_bytes_new_static(utf8.data(), utf8.size()));
+         soup_websocket_connection_send_message(m_connection.get(), SOUP_WEBSOCKET_DATA_TEXT, bytes.get());
+@@ -238,8 +340,10 @@ void WebSocketTask::sendString(std::span<const uint8_t> utf8, CompletionHandler<
+ 
+ void WebSocketTask::sendData(std::span<const uint8_t> data, CompletionHandler<void()>&& callback)
+ {
+-    if (m_connection && soup_websocket_connection_get_state(m_connection.get()) == SOUP_WEBSOCKET_STATE_OPEN)
++    if (m_connection && soup_websocket_connection_get_state(m_connection.get()) == SOUP_WEBSOCKET_STATE_OPEN) {
++        logCloudWebSocketPayload(m_connection.get(), "outbound", "binary", data.size());
+         soup_websocket_connection_send_binary(m_connection.get(), data.data(), data.size());
++    }
+     callback();
+ }
+ 
+@@ -248,6 +352,9 @@ void WebSocketTask::close(int32_t code, const String& reason)
+     if (m_receivedDidClose)
+         return;
+ 
++    if (cloudWebSocketDiagnosticsEnabled())
++        g_message("WebSocket local close requested: code=%d reason_bytes=%u connected=%d", code, reason.sizeInBytes(), !!m_connection);
++
+     if (!m_connection) {
+         g_cancellable_cancel(m_cancellable.get());
+         didClose(code ? code : SOUP_WEBSOCKET_CLOSE_ABNORMAL, reason);

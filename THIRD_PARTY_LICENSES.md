@@ -84,7 +84,8 @@ found at: https://www.gnu.org/licenses/old-licenses/lgpl-2.0.html
 
 Because this file (and other WebKit-side patches described in
 `wpe-drm/webkit-patches/README.md`) is compiled into the custom
-`libWPEWebKit-2.0.so.1.10.2` binary shipped inside
+WebKit 2.53.3 runtime (upstream file version 1.10.2), shipped as the single
+`libWPEWebKit-2.0.so.1` binary inside
 `assets/wpe-runtime/lib/` as part of the packaged `.amr`, the LGPL requires
 that recipients of the binary be able to obtain (or be given a way to
 rebuild/relink) the corresponding source of the LGPL-covered portions.
@@ -96,7 +97,7 @@ To stay compliant, this project should:
    (per the existing `scripts/sync_generated.sh` process).
 2. Publish or otherwise make available the full patched WebKit source tree
    (or a diff against the corresponding upstream WPE WebKit release tag)
-   that was used to build `libWPEWebKit-2.0.so.1.10.2`, so that a recipient
+   that was used to build the packaged `libWPEWebKit-2.0.so.1`, so that a recipient
    of the `.amr` package can reproduce or relink the library.
 3. Retain all original copyright/license headers in any file copied from,
    or patched against, the WebKit source tree.
@@ -105,7 +106,20 @@ If the full patched WebKit source tree cannot be published for any reason,
 consult legal counsel — simply shipping the compiled `.so` without a way to
 obtain corresponding source does not satisfy the LGPL.
 
-## 3. Other WebKit subsystem patches (not vendored in this repo)
+## 3. Rockchip librga (Apache-2.0)
+
+`assets/wpe-runtime/lib/librga.so.2` is the Rockchip RGA userspace
+library used for hardware-assisted framebuffer rotation. The bundled ARM64
+binary has SHA-256
+`8935a536e27ec6a88b258a7886ab656076317d5aedfa9edd9aa0019a752ebc3c`.
+The minimal IM2D ABI declarations in `wpe-drm/WPEViewDRM.cpp` and
+`tools/diagnostics/rga_rotate_probe.c` mirror the upstream Apache-2.0 headers
+from https://github.com/airockchip/librga.
+
+Rockchip librga is licensed under the Apache License, Version 2.0. A copy of
+that license is available at https://www.apache.org/licenses/LICENSE-2.0.
+
+## 4. Other WebKit subsystem patches (not vendored in this repo)
 
 `wpe-drm/webkit-patches/README.md` documents additional source-level patches
 applied directly to the build-server WebKit tree (outside files mirrored
@@ -132,5 +146,6 @@ source" obligation described above applies to them.
 | --- | --- | --- |
 | `wpe-drm/WPEViewDRM.cpp` and other WPEPlatform DRM backend files | BSD-2-Clause | Mirror of upstream WPE WebKit file |
 | `wpe-drm/GStreamerHolePunchQuirkRockchip.{cpp,h}` | LGPL-2.0-or-later | Original quirk, using WebCore file header/license |
+| `assets/wpe-runtime/lib/librga.so.2` and minimal IM2D ABI declarations | Apache-2.0 | Rockchip RGA runtime and header-compatible ABI declarations |
 | `wpe-drm/webkit-patches/*` (patches, not vendored here) | LGPL-2.0-or-later / BSD-2-Clause (per upstream file) | Applied only on build server; see `wpe-drm/webkit-patches/README.md` |
 | Everything else (`src/`, `jsapi/`, `scripts/`, `tools/`, etc.) | MIT | See root `LICENSE` |

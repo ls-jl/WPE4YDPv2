@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MPP Video Smoke Test</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #fff;
+      font: 15px sans-serif;
+    }
+
+    video {
+      width: 100vw;
+      height: 100vh;
+      object-fit: contain;
+      background: #000;
+    }
+
+    #status {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      z-index: 2;
+      padding: 5px 7px;
+      background: rgba(0, 0, 0, 0.6);
+    }
+  </style>
+</head>
+<body>
+  <div id="status">loading</div>
+  <video id="video" src="mpp-smoke.mp4" autoplay muted playsinline loop></video>
+  <script>
+    const status = document.querySelector('#status');
+    const video = document.querySelector('#video');
+
+    function report(event) {
+      const line = `${event} t=${video.currentTime.toFixed(2)} ready=${video.readyState} paused=${video.paused}`;
+      status.textContent = line;
+      console.log(`MPP_VIDEO_TEST ${line}`);
+    }
+
+    for (const event of ['loadedmetadata', 'canplay', 'playing', 'waiting', 'stalled', 'error'])
+      video.addEventListener(event, () => report(event));
+
+    video.play()
+      .then(() => report('play-ok'))
+      .catch(error => report(`play-failed:${error.name}`));
+
+    setInterval(() => report('tick'), 1000);
+  </script>
+</body>
+</html>

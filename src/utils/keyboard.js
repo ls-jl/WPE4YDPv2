@@ -1,4 +1,5 @@
 import globalModule from 'global'
+import { parseTextEditResult } from './keyboard-event'
 
 let globalManager = null
 
@@ -7,31 +8,6 @@ export function getGlobalModule() {
     globalManager = new globalModule.Global()
   }
   return globalManager
-}
-
-function normalizeText(value) {
-  if (value && typeof value === 'object') {
-    if (typeof value.value === 'string') return value.value
-    if (typeof value.text === 'string') return value.text
-    if (typeof value.contents === 'string') return value.contents
-    if (value.records && value.records[0] && typeof value.records[0].text === 'string') {
-      return value.records[0].text
-    }
-  }
-  return typeof value === 'string' ? value : ''
-}
-
-function parseTextEditResult(jsonData) {
-  try {
-    const result = JSON.parse(jsonData || '{}')
-    return {
-      confirmed: !!(result && result.editConfirmed),
-      text: normalizeText(result && result.text),
-    }
-  } catch (err) {
-    console.warn(`keyboard parse result failed ${err}`)
-  }
-  return { confirmed: false, text: '' }
 }
 
 function clampMaxlength(value) {
@@ -49,6 +25,8 @@ export class KeyboardSession {
     this.onCancel = onCancel
     this.stripNewlines = true
     this.closeDelayMs = 350
+    this.closedUuids = {}
+    this.closeTimers = {}
   }
 
   mount() {
@@ -63,7 +41,7 @@ export class KeyboardSession {
       setTimeout(() => {
         if (!this.activeUuid || uuid !== this.activeUuid) return
         if (result.confirmed) {
-          this.finish(result.text || '')
+          this.finish(result.found ? result.text : '')
         } else {
           this.cancel()
         }
@@ -148,33 +126,36 @@ export class KeyboardSession {
   }
 
   deferClose(uuid) {
-    if (!uuid) return
-    setTimeout(() => {
-      const gm = getGlobalModule()
-      if (gm.closeTextEdit) {
-        try {
-          gm.closeTextEdit(uuid)
-          console.warn(`keyboard global closeTextEdit uuid ${uuid}`)
-        } catch (err) {
-          console.warn(`keyboard closeTextEdit failed ${err}`)
-        }
-      }
+    if (!uuid || this.closedUuids[uuid] || this.closeTimers[uuid]) return
+    this.closeTimers[uuid] = setTimeout(() => {
+      delete this.closeTimers[uuid]
+      this.closeUuid(uuid, 'deferred')
     }, this.closeDelayMs)
+  }
+
+  closeUuid(uuid, reason) {
+    if (!uuid || this.closedUuids[uuid]) return
+    if (this.closeTimers[uuid]) {
+      clearTimeout(this.closeTimers[uuid])
+      delete this.closeTimers[uuid]
+    }
+    this.closedUuids[uuid] = true
+    setTimeout(() => { delete this.closedUuids[uuid] }, 60000)
+    const gm = getGlobalModule()
+    if (!gm.closeTextEdit) return
+    try {
+      gm.closeTextEdit(uuid)
+      console.warn(`keyboard global closeTextEdit uuid=${uuid} reason=${reason || ''}`)
+    } catch (err) {
+      console.warn(`keyboard closeTextEdit failed ${err}`)
+    }
   }
 
   close() {
     const uuid = this.activeUuid
     if (!uuid) return
-    const gm = getGlobalModule()
-    if (gm.closeTextEdit) {
-      try {
-        gm.closeTextEdit(uuid)
-        console.warn(`keyboard global close uuid ${uuid}`)
-      } catch (err) {
-        console.warn(`keyboard close failed ${err}`)
-      }
-    }
     this.activeUuid = ''
+    this.closeUuid(uuid, 'session close')
   }
 
   isActive() {

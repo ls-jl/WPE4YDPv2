@@ -1,0 +1,5 @@
+wpe-drm/ChromeMotionState.h
+wpe-drm/VideoReleaseQueue.h
+wpe-drm/GPUFrameValidity.h
+wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.h
+wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.cc
