@@ -12,6 +12,8 @@ int main(void)
     assert(!strcmp(browser_language_code(BROWSER_LANGUAGE_EN_US), "en-US"));
     assert(!strcmp(browser_i18n(BROWSER_LANGUAGE_ZH_CN, "settings"), "设置"));
     assert(!strcmp(browser_i18n(BROWSER_LANGUAGE_EN_US, "settings"), "SETTINGS"));
+    assert(!strcmp(browser_i18n(BROWSER_LANGUAGE_ZH_CN, "rotation"), "旋转"));
+    assert(!strcmp(browser_i18n(BROWSER_LANGUAGE_EN_US, "rotation_270"), "ROTATE 270°"));
     assert(!strcmp(browser_i18n(BROWSER_LANGUAGE_EN_US, "unknown"), "unknown"));
     return 0;
 }

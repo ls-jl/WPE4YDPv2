@@ -1068,14 +1068,20 @@ gboolean browser_profile_store_save_global_settings(BrowserProfileStore *store,
                                                     GError **error)
 {
     g_return_val_if_fail(store && settings, FALSE);
-    return set_meta(store, "ui_theme",
+    if (!begin_transaction(store->database, error))
+        return FALSE;
+    gboolean success = set_meta(store, "ui_theme",
                     !g_ascii_strcasecmp(settings->theme, "dark") ? "dark" : "light", error)
         && set_meta(store, "toolbar_auto_hide",
                     settings->toolbar_auto_hide ? "1" : "0", error)
         && set_meta(store, "toolbar_gesture_in_immersive",
                     settings->toolbar_gesture_in_immersive ? "1" : "0", error)
         && set_meta(store, "gpu_acceleration",
-                    settings->gpu_acceleration ? "1" : "0", error);
+                    settings->gpu_acceleration ? "1" : "0", error)
+        && commit_transaction(store->database, error);
+    if (!success)
+        rollback_transaction(store->database);
+    return success;
 }
 
 static gboolean insert_navigation(sqlite3 *database, int64_t tab_id, int kind,

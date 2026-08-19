@@ -9,9 +9,18 @@ rm -f "$EXIT_STATUS_FILE"
 write_exit_status() {
     reason="$1"
     code="$2"
+    browser_mode="${3:-}"
     tmp="$EXIT_STATUS_FILE.tmp.$$"
-    printf '{"reason":"%s","code":%s,"timestamp":%s}\n' \
-        "$reason" "$code" "$(date +%s 2>/dev/null || echo 0)" >"$tmp" || return 0
+    case "$browser_mode" in
+        native|rotate90|rotate180|rotate270)
+            printf '{"reason":"%s","code":%s,"browserMode":"%s","timestamp":%s}\n' \
+                "$reason" "$code" "$browser_mode" "$(date +%s 2>/dev/null || echo 0)" >"$tmp" || return 0
+            ;;
+        *)
+            printf '{"reason":"%s","code":%s,"timestamp":%s}\n' \
+                "$reason" "$code" "$(date +%s 2>/dev/null || echo 0)" >"$tmp" || return 0
+            ;;
+    esac
     chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$EXIT_STATUS_FILE" 2>/dev/null || rm -f "$tmp"
 }
@@ -210,6 +219,19 @@ export WPE_CHROME_RENDER_STATE="${WPE_CHROME_RENDER_STATE:-$VAR_DIR/chrome-rende
 export WPE_BROWSER_DB="${WPE_BROWSER_DB:-$VAR_DIR/browser.sqlite3}"
 export WPE_PROFILES_DIR="${WPE_PROFILES_DIR:-$VAR_DIR/profiles}"
 export WPE_PROFILE_SWITCH_FILE="${WPE_PROFILE_SWITCH_FILE:-$VAR_DIR/profile-switch.request}"
+export WPE_DISPLAY_MODE_FILE="${WPE_DISPLAY_MODE_FILE:-$VAR_DIR/display-mode}"
+case "${WPE_BROWSER_MODE:-}" in
+    native|rotate90|rotate180|rotate270) ;;
+    *)
+        SAVED_DISPLAY_MODE="$(sed -n '1p' "$WPE_DISPLAY_MODE_FILE" 2>/dev/null || true)"
+        case "$SAVED_DISPLAY_MODE" in
+            native|rotate90|rotate180|rotate270) WPE_BROWSER_MODE="$SAVED_DISPLAY_MODE" ;;
+            *) WPE_BROWSER_MODE=native ;;
+        esac
+        export WPE_BROWSER_MODE
+        ;;
+esac
+export WPE_BROWSER_MODE
 export WPE_CHROME_FONT="${WPE_CHROME_FONT:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Regular.ttf}"
 export WPE_CHROME_FONT_MEDIUM="${WPE_CHROME_FONT_MEDIUM:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Medium.ttf}"
 export WPE_CHROME_FONT_BOLD="${WPE_CHROME_FONT_BOLD:-$DIR/assets/fonts/miniapp/HarmonyOS_Sans_SC_Bold.ttf}"
@@ -220,10 +242,14 @@ export WPE_DRM_FIT="${WPE_DRM_FIT:-panel-native}"
 REQUESTED_ROTATION="${4:-${WPE_DRM_ROTATION:-${WPE_PANEL_ROTATION:-0}}}"
 export WPE_PANEL_ROTATION="${WPE_PANEL_ROTATION:-$REQUESTED_ROTATION}"
 export WPE_TOUCH_ROTATION="${WPE_TOUCH_ROTATION:-$WPE_PANEL_ROTATION}"
-case "$WPE_PANEL_ROTATION" in
-    0|360|-0) export WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT="${WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT:-0}" ;;
-    *) export WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT="${WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT:-1}" ;;
-esac
+if [ "${WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT+x}" = x ]; then
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE_SET=1
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE="$WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT"
+else
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE_SET=0
+    export WPE_FORCE_FULL_REPAINT_OVERRIDE=
+fi
+unset WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT
 export WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS="${WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT_ANIMATIONS:-0}"
 PANEL_W="${WPE_PANEL_SIZE%x*}"
 PANEL_H="${WPE_PANEL_SIZE#*x}"
@@ -343,7 +369,10 @@ export WPE_DRM_BUFFER_PATH="${WPE_DRM_BUFFER_PATH:-dma_heap}"
 export WPE_DRM_RUNTIME_DIR="${WPE_DRM_RUNTIME_DIR:-$VAR_DIR/runtime-tmp}"
 export WPE_KEYBOARD_DIR="${WPE_KEYBOARD_DIR:-$VAR_DIR/keyboard}"
 export WPE_RAW_TOUCH="${WPE_RAW_TOUCH:-1}"
-export WPE_TOUCH_DEVICE="${WPE_TOUCH_DEVICE:-/dev/input/by-path/hyn_ts}"
+export WPE_TOUCH_DEVICE="${WPE_TOUCH_DEVICE:-}"
+if [ -z "$WPE_TOUCH_DEVICE" ]; then
+    echo "Raw touch disabled: WPE_TOUCH_DEVICE was not supplied by system display config" >&2
+fi
 export WPE_TOUCH_OFFSET_X="${WPE_TOUCH_OFFSET_X:-0}"
 export WPE_TOUCH_OFFSET_Y="${WPE_TOUCH_OFFSET_Y:-0}"
 export WPE_SEND_TOUCH_EVENTS="${WPE_SEND_TOUCH_EVENTS:-1}"
@@ -440,16 +469,30 @@ run_browser_profile() {
     export WPE_GPU_READY_FILE="$GPU_READY_FILE"
     "$DIR/wpe-drm-minimal" "$URL" "$DRM" "$VIEWPORT" "$ROTATION" &
     BROWSER_PID=$!
-    wait "$BROWSER_PID"
-    BROWSER_STATUS=$?
+    if wait "$BROWSER_PID"; then
+        BROWSER_STATUS=0
+    else
+        BROWSER_STATUS=$?
+    fi
+    if [ "$TERMINATING" != 0 ]; then
+        # A trapped signal can interrupt wait before the child is reaped. Keep
+        # the PID until one final wait completes; the JSAPI process-group
+        # watchdog remains the bounded SIGKILL fallback for a wedged child.
+        kill "$BROWSER_PID" 2>/dev/null || true
+        wait "$BROWSER_PID" 2>/dev/null || true
+        BROWSER_STATUS=0
+    fi
     BROWSER_PID=
     return "$BROWSER_STATUS"
 }
 
 run_profile_switch_loop() {
     while :; do
-        run_browser_profile
-        BROWSER_STATUS=$?
+        if run_browser_profile; then
+            BROWSER_STATUS=0
+        else
+            BROWSER_STATUS=$?
+        fi
         if [ "$BROWSER_STATUS" -ne 75 ] || [ "$TERMINATING" != 0 ]; then
             return "$BROWSER_STATUS"
         fi
@@ -493,18 +536,24 @@ fi
 
 while :; do
     load_gpu_mode_preference
-    select_render_profile
-    SELECT_STATUS=$?
+    if select_render_profile; then
+        SELECT_STATUS=0
+    else
+        SELECT_STATUS=$?
+    fi
     if [ "$SELECT_STATUS" -ne 0 ]; then
         exit "$SELECT_STATUS"
     fi
 
-    echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE gpu_status=$WPE_GPU_STATUS compositor=$WEBKIT_SKIA_CPU_COMPOSITOR url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT rga_rotation=$WPE_DRM_RGA_ROTATION video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
+    echo "WPE launch: profile=$SELECTED_PROFILE gpu_mode=$GPU_MODE gpu_status=$WPE_GPU_STATUS compositor=$WEBKIT_SKIA_CPU_COMPOSITOR full_repaint=$WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT url=$URL drm=$DRM panel=$WPE_PANEL_SIZE drm_mode=$WPE_DRM_MODE viewport=$VIEWPORT layout_template=${WPE_LAYOUT_TEMPLATE:-unknown} layout_rotation=${WPE_LAYOUT_ROTATION:-unknown} output_rotation=$ROTATION rotation=$ROTATION panel_rotation=$WPE_PANEL_ROTATION touch_rotation=$WPE_TOUCH_ROTATION touch_device=$WPE_TOUCH_DEVICE touch_offset=$WPE_TOUCH_OFFSET_X,$WPE_TOUCH_OFFSET_Y browser_mode=${WPE_BROWSER_MODE:-unknown} display_source=${WPE_DISPLAY_SOURCE:-unknown} fit=$WPE_DRM_FIT rga_rotation=$WPE_DRM_RGA_ROTATION video_fit=${WPE_VIDEO_OVERLAY_FIT:-disabled} video_rotation=${WPE_VIDEO_OVERLAY_ROTATION:-disabled} chrome_layout=$WPE_CHROME_LAYOUT gst_source=$GST_SOURCE panel_crtc_x=$WPE_PANEL_CRTC_X rotated_x=${WPE_DRM_ROTATED_X:-auto} touch_active_x=$WPE_TOUCH_ACTIVE_X fps=$WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS max_fps=$WPE_DRM_MAX_FPS web_mem_mb=$WPE_WEB_PROCESS_MEMORY_LIMIT_MB mem_pressure_monitor=$WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR heap=$WPE_DRM_DMA_HEAP buffer_path=$WPE_DRM_BUFFER_PATH keyboard_dir=$WPE_KEYBOARD_DIR browser_db=$WPE_BROWSER_DB profiles_dir=$WPE_PROFILES_DIR profile_override=${WPE_PROFILE_OVERRIDE:-last}"
 
-    run_profile_switch_loop
-    STATUS=$?
+    if run_profile_switch_loop; then
+        STATUS=0
+    else
+        STATUS=$?
+    fi
     if [ "$SELECTED_PROFILE" = gpu ] && [ "$TERMINATING" = 0 ] && \
-       [ "$STATUS" -ne 73 ] && [ "$STATUS" -ne 74 ] && \
+       [ "$STATUS" -ne 72 ] && [ "$STATUS" -ne 73 ] && [ "$STATUS" -ne 74 ] && \
        { [ "$STATUS" -eq 91 ] || [ ! -f "$GPU_READY_FILE" ]; }; then
         if [ "$GPU_MODE" = required ]; then
             echo "WPE fatal: required GPU launch failed status=$STATUS ready=0"
@@ -515,8 +564,11 @@ while :; do
         configure_cpu_profile
         SELECTED_PROFILE=cpu-fallback
         export WPE_GPU_STATUS=fallback
-        run_profile_switch_loop
-        STATUS=$?
+        if run_profile_switch_loop; then
+            STATUS=0
+        else
+            STATUS=$?
+        fi
     fi
 
     if [ "$STATUS" -ne 73 ]; then
@@ -533,7 +585,20 @@ while :; do
     echo "WPE GPU mode restart: mode=$GPU_MODE count=$GPU_RESTART_COUNT"
 done
 
-if [ "$STATUS" -eq 74 ]; then
+if [ "$TERMINATING" != 0 ]; then
+    echo "WPE external shutdown completed"
+    rm -f "$EXIT_STATUS_FILE"
+    STATUS=0
+elif [ "$STATUS" -eq 72 ]; then
+    DISPLAY_MODE="$(sed -n '1p' "$WPE_DISPLAY_MODE_FILE" 2>/dev/null || true)"
+    case "$DISPLAY_MODE" in
+        native|rotate90|rotate180|rotate270) ;;
+        *) DISPLAY_MODE="${WPE_BROWSER_MODE:-native}" ;;
+    esac
+    echo "WPE rotation change completed mode=$DISPLAY_MODE"
+    write_exit_status rotation_change 72 "$DISPLAY_MODE"
+    STATUS=0
+elif [ "$STATUS" -eq 74 ]; then
     echo "WPE user shutdown completed"
     write_exit_status user_shutdown 74
     STATUS=0

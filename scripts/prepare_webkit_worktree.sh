@@ -22,7 +22,12 @@ while IFS= read -r patch; do
     case "$patch" in ''|'#'*) continue ;; esac
     patch_path="$PATCH_ROOT/$patch"
     test -s "$patch_path"
-    git -C "$WEBKIT_WORKTREE" apply --check "$patch_path"
+    printf 'Applying WebKit patch: %s\n' "$patch"
+    if ! git -C "$WEBKIT_WORKTREE" apply --check "$patch_path"; then
+        printf 'error: WebKit patch does not apply to revision %s: %s\n' \
+            "$REVISION" "$patch" >&2
+        exit 1
+    fi
     git -C "$WEBKIT_WORKTREE" apply "$patch_path"
 done < "$PATCH_ROOT/series"
 
@@ -32,6 +37,10 @@ cp "$ROOT/wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.h" "$angle
 cp "$ROOT/wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.cc" "$angle_zlib/"
 cp "$ROOT/wpe-drm/ChromeMotionState.h" \
     "$WEBKIT_WORKTREE/Source/WebKit/WPEPlatform/wpe/drm/ChromeMotionState.h"
+cp "$ROOT/wpe-drm/VideoReleaseQueue.h" \
+    "$WEBKIT_WORKTREE/Source/WebKit/WPEPlatform/wpe/drm/VideoReleaseQueue.h"
+cp "$ROOT/wpe-drm/GPUFrameValidity.h" \
+    "$WEBKIT_WORKTREE/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/GPUFrameValidity.h"
 
 printf 'WebKit worktree ready: source=%s revision=%s\n' "$WEBKIT_WORKTREE" "$REVISION"
 git -C "$WEBKIT_WORKTREE" diff --stat

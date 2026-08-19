@@ -92,6 +92,7 @@ done
 reject_lfs_pointer "$ROOT/libs/arm64-orange/libjsapi_browser.so"
 reject_lfs_pointer "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"
 validate_webkit_elf "$ROOT/assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"
+sh "$ROOT/scripts/validate_gpu_runtime.sh" optional
 
 webkit_entries="$(find "$ROOT/assets/wpe-runtime/lib" -maxdepth 1 \
   -name 'libWPEWebKit-2.0.so*' -print)"

@@ -2,7 +2,9 @@
 
 This directory is the reproducible source of the browser's WebKit changes.
 The clean upstream/device baseline is recorded in `revision`; `series` lists
-the patches in application order.
+the patches in application order. `inputs` lists support sources copied into
+the isolated worktree after patch replay; their content is included in the
+runtime manifest's patch-series hash.
 
 ## Patch Groups
 
@@ -31,6 +33,16 @@ the patches in application order.
 - `0500-adaptive-memory-pressure.patch`: adds configurable Linux system-memory
   thresholds with recovery hysteresis, bounded native glyph caching and safe
   DRM chrome-cache trimming without releasing scanout or in-flight buffers.
+- `0600-drm-lifecycle-and-video-ack.patch`: completes pending-buffer cleanup on
+  commit failure and shutdown, and queues nonblocking video release ACKs so a
+  temporarily full socket cannot stall the decoder after four in-flight frames.
+- `0630-zero-rotation-chrome-and-panel-fit.patch`: keeps native chrome on the
+  full-panel composition path at absolute rotation zero and makes panel-native
+  commits preserve framebuffer pixels instead of stretching to the DRM mode.
+- `0640-portrait-menu-and-gpu-frame-stability.patch`: validates accumulated
+  GPU swapchain contents before incremental repaint, reuses RGA imports and
+  chrome-base storage, and preserves the last complete DRM frame when a new
+  GPU frame cannot be synchronized or converted.
 
 The former experiment-by-experiment patches and full modified source mirrors
 were consolidated after replaying the production series successfully against

@@ -1,0 +1,334 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -33,6 +33,7 @@
+ #include "WPEToplevelDRM.h"
+ #include "WPEBufferSHM.h"
+ #include "WPEViewDRMPrivate.h"
++#include "VideoReleaseQueue.h"
+ #include <drm_fourcc.h>
+ #include <drm_mode.h>
+ #include <dlfcn.h>
+@@ -3471,7 +3472,8 @@
+ 
+ static void wpeViewDRMDispose(GObject* object)
+ {
+-    auto* priv = WPE_VIEW_DRM(object)->priv;
++    auto* view = WPE_VIEW_DRM(object);
++    auto* priv = view->priv;
+ 
+     videoOverlayStop(WPE_VIEW_DRM(object));
+ 
+@@ -3498,6 +3500,30 @@
+         priv->frameThrottleSource = nullptr;
+     }
+ 
++    // Every buffer accepted from WPE must receive exactly one release, even
++    // when the view is destroyed while a page flip or throttled frame is
++    // pending. Avoid duplicate callbacks if a producer reuses an object.
++    std::array<WPEBuffer*, 3> released { nullptr, nullptr, nullptr };
++    size_t releasedCount = 0;
++    auto releaseBuffer = [&](GRefPtr<WPEBuffer>& buffer) {
++        if (!buffer)
++            return;
++        WPEBuffer* raw = buffer.get();
++        bool duplicate = std::find(released.begin(), released.begin() + releasedCount, raw)
++            != released.begin() + releasedCount;
++        if (!duplicate) {
++            wpe_view_buffer_released(WPE_VIEW(view), raw);
++            released[releasedCount++] = raw;
++        }
++        buffer = nullptr;
++    };
++    releaseBuffer(priv->queuedBuffer);
++    releaseBuffer(priv->pendingBuffer);
++    releaseBuffer(priv->committedBuffer);
++    priv->pendingScanoutBuffer = nullptr;
++    priv->committedScanoutBuffer = nullptr;
++    priv->updateFlags = { };
++
+     G_OBJECT_CLASS(wpe_view_drm_parent_class)->dispose(object);
+ }
+ 
+@@ -4200,6 +4226,8 @@
+     int clientFD { -1 };
+     GRefPtr<GSource> listenSource;
+     GRefPtr<GSource> clientSource;
++    GRefPtr<GSource> releaseSource;
++    WPE::DRM::VideoReleaseQueue pendingReleaseAcks;
+     const WPE::DRM::Plane* plane { nullptr };
+     VideoOverlayFB current;
+     VideoOverlayWireMessage lastFrame;
+@@ -4207,6 +4235,7 @@
+     bool haveFrame { false };
+     bool planeEnabled { false };
+     bool zposUnsupported { false };
++    bool droppingClient { false };
+     unsigned commitFailLogCount { 0 };
+     uint32_t loggedFrameWidth { 0 };
+     uint32_t loggedFrameHeight { 0 };
+@@ -4219,6 +4248,7 @@
+     uint64_t failedFrames { 0 };
+     uint64_t ackedFrames { 0 };
+     uint64_t ackFailedFrames { 0 };
++    uint64_t ackRetriedFrames { 0 };
+     uint64_t commitTotalUS { 0 };
+     uint64_t commitMaxUS { 0 };
+     uint64_t nextStatsFrame { 120 };
+@@ -4345,28 +4375,74 @@
+     fb.sequence = 0;
+ }
+ 
+-static void videoOverlaySendRelease(VideoOverlayState* overlay, uint64_t sequence)
++static void videoOverlayDropClient(WPEViewDRM*);
++
++static bool videoOverlayFlushReleases(VideoOverlayState* overlay)
+ {
+-    if (!overlay || overlay->clientFD < 0 || !sequence)
+-        return;
+-    VideoOverlayWireMessage message = { };
+-    message.version = videoOverlayProtocolVersion;
+-    message.type = VideoOverlayMessageRelease;
+-    message.sequence = sequence;
+-    ssize_t result;
+-    do {
+-        result = send(overlay->clientFD, &message, sizeof(message), MSG_NOSIGNAL);
+-    } while (result < 0 && errno == EINTR);
+-    if (result == sizeof(message))
+-        overlay->ackedFrames++;
+-    else {
++    if (!overlay || overlay->clientFD < 0)
++        return false;
++    while (!overlay->pendingReleaseAcks.empty()) {
++        VideoOverlayWireMessage message = { };
++        message.version = videoOverlayProtocolVersion;
++        message.type = VideoOverlayMessageRelease;
++        message.sequence = overlay->pendingReleaseAcks.front();
++        ssize_t result;
++        do {
++            result = send(overlay->clientFD, &message, sizeof(message), MSG_NOSIGNAL | MSG_DONTWAIT);
++        } while (result < 0 && errno == EINTR);
++        if (result == sizeof(message)) {
++            overlay->ackedFrames++;
++            overlay->pendingReleaseAcks.pop();
++            continue;
++        }
++        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
++            return false;
+         overlay->ackFailedFrames++;
+         if (overlay->commitFailLogCount++ < 8)
+             g_warning("WPEViewDRM video overlay: release ACK failed sequence=%" G_GUINT64_FORMAT ": %s",
+-                sequence, strerror(errno));
++                message.sequence, result < 0 ? strerror(errno) : "short write");
++        videoOverlayDropClient(overlay->view);
++        return false;
+     }
++    return true;
+ }
+ 
++static gboolean videoOverlayReleaseWritable(int, GIOCondition condition, gpointer userData)
++{
++    auto* overlay = static_cast<VideoOverlayState*>(userData);
++    if (!overlay || !overlay->view)
++        return G_SOURCE_REMOVE;
++    if (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) {
++        videoOverlayDropClient(overlay->view);
++        return G_SOURCE_REMOVE;
++    }
++    overlay->ackRetriedFrames += overlay->pendingReleaseAcks.size();
++    if (!videoOverlayFlushReleases(overlay))
++        return overlay->clientFD >= 0 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
++    overlay->releaseSource = nullptr;
++    return G_SOURCE_REMOVE;
++}
++
++static void videoOverlaySendRelease(VideoOverlayState* overlay, uint64_t sequence)
++{
++    if (!overlay || overlay->droppingClient || overlay->clientFD < 0 || !sequence)
++        return;
++    auto addResult = overlay->pendingReleaseAcks.add(sequence);
++    if (addResult == WPE::DRM::VideoReleaseQueue::AddResult::Overflow) {
++        g_warning("WPEViewDRM video overlay: release ACK backlog exceeded limit; reconnecting client");
++        videoOverlayDropClient(overlay->view);
++        return;
++    }
++    if (videoOverlayFlushReleases(overlay) || overlay->releaseSource || overlay->clientFD < 0)
++        return;
++    overlay->releaseSource = adoptGRef(g_unix_fd_source_new(overlay->clientFD,
++        static_cast<GIOCondition>(G_IO_OUT | G_IO_ERR | G_IO_HUP | G_IO_NVAL)));
++    g_source_set_name(overlay->releaseSource.get(), "WPE DRM video release ACK");
++    g_source_set_callback(overlay->releaseSource.get(),
++        reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(videoOverlayReleaseWritable)), overlay, nullptr);
++    g_source_attach(overlay->releaseSource.get(), g_main_context_get_thread_default());
++}
++
+ static void videoOverlayRecordCommit(VideoOverlayState* overlay, int64_t durationUS)
+ {
+     if (durationUS < 0)
+@@ -4384,9 +4460,10 @@
+     g_message("WPEViewDRM video stats: received=%" G_GUINT64_FORMAT
+         " committed=%" G_GUINT64_FORMAT " coalesced=%" G_GUINT64_FORMAT
+         " failed=%" G_GUINT64_FORMAT " acked=%" G_GUINT64_FORMAT
+-        " ack_failed=%" G_GUINT64_FORMAT " inflight=%u commit_avg_ms=%.2f commit_max_ms=%.2f current_fb=%u sequence=%" G_GUINT64_FORMAT,
++        " ack_failed=%" G_GUINT64_FORMAT " ack_retried=%" G_GUINT64_FORMAT " ack_pending=%zu inflight=%u commit_avg_ms=%.2f commit_max_ms=%.2f current_fb=%u sequence=%" G_GUINT64_FORMAT,
+         overlay->receivedFrames, overlay->committedFrames, overlay->coalescedFrames,
+         overlay->failedFrames, overlay->ackedFrames, overlay->ackFailedFrames,
++        overlay->ackRetriedFrames, overlay->pendingReleaseAcks.size(),
+         overlay->current.sequence ? 1 : 0, averageMS, overlay->commitMaxUS / 1000.0,
+         overlay->current.fbID, overlay->current.sequence);
+     while (overlay->nextStatsFrame <= overlay->receivedFrames)
+@@ -4683,15 +4760,24 @@
+ static void videoOverlayDropClient(WPEViewDRM* view)
+ {
+     auto* overlay = view->priv->videoOverlay;
++    if (!overlay || overlay->droppingClient)
++        return;
++    overlay->droppingClient = true;
+     if (overlay->clientSource) {
+         g_source_destroy(overlay->clientSource.get());
+         overlay->clientSource = nullptr;
+     }
++    if (overlay->releaseSource) {
++        g_source_destroy(overlay->releaseSource.get());
++        overlay->releaseSource = nullptr;
++    }
+     videoOverlayDisable(view);
+     if (overlay->clientFD >= 0) {
+         close(overlay->clientFD);
+         overlay->clientFD = -1;
+     }
++    overlay->pendingReleaseAcks.clear();
++    overlay->droppingClient = false;
+ }
+ 
+ static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gpointer userData)
+@@ -4848,7 +4934,7 @@
+ 
+     unlink(path);
+     address.sun_family = AF_UNIX;
+-    strcpy(address.sun_path, path);
++    memcpy(address.sun_path, path, strlen(path) + 1);
+     if (bind(listenFD, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) || listen(listenFD, 1)) {
+         g_warning("WPEViewDRM video overlay: failed to listen on %s: %s", path, strerror(errno));
+         close(listenFD);
+@@ -4991,9 +5077,10 @@
+     return false;
+ }
+ 
+-static void dropPendingFrame(WPEViewDRM* view)
++static bool abortPendingCommit(WPEViewDRM* view, const char* reason)
+ {
+     auto* priv = view->priv;
++    bool droppedWebFrame = !!priv->pendingBuffer;
+     if (priv->pendingBuffer)
+         wpe_view_buffer_released(WPE_VIEW(view), priv->pendingBuffer.get());
+     priv->pendingBuffer = nullptr;
+@@ -5004,9 +5091,13 @@
+     priv->preparedChromeBasePitch = 0;
+     priv->preparedBaseGeneration = 0;
+     priv->damageRects.clear();
+-    priv->lastUpdateDroppedBuffer = true;
++    priv->lastUpdateDroppedBuffer = droppedWebFrame;
+     priv->forceFullDamageNextFrame = true;
+-    priv->droppedWindowCount++;
++    if (droppedWebFrame)
++        priv->droppedWindowCount++;
++    g_warning("WPEViewDRM pending commit aborted: reason=%s web_frame=%d",
++        reason ? reason : "unknown", droppedWebFrame);
++    return droppedWebFrame;
+ }
+ 
+ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
+@@ -5035,7 +5126,7 @@
+             renderingFence = UnixFileDescriptor { wpe_buffer_take_rendering_fence(buffer), UnixFileDescriptor::Adopt };
+         if (pendingNeedsCPURead && !waitForRenderingFence(view, renderingFence)) {
+             priv->retainedBaseFrameCount++;
+-            dropPendingFrame(view);
++            abortPendingCommit(view, "rendering-fence");
+             return TRUE;
+         }
+ 
+@@ -5049,8 +5140,14 @@
+         drmBuffer = uiOnlyRedraw
+             ? nextChromeOverlayBuffer(view, error)
+             : drmScanoutBufferForRender(view, buffer, rotation, error);
+-        if (!drmBuffer)
++        if (!drmBuffer) {
++            if (abortPendingCommit(view, "scanout-import")) {
++                if (error)
++                    g_clear_error(error);
++                return TRUE;
++            }
+             return FALSE;
++        }
+ 
+         if (uiOnlyRedraw) {
+             auto durationUS = g_get_monotonic_time() - copyStartUS;
+@@ -5100,8 +5197,14 @@
+     gint64 commitStartUS = g_get_monotonic_time();
+     if (wpe_display_drm_supports_atomic(display)) {
+         auto damageID = drmBuffer ? buildDamageBlob(display, priv->damageRects, error) : std::nullopt;
+-        if (damageID.has_value() && !damageID.value())
++        if (damageID.has_value() && !damageID.value()) {
++            if (abortPendingCommit(view, "damage-blob")) {
++                if (error)
++                    g_clear_error(error);
++                return TRUE;
++            }
+             return FALSE;
++        }
+ 
+         auto result = wpeViewDRMCommitAtomic(WPE_VIEW_DRM(view), drmBuffer, damageID, error);
+         if (damageID)
+@@ -5116,15 +5219,10 @@
+             priv->lastFrameCommitUS = commitStartUS;
+         priv->lastCommitWasSynchronous = result && bufferUsesSynchronousCommit(drmBuffer);
+         if (!result) {
+-            if (!priv->pendingBuffer)
+-                priv->pendingScanoutBuffer = nullptr;
+-            else {
+-                priv->forceFullDamageNextFrame = true;
+-                priv->preparedChromeBasePixels.clear();
+-                priv->preparedChromeBaseWidth = 0;
+-                priv->preparedChromeBaseHeight = 0;
+-                priv->preparedChromeBasePitch = 0;
+-                priv->preparedBaseGeneration = 0;
++            if (abortPendingCommit(view, "atomic-commit")) {
++                if (error)
++                    g_clear_error(error);
++                return TRUE;
+             }
+         }
+         return result;
+@@ -5143,6 +5241,11 @@
+     priv->commitWindowCount++;
+     if (result)
+         priv->lastFrameCommitUS = commitStartUS;
++    else if (abortPendingCommit(view, "legacy-commit")) {
++        if (error)
++            g_clear_error(error);
++        return TRUE;
++    }
+     return result;
+ }
+ 
+--- a/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
++++ b/Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp
+@@ -238,13 +238,16 @@
+         }
+ 
+         struct sockaddr_un address = { };
+-        if (strlen(path) >= sizeof(address.sun_path))
++        size_t pathLength = strlen(path);
++        if (pathLength >= sizeof(address.sun_path)) {
++            warnOnceLocked("video overlay socket path is too long");
+             return false;
++        }
+         int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+         if (fd < 0)
+             return false;
+         address.sun_family = AF_UNIX;
+-        strcpy(address.sun_path, path);
++        memcpy(address.sun_path, path, pathLength + 1);
+         if (connect(fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address))) {
+             g_warning("Rockchip video overlay: connect(%s) failed: %s", path, g_strerror(errno));
+             close(fd);

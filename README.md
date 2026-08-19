@@ -25,7 +25,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 - **多用户 Profile 与 Cookie 持久化**：最多 8 个持久 Profile 和访客模式；Cookie、LocalStorage、IndexedDB、Service Worker、缓存、标签、历史、收藏和站点档案完全隔离。浏览器元数据使用 SQLite WAL，Cookie 使用 WebKit 独立 SQLite CookieJar。
 - **Chrome Material 原生界面**：浅色/深色主题、共享圆角卡片和 native 图标、按压态、开关/单选/危险操作样式；GPU 旋转路径缓存完整 CPU 底图，菜单动画只重画 chrome，不重复读取 Mali DMA-BUF。
 - **分组设置**：外观、网页、启动与搜索、隐私与数据、语言、关于。主题和工具栏自动隐藏全局保存；缩放、字体、网页能力、搜索引擎、语言和启动行为按 Profile 隔离，Guest 网页设置只在当前会话生效。语言同时控制 native 菜单、`Accept-Language` 和 `navigator.language(s)`。
-- 原生工具栏 `inset` 布局（显隐不 resize WebView）、Chrome 风格三点分层菜单、地址栏直接键盘编辑、横向滚动、系统键盘桥、双显示模式（原生/横屏旋转）。
+- 原生工具栏 `resize` 布局（展开时为网页保留真实 content inset）、Chrome 风格三点分层菜单、地址栏直接键盘编辑、横向滚动、系统键盘桥，以及相对设备原生方向的 `0°/90°/180°/270°` 显示模式。四个方向只复用旧 `native/rotate270` 两套页面布局模板，输出与触摸角度在布局完成后独立应用，避免横屏内容被缩放进竖屏 viewport。
 
 ## 目录结构
 
@@ -44,7 +44,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
   - `GStreamerHolePunchQuirkRockchip.{h,cpp}`：视频直出 WebProcess 端 quirk，对应 `Source/WebCore/platform/gstreamer/`。
   - `browser-chrome-model.*`、`browser-navigation.*`、`browser-profile-store.*`：可独立测试的面板、导航和数据库模块。
   - `runtime/`：由 `run.sh` 加载的 supervisor 子模块；构建时同步到包内。
-  - `webkit-patches/{revision,series}`：从固定 WebKit revision 重放的四组生产补丁，不再保存实验补丁和整文件镜像。
+  - `webkit-patches/{revision,series}`：从固定 WebKit revision 顺序重放的生产补丁，不再保存实验补丁和整文件镜像。
 - `tests/fixtures/web/`：本地网页、RAF、触摸、音视频 fixture，不随页面业务代码维护。
 - `tools/diagnostics/`：诊断 C 工具及统一 Makefile。
 - `tools/`：出屏、键盘、云游戏排障和 runtime 体积文档。
@@ -65,10 +65,18 @@ rm -rf .falcon_ .falcon_tmp && npm run build
 
 WebKit 内核与 `wpe-drm-minimal` 在 ARM64 交叉编译服务器上构建。`scripts/build_webrtc_runtime_pve.sh` 会从 `wpe-drm/webkit-patches/revision` 创建隔离 worktree，按 `series` 重放生产补丁，并输出记录 revision、series hash、编译开关和 ELF SHA256 的 `build-manifest.json`。禁止继续原地修改长期共享 WebKit 源码树。
 
+当前唯一构建机源码目录为 `pve@192.168.100.118:/home/pve/web-browser-src`；旧 Parallels 构建机已废弃。同步源码后在 PVE 执行：
+
+```sh
+cd /home/pve/web-browser-src
+PROJECT_ROOT=$PWD JOBS=72 scripts/build_jsapi_remote.sh
+PROJECT_ROOT=$PWD JOBS=72 scripts/build_webrtc_runtime_pve.sh
+```
+
 ## 运行
 
 1. 安装 amr（`miniapp_cli install <amr>`）。
-2. 启动 MiniApp 进入 `index` 启动页，选显示模式，点启动浏览器；或直接 `miniapp_cli start 8001779591038449 frame`。
+2. 启动 MiniApp 进入 `index` 启动页，选择“沿用上次”或显式方向后启动；浏览器内也可从三点菜单的“旋转”页面切换方向。切换通过退出码 `72` 在同一个 `frame`/`<hole>` 页面内受控重启，不清理 Profile、Cookie 或标签。
 3. `frame` 页显示全屏 `<hole>`，WPE 从包内 runtime 起并直接 DRM 出屏。Home/退出时 JSAPI 停 WPE 释放 DRM。
 
 可写数据在 `$dataDir/browser/`：`wpe-drm.log`（每次启动截断重写）、`browser.sqlite3`（Profile/标签/历史/收藏）、`profiles/p<ID>/runtime/{data,cache}`（站点数据）、`profiles/p<ID>/cookies.sqlite`（CookieJar）、`chrome-render-state.ini`（轻量绘制 IPC）、`keyboard/`、`fontconfig-cache/` 等。旧 `browser-state.ini` 和 `runtime-tmp` 仅在首次升级时迁入 DEFAULT，随后分别备份为 `.migrated.bak` 和移动到 Profile 目录。

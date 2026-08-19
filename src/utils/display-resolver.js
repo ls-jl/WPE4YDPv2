@@ -3,9 +3,24 @@ export const DEFAULT_VIEWPORT = '960x266'
 export const DEFAULT_ROTATION = 270
 export const DEFAULT_DRM_MODE = '480x960'
 export const DEFAULT_BROWSER_MODE = 'native'
+export const LAST_BROWSER_MODE = 'last'
 
-const ROTATE_270_MODE = 'rotate270'
-const ROTATE_MODE_DELTA = 270
+export const BROWSER_MODE_DELTAS = Object.freeze({
+  native: 0,
+  rotate90: 90,
+  rotate180: 180,
+  rotate270: 270,
+})
+export const BROWSER_MODE_LAYOUT_TEMPLATES = Object.freeze({
+  native: 'native',
+  rotate90: 'rotate270',
+  rotate180: 'native',
+  rotate270: 'rotate270',
+})
+const LAYOUT_TEMPLATE_DELTAS = Object.freeze({
+  native: 0,
+  rotate270: 270,
+})
 const HARD_FALLBACK_DISPLAY = {
   panelSize: DEFAULT_VIEWPORT,
   drmMode: DEFAULT_DRM_MODE,
@@ -14,7 +29,41 @@ const HARD_FALLBACK_DISPLAY = {
 
 export function normalizeBrowserMode(value) {
   const mode = `${value || ''}`
-  return mode === ROTATE_270_MODE ? ROTATE_270_MODE : DEFAULT_BROWSER_MODE
+  return Object.prototype.hasOwnProperty.call(BROWSER_MODE_DELTAS, mode)
+    ? mode : DEFAULT_BROWSER_MODE
+}
+
+export function normalizeBrowserLaunchMode(value) {
+  const mode = `${value || ''}`
+  return !mode || mode === LAST_BROWSER_MODE
+    ? LAST_BROWSER_MODE : normalizeBrowserMode(mode)
+}
+
+export function browserModeDelta(value) {
+  return BROWSER_MODE_DELTAS[normalizeBrowserMode(value)]
+}
+
+export function browserLayoutTemplate(value) {
+  return BROWSER_MODE_LAYOUT_TEMPLATES[normalizeBrowserMode(value)]
+}
+
+export function browserLayoutDelta(value) {
+  return LAYOUT_TEMPLATE_DELTAS[browserLayoutTemplate(value)]
+}
+
+export function resolvePersistedBrowserMode(browserPlayer, options) {
+  const launchMode = normalizeBrowserLaunchMode(options && options.browserMode)
+  if (launchMode !== LAST_BROWSER_MODE) return launchMode
+  try {
+    if (browserPlayer && browserPlayer.getDisplayMode) {
+      return normalizeBrowserMode(browserPlayer.getDisplayMode({
+        workdir: (options && options.workdir) || browserDataPath(''),
+      }))
+    }
+  } catch (err) {
+    console.warn(`read persisted display mode failed ${err}`)
+  }
+  return DEFAULT_BROWSER_MODE
 }
 
 function normalizeRotationValue(value, fallback) {
@@ -217,7 +266,7 @@ export function dataRootPath() {
   } catch (err) {
     console.warn(`read data dir failed ${err}`)
   }
-  return '/tmp/wpe-browser-data'
+  return ''
 }
 
 export function workspacePath(page) {
@@ -239,7 +288,9 @@ export function workspacePath(page) {
 }
 
 export function browserDataPath(name) {
-  return dataRootPath() + '/browser/' + name
+  const root = dataRootPath()
+  if (!root) return ''
+  return root + '/browser/' + name
 }
 
 function fallbackDisplayConfig() {
@@ -318,6 +369,9 @@ function readEnvSize() {
 export async function resolveDisplayConfig(component, browserPlayer, options) {
   const fallback = fallbackDisplayConfig()
   const browserMode = normalizeBrowserMode(options && options.browserMode)
+  const outputDelta = browserModeDelta(browserMode)
+  const modeLayoutTemplate = browserLayoutTemplate(browserMode)
+  const modeLayoutDelta = browserLayoutDelta(browserMode)
   const systemConfig = readSystemDisplayConfig(browserPlayer)
   const legacyRotation = Number(options && options.rotation)
   const hasLegacyRotation = !(options && options.browserMode) && Number.isFinite(legacyRotation)
@@ -330,25 +384,31 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
     const nativeTouchRotation = normalizeRotationValue(systemConfig.touchRotation, nativeRotation)
     const rotation = hasLegacyRotation
       ? normalizeRotationValue(legacyRotation, nativeRotation)
-      : (browserMode === ROTATE_270_MODE ? rotateByDelta(nativeRotation, ROTATE_MODE_DELTA) : nativeRotation)
+      : rotateByDelta(nativeRotation, outputDelta)
+    const layoutTemplate = hasLegacyRotation ? 'legacy' : modeLayoutTemplate
+    const layoutRotation = hasLegacyRotation
+      ? rotation
+      : rotateByDelta(nativeRotation, modeLayoutDelta)
     const drmMode = sizeSpec(parseSizeSpec(systemConfig.drmMode)) || readDrmMode(browserPlayer, options || {}, fallback)
     const drmSize = parseSizeSpec(drmMode)
-    const relativeRotation = rotationDelta(nativeRotation, rotation)
-    const orientedPanel = normalizeForRotation(rawPanel, relativeRotation)
-    const reconciled = reconcilePanelOrientation(orientedPanel, rotation, drmSize)
+    const layoutRelativeRotation = rotationDelta(nativeRotation, layoutRotation)
+    const orientedPanel = normalizeForRotation(rawPanel, layoutRelativeRotation)
+    const reconciled = reconcilePanelOrientation(orientedPanel, layoutRotation, drmSize)
     const panel = reconciled.panel
     const panelSize = sizeSpec(panel) || fallback.panelSize || HARD_FALLBACK_DISPLAY.panelSize
     const touchRotation = hasLegacyRotation
       ? normalizeRotationValue(systemConfig.touchRotation, rotation)
-      : (browserMode === ROTATE_270_MODE ? rotateByDelta(nativeTouchRotation, ROTATE_MODE_DELTA) : nativeTouchRotation)
+      : rotateByDelta(nativeTouchRotation, outputDelta)
     const displaySource = `system_cfg:${browserMode}`
-    console.warn(`display_resolve source=${displaySource} raw=${systemConfig.width}x${systemConfig.height} direction=${systemConfig.frameworkRotation} relative_rotation=${relativeRotation} video_direction=${systemConfig.videoRotation} tp_direction=${systemConfig.touchRotation} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} touch_rotation=${touchRotation} orientation_corrected=${reconciled.corrected ? 1 : 0}`)
+    console.warn(`display_resolve source=${displaySource} raw=${systemConfig.width}x${systemConfig.height} direction=${systemConfig.frameworkRotation} layout_template=${layoutTemplate} layout_rotation=${layoutRotation} layout_relative_rotation=${layoutRelativeRotation} output_rotation=${rotation} video_direction=${systemConfig.videoRotation} tp_direction=${systemConfig.touchRotation} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} touch_rotation=${touchRotation} orientation_corrected=${reconciled.corrected ? 1 : 0}`)
     return {
       panelSize,
       drmMode,
       viewport: panelSize,
       rotation,
       touchRotation,
+      layoutTemplate,
+      layoutRotation,
       touchDevice: systemConfig.touchDevice || '',
       touchOffsetX: Number(systemConfig.touchOffsetX) || 0,
       touchOffsetY: Number(systemConfig.touchOffsetY) || 0,
@@ -359,12 +419,15 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
   }
 
   const optionRotation = Number(options && options.rotation)
-  const rotation = Number.isFinite(optionRotation)
+  const hasFallbackLegacyRotation = !(options && options.browserMode) && Number.isFinite(optionRotation)
+  const rotation = hasFallbackLegacyRotation
     ? normalizeRotationValue(optionRotation, fallback.rotation)
-    : (browserMode === ROTATE_270_MODE ? rotateByDelta(fallback.rotation, ROTATE_MODE_DELTA) : fallback.rotation)
-  const relativeRotation = options && options.browserMode
-    ? (browserMode === ROTATE_270_MODE ? ROTATE_MODE_DELTA : 0)
-    : rotationDelta(fallback.rotation, rotation)
+    : rotateByDelta(fallback.rotation, outputDelta)
+  const layoutTemplate = hasFallbackLegacyRotation ? 'legacy' : modeLayoutTemplate
+  const layoutRotation = hasFallbackLegacyRotation
+    ? rotation
+    : rotateByDelta(fallback.rotation, modeLayoutDelta)
+  const layoutRelativeRotation = rotationDelta(fallback.rotation, layoutRotation)
   const drmMode = readDrmMode(browserPlayer, options || {}, fallback)
   const drmSize = parseSizeSpec(drmMode)
   const fallbackPanel = parseSizeSpec((options && options.panelSize) || fallback.panelSize) || parseSizeSpec(HARD_FALLBACK_DISPLAY.panelSize)
@@ -378,69 +441,79 @@ export async function resolveDisplayConfig(component, browserPlayer, options) {
 
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i]
-    const normalized = normalizeForRotation(candidate.size, relativeRotation)
+    const normalized = normalizeForRotation(candidate.size, layoutRelativeRotation)
     const reject = rejectPanelCandidate(normalized, fallbackPanel, drmSize)
     if (!reject) {
-      const reconciled = reconcilePanelOrientation(normalized, rotation, drmSize)
+      const reconciled = reconcilePanelOrientation(normalized, layoutRotation, drmSize)
       const panelSize = sizeSpec(reconciled.panel)
-      console.warn(`display_resolve source=${candidate.source}:${browserMode} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} relative_rotation=${relativeRotation} orientation_corrected=${reconciled.corrected ? 1 : 0}`)
+      console.warn(`display_resolve source=${candidate.source}:${browserMode} layout_template=${layoutTemplate} layout_rotation=${layoutRotation} layout_relative_rotation=${layoutRelativeRotation} output_rotation=${rotation} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} touch_rotation=${rotation} orientation_corrected=${reconciled.corrected ? 1 : 0}`)
       return {
         panelSize,
         drmMode,
         viewport: panelSize,
         rotation,
         touchRotation: rotation,
+        layoutTemplate,
+        layoutRotation,
         browserMode,
         displaySource: `${candidate.source}:${browserMode}`,
       }
     }
     if (candidate.size) {
-      console.warn(`display_resolve reject source=${candidate.source} size=${sizeSpec(candidate.size)} normalized=${sizeSpec(normalized)} reason=${reject}`)
+      console.warn(`display_resolve reject source=${candidate.source} size=${sizeSpec(candidate.size)} normalized=${sizeSpec(normalized)} layout_template=${layoutTemplate} reason=${reject}`)
     }
   }
 
-  const orientedFallback = normalizeForRotation(fallbackPanel, relativeRotation)
-  const reconciledFallback = reconcilePanelOrientation(orientedFallback, rotation, drmSize)
+  const orientedFallback = normalizeForRotation(fallbackPanel, layoutRelativeRotation)
+  const reconciledFallback = reconcilePanelOrientation(orientedFallback, layoutRotation, drmSize)
   const panelSize = sizeSpec(reconciledFallback.panel) || HARD_FALLBACK_DISPLAY.panelSize
   const source = fallbackPanel ? 'app_config' : 'hard_fallback'
-  console.warn(`display_resolve source=${source}:${browserMode} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} relative_rotation=${relativeRotation} orientation_corrected=${reconciledFallback.corrected ? 1 : 0}`)
+  console.warn(`display_resolve source=${source}:${browserMode} layout_template=${layoutTemplate} layout_rotation=${layoutRotation} layout_relative_rotation=${layoutRelativeRotation} output_rotation=${rotation} panel=${panelSize} drm_mode=${drmMode} viewport=${panelSize} rotation=${rotation} touch_rotation=${rotation} orientation_corrected=${reconciledFallback.corrected ? 1 : 0}`)
   return {
     panelSize,
     drmMode,
     viewport: panelSize,
     rotation,
     touchRotation: rotation,
+    layoutTemplate,
+    layoutRotation,
     browserMode,
     displaySource: `${source}:${browserMode}`,
   }
 }
 
 export async function browserOptions(component, browserPlayer, options) {
-  let runtimePath = options.runtimePath || ''
+  const resolvedMode = resolvePersistedBrowserMode(browserPlayer, options || {})
+  const resolvedOptions = Object.assign({}, options || {}, {
+    browserMode: resolvedMode,
+  })
+  let runtimePath = resolvedOptions.runtimePath || ''
   if (!runtimePath) {
     runtimePath = browserPlayer.prepareRuntime({
       workspace: workspacePath(component),
     })
   }
-  const display = await resolveDisplayConfig(component, browserPlayer, options)
+  const display = await resolveDisplayConfig(component, browserPlayer, resolvedOptions)
   return {
     runtimePath,
-    workdir: options.workdir || browserDataPath(''),
-    logPath: options.logPath || browserDataPath('wpe-drm.log'),
-    url: options.url || DEFAULT_URL,
-    viewport: options.viewport || display.viewport || DEFAULT_VIEWPORT,
-    panelSize: options.panelSize || display.panelSize || DEFAULT_VIEWPORT,
-    drmMode: options.drmMode || display.drmMode || DEFAULT_DRM_MODE,
+    workdir: resolvedOptions.workdir || browserDataPath(''),
+    logPath: resolvedOptions.logPath || browserDataPath('wpe-drm.log'),
+    url: resolvedOptions.url || DEFAULT_URL,
+    viewport: resolvedOptions.viewport || display.viewport || DEFAULT_VIEWPORT,
+    panelSize: resolvedOptions.panelSize || display.panelSize || DEFAULT_VIEWPORT,
+    drmMode: resolvedOptions.drmMode || display.drmMode || DEFAULT_DRM_MODE,
     displaySource: display.displaySource || 'unknown',
+    layoutTemplate: display.layoutTemplate || browserLayoutTemplate(resolvedMode),
+    layoutRotation: Number.isFinite(Number(display.layoutRotation)) ? Number(display.layoutRotation) : Number(display.rotation),
     rotation: Number.isFinite(Number(display.rotation)) ? Number(display.rotation) : DEFAULT_ROTATION,
-    browserMode: display.browserMode || normalizeBrowserMode(options.browserMode),
+    browserMode: display.browserMode || resolvedMode,
     touchRotation: Number.isFinite(Number(display.touchRotation)) ? Number(display.touchRotation) : Number(display.rotation),
-    touchDevice: options.touchDevice || display.touchDevice || '',
+    touchDevice: resolvedOptions.touchDevice || display.touchDevice || '',
     touchOffsetX: Number.isFinite(Number(display.touchOffsetX)) ? Number(display.touchOffsetX) : 0,
     touchOffsetY: Number.isFinite(Number(display.touchOffsetY)) ? Number(display.touchOffsetY) : 0,
     fpsMax: Number.isFinite(Number(display.fpsMax)) ? Number(display.fpsMax) : 0,
-    drm: options.drm || '/dev/dri/card0',
-    gpuMode: options.gpuMode || 'auto',
+    drm: resolvedOptions.drm || '/dev/dri/card0',
+    gpuMode: resolvedOptions.gpuMode || 'auto',
     useOverlay: true,
     overlayZpos: 0,
   }

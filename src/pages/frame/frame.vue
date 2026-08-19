@@ -45,7 +45,9 @@ export default {
   },
   mounted() {
     this.ensureControllers()
-    this.keyboardBridge.setup()
+    if (this.browserWorkdir()) {
+      this.keyboardBridge.setup()
+    }
     this.browserLifecycle.start()
   },
   beforeDestroy() {
@@ -67,6 +69,9 @@ export default {
     },
     teardownControllers() {
       this.clearKeyboardHideTimer()
+      if (this.browserLifecycle) {
+        this.browserLifecycle.stop()
+      }
       if (this.keyboardBridge) {
         this.keyboardBridge.teardown()
       }
@@ -140,7 +145,6 @@ export default {
       this.ensureControllers()
       this.pageVisible = false
       this.clearKeyboardHideTimer()
-      this.browserLifecycle.stop()
       this.teardownControllers()
     },
   },

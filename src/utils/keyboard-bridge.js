@@ -6,6 +6,11 @@ const TEXTAREA_PROBE_MS = 1500
 const BACKEND_SWITCH_SETTLE_MS = 250
 const TEXTAREA_RETURN_CANCEL_MS = 800
 const COMPLETION_TIMEOUT_MS = 15000
+// Native keeps a keyboard request alive for up to 120 seconds. Remember a
+// locally completed request beyond that window so a delayed/missing
+// completion file cannot reopen the same keyboard session.
+const COMPLETED_REQUEST_TTL_MS = 130000
+const RESPONSE_RETRY_DELAYS_MS = [100, 250, 500, 1000, 1500, 2000, 2500]
 
 export function createKeyboardBridgeState() {
   return {
@@ -25,6 +30,9 @@ export function createKeyboardBridgeState() {
     sequence: 0,
     lastUpdateText: null,
     completionDeadline: 0,
+    responseRetryTimer: null,
+    responseRetryAttempt: 0,
+    pendingResponse: null,
     completedRequestIds: {},
     textareaVisible: false,
     textareaFocused: false,
@@ -53,6 +61,10 @@ export class KeyboardBridge {
   }
 
   setup() {
+    if (!this.workdir()) {
+      console.warn('keyboard bridge disabled: browser workdir is unavailable')
+      return
+    }
     this.readProfile()
     if (this.state.session) return
     this.state.session = new KeyboardSession({
@@ -65,6 +77,7 @@ export class KeyboardBridge {
   teardown() {
     this.stopPolling()
     this.clearBackendTimers()
+    this.clearResponseRetryTimer()
     if (this.state.activeRequest && this.state.phase !== 'responding') {
       this.writeResponse(false, '')
     }
@@ -330,6 +343,12 @@ export class KeyboardBridge {
     this.clearReturnCancelTimer()
   }
 
+  clearResponseRetryTimer() {
+    if (!this.state.responseRetryTimer) return
+    clearTimeout(this.state.responseRetryTimer)
+    this.state.responseRetryTimer = null
+  }
+
   closeTextarea() {
     this.clearProbeTimer()
     this.state.textareaFocused = false
@@ -480,19 +499,48 @@ export class KeyboardBridge {
     const request = this.state.activeRequest
     if (!request || !request.id) return false
     try {
-      this.browserPlayer.respondKeyboardRequest({
+      const result = this.browserPlayer.respondKeyboardRequest({
         workdir: this.workdir(),
         id: request.id,
         sequence: this.state.sequence,
         confirmed: !!confirmed,
         text: confirmed ? text : '',
       })
+      if (result === false) return false
       console.warn(`keyboard ${confirmed ? 'confirmed' : 'cancelled'} id=${request.id} backend=${this.state.activeBackend} kind=${request.kind || ''} sequence=${this.state.sequence}`)
       return true
     } catch (err) {
       console.warn(`respond keyboard request failed ${err}`)
       return false
     }
+  }
+
+  publishPendingResponse() {
+    const request = this.state.activeRequest
+    const response = this.state.pendingResponse
+    if (!request || !response || this.state.phase !== 'responding') return
+    this.clearResponseRetryTimer()
+    if (this.writeResponse(response.confirmed, response.text)) {
+      this.state.pendingResponse = null
+      this.state.responseRetryAttempt = 0
+      this.closeLocalKeyboard()
+      return
+    }
+
+    const attempt = this.state.responseRetryAttempt
+    if (attempt >= RESPONSE_RETRY_DELAYS_MS.length) {
+      console.warn(`keyboard terminal response abandoned id=${request.id} attempts=${attempt + 1}`)
+      this.closeLocalKeyboard()
+      this.resetActiveRequest('terminal response write failed')
+      return
+    }
+    const delay = RESPONSE_RETRY_DELAYS_MS[attempt]
+    this.state.responseRetryAttempt += 1
+    console.warn(`keyboard terminal response retry id=${request.id} attempt=${attempt + 1} delay=${delay}`)
+    this.state.responseRetryTimer = setTimeout(() => {
+      this.state.responseRetryTimer = null
+      this.publishPendingResponse()
+    }, delay)
   }
 
   finishRequest(confirmed, value) {
@@ -506,14 +554,18 @@ export class KeyboardBridge {
     this.state.phase = 'responding'
     this.state.completionDeadline = Date.now() + COMPLETION_TIMEOUT_MS
     this.clearBackendTimers()
-    this.writeResponse(confirmed, text)
-    this.closeLocalKeyboard()
+    this.state.pendingResponse = { confirmed: !!confirmed, text }
+    this.state.responseRetryAttempt = 0
+    this.publishPendingResponse()
   }
 
   resetActiveRequest(reason, notify = true) {
     const request = this.state.activeRequest
-    if (request && request.id) this.state.completedRequestIds[request.id] = Date.now() + 10000
+    if (request && request.id) {
+      this.state.completedRequestIds[request.id] = Date.now() + COMPLETED_REQUEST_TTL_MS
+    }
     this.clearBackendTimers()
+    this.clearResponseRetryTimer()
     this.closeLocalKeyboard()
     this.state.activeRequest = null
     this.state.activeBackend = ''
@@ -521,6 +573,8 @@ export class KeyboardBridge {
     this.state.sequence = 0
     this.state.lastUpdateText = null
     this.state.completionDeadline = 0
+    this.state.responseRetryAttempt = 0
+    this.state.pendingResponse = null
     this.state.phase = 'idle'
     console.warn(`keyboard session reset reason=${reason || ''}`)
     if (notify) this.notifyInactive()

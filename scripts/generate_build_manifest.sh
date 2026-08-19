@@ -24,6 +24,15 @@ while IFS= read -r patch || [ -n "$patch" ]; do
     esac
     hash_file "$PATCH_ROOT/$patch" >> "$SERIES_INPUT"
 done < "$PATCH_ROOT/series"
+if [ -f "$PATCH_ROOT/inputs" ]; then
+    cat "$PATCH_ROOT/inputs" >> "$SERIES_INPUT"
+    while IFS= read -r input || [ -n "$input" ]; do
+        case "$input" in
+            ''|'#'*) continue ;;
+        esac
+        hash_file "$ROOT/$input" >> "$SERIES_INPUT"
+    done < "$PATCH_ROOT/inputs"
+fi
 SERIES_HASH=$(hash_file "$SERIES_INPUT")
 
 WEBKIT_ELF="$STAGE/lib/libWPEWebKit-2.0.so.1"

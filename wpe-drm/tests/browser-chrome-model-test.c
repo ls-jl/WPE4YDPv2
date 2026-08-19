@@ -22,6 +22,10 @@ static void test_panel_definitions(void)
                     CHROME_PANEL_SETTINGS);
     g_assert_cmpuint(chrome_panel_default_line_count(
                          CHROME_PANEL_APPEARANCE), ==, 6);
+    g_assert_cmpint(chrome_panel_parent(CHROME_PANEL_ROTATION), ==,
+                    CHROME_PANEL_MENU);
+    g_assert_cmpuint(chrome_panel_default_line_count(
+                         CHROME_PANEL_ROTATION), ==, 4);
     g_assert_false(chrome_panel_is_overflow_stack(CHROME_PANEL_TABS));
     g_assert_true(chrome_panel_is_internal_list(CHROME_PANEL_HISTORY));
 }
@@ -57,10 +61,41 @@ static void test_toolbar_geometry(void)
                         &portrait, 140, portrait.address_y + 10), ==, -1);
 }
 
+static void test_menu_grid_geometry(void)
+{
+    BrowserChromeMenuGridGeometry landscape =
+        browser_chrome_menu_grid_geometry(960, 266, 7);
+    g_assert_false(landscape.portrait);
+    g_assert_cmpint(landscape.columns, ==, 3);
+    g_assert_cmpint(landscape.rows, ==, 2);
+    g_assert_cmpint(landscape.items_per_page, ==, 6);
+    g_assert_cmpint(landscape.page_count, ==, 2);
+
+    const int portrait_sizes[][2] = {
+        { 266, 960 },
+        { 568, 1210 },
+    };
+    for (guint index = 0; index < G_N_ELEMENTS(portrait_sizes); ++index) {
+        BrowserChromeMenuGridGeometry portrait =
+            browser_chrome_menu_grid_geometry(portrait_sizes[index][0],
+                                               portrait_sizes[index][1], 7);
+        g_assert_true(portrait.portrait);
+        g_assert_cmpint(portrait.columns, ==, 2);
+        g_assert_cmpint(portrait.rows, ==, 3);
+        g_assert_cmpint(portrait.items_per_page, ==, 6);
+        g_assert_cmpint(portrait.page_count, ==, 2);
+    }
+
+    BrowserChromeMenuGridGeometry one_page =
+        browser_chrome_menu_grid_geometry(280, 936, 6);
+    g_assert_cmpint(one_page.page_count, ==, 1);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/browser/chrome/panel-definitions", test_panel_definitions);
     g_test_add_func("/browser/chrome/toolbar-geometry", test_toolbar_geometry);
+    g_test_add_func("/browser/chrome/menu-grid-geometry", test_menu_grid_geometry);
     return g_test_run();
 }

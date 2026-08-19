@@ -238,13 +238,16 @@ private:
         }
 
         struct sockaddr_un address = { };
-        if (strlen(path) >= sizeof(address.sun_path))
+        size_t pathLength = strlen(path);
+        if (pathLength >= sizeof(address.sun_path)) {
+            warnOnceLocked("video overlay socket path is too long");
             return false;
+        }
         int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
         if (fd < 0)
             return false;
         address.sun_family = AF_UNIX;
-        strcpy(address.sun_path, path);
+        memcpy(address.sun_path, path, pathLength + 1);
         if (connect(fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address))) {
             g_warning("Rockchip video overlay: connect(%s) failed: %s", path, g_strerror(errno));
             close(fd);

@@ -6,6 +6,7 @@ static const ChromePanelDefinition panel_definitions[CHROME_PANEL_COUNT] = {
     [CHROME_PANEL_MENU] = { "menu", CHROME_PANEL_NONE, 0, TRUE, FALSE },
     [CHROME_PANEL_SETTINGS] = { "settings", CHROME_PANEL_MENU, 6, TRUE, TRUE },
     [CHROME_PANEL_LANGUAGE] = { "language", CHROME_PANEL_SETTINGS, 2, TRUE, TRUE },
+    [CHROME_PANEL_ROTATION] = { "rotation", CHROME_PANEL_MENU, 4, TRUE, TRUE },
     [CHROME_PANEL_APPEARANCE] = { "appearance", CHROME_PANEL_SETTINGS, 6, TRUE, TRUE },
     [CHROME_PANEL_WEB] = { "web", CHROME_PANEL_SETTINGS, 5, TRUE, TRUE },
     [CHROME_PANEL_STARTUP] = { "startup & search", CHROME_PANEL_SETTINGS, 4, TRUE, TRUE },
@@ -124,4 +125,22 @@ int browser_chrome_toolbar_button_at(
     int index = (int)((x - geometry->controls_x)
         * geometry->button_count / geometry->controls_width);
     return CLAMP(index, 0, geometry->button_count - 1);
+}
+
+BrowserChromeMenuGridGeometry browser_chrome_menu_grid_geometry(
+    int panel_width, int panel_height, int item_count)
+{
+    panel_width = MAX(1, panel_width);
+    panel_height = MAX(1, panel_height);
+    item_count = MAX(0, item_count);
+
+    BrowserChromeMenuGridGeometry geometry = {
+        .portrait = panel_width < panel_height,
+        .columns = panel_width < panel_height ? 2 : 3,
+        .rows = panel_width < panel_height ? 3 : 2,
+    };
+    geometry.items_per_page = geometry.columns * geometry.rows;
+    geometry.page_count = MAX(1,
+        (item_count + geometry.items_per_page - 1) / geometry.items_per_page);
+    return geometry;
 }

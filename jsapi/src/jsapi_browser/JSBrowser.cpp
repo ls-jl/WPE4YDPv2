@@ -1,9 +1,10 @@
 #include "jqutil_v2/jqutil.h"
 #include "utils/log.h"
 #include "BrowserDisplayConfig.h"
+#include "BrowserFilesystem.h"
+#include "BrowserProcessIdentity.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -20,7 +21,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -35,8 +35,11 @@ namespace {
 
 using display::currentDrmModeSpec;
 using display::normalizeRotationValue;
-using display::parseJsonIntField;
 using display::parseJsonStringField;
+using filesystem::ensureDirectoryTree;
+using filesystem::normalizeDisplayMode;
+using filesystem::readDisplayMode;
+using filesystem::writeDisplayMode;
 
 const char* kTag = "miniapp-browser-launcher";
 const char* kRuntimeRelative = "assets/wpe-runtime";
@@ -96,37 +99,9 @@ static bool fileExists(const std::string& path)
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static bool ensureDir(const std::string& path)
-{
-    if (path.empty()) return false;
-    if (mkdir(path.c_str(), 0700) == 0 || errno == EEXIST) {
-        chmod(path.c_str(), 0700);
-        return true;
-    }
-    return false;
-}
-
 static bool ensureDirRecursive(const std::string& path)
 {
-    if (path.empty()) return false;
-    std::string current;
-    size_t pos = 0;
-    if (path[0] == '/') {
-        current = "/";
-        pos = 1;
-    }
-    while (pos <= path.size()) {
-        size_t slash = path.find('/', pos);
-        std::string part = path.substr(pos, slash == std::string::npos ? std::string::npos : slash - pos);
-        if (!part.empty()) {
-            if (!current.empty() && current[current.size() - 1] != '/') current += "/";
-            current += part;
-            if (!ensureDir(current)) return false;
-        }
-        if (slash == std::string::npos) break;
-        pos = slash + 1;
-    }
-    return true;
+    return ensureDirectoryTree(path, 0700);
 }
 
 static std::string parentDir(const std::string& path)
@@ -167,45 +142,29 @@ static std::string readFile(const std::string& path)
     return ss.str();
 }
 
-static bool writeFile(const std::string& path, const std::string& value, mode_t mode = 0600, bool syncToDisk = true)
-{
-    ensureDirRecursive(parentDir(path));
-    int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, mode);
-    if (fd < 0) return false;
-    const char* ptr = value.data();
-    size_t left = value.size();
-    bool ok = true;
-    while (left > 0) {
-        ssize_t written = write(fd, ptr, left);
-        if (written <= 0) {
-            ok = false;
-            break;
-        }
-        ptr += written;
-        left -= static_cast<size_t>(written);
-    }
-    if (syncToDisk && fsync(fd) != 0) ok = false;
-    close(fd);
-    chmod(path.c_str(), mode);
-    return ok;
-}
-
 static bool writeFileAtomic(const std::string& path, const std::string& value,
     mode_t mode = 0600, bool syncToDisk = true)
 {
-    ensureDirRecursive(parentDir(path));
+    if (!ensureDirRecursive(parentDir(path))) return false;
     std::string pattern = path + ".tmp.XXXXXX";
     std::vector<char> buffer(pattern.begin(), pattern.end());
     buffer.push_back('\0');
     int fd = mkstemp(buffer.data());
     if (fd < 0) return false;
-    fchmod(fd, mode);
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (fchmod(fd, mode) != 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        int savedErrno = errno;
+        close(fd);
+        unlink(buffer.data());
+        errno = savedErrno;
+        return false;
+    }
     const char* ptr = value.data();
     size_t left = value.size();
     bool ok = true;
     while (left > 0) {
         ssize_t written = write(fd, ptr, left);
+        if (written < 0 && errno == EINTR)
+            continue;
         if (written <= 0) {
             ok = false;
             break;
@@ -295,25 +254,76 @@ static bool getBoolProperty(JSContext* ctx, JSValueConst obj, const char* name, 
     return result < 0 ? fallback : result != 0;
 }
 
+static bool getBoundedIntProperty(JSContext* ctx, JSValueConst object, const char* name,
+    int minimum, int maximum, int& result)
+{
+    if (!JS_IsObject(object))
+        return false;
+    JSValue value = JS_GetPropertyStr(ctx, object, name);
+    if (!JS_IsNumber(value)) {
+        JS_FreeValue(ctx, value);
+        return false;
+    }
+    int32_t parsed = 0;
+    const bool valid = JS_ToInt32(ctx, &parsed, value) == 0 && parsed >= minimum && parsed <= maximum;
+    JS_FreeValue(ctx, value);
+    if (valid)
+        result = parsed;
+    return valid;
+}
+
+static std::string getStringObjectProperty(JSContext* ctx, JSValueConst object, const char* name)
+{
+    if (!JS_IsObject(object))
+        return "";
+    JSValue value = JS_GetPropertyStr(ctx, object, name);
+    if (!JS_IsString(value)) {
+        JS_FreeValue(ctx, value);
+        return "";
+    }
+    const char* text = JS_ToCString(ctx, value);
+    std::string result = text ? text : "";
+    if (text)
+        JS_FreeCString(ctx, text);
+    JS_FreeValue(ctx, value);
+    return result;
+}
+
 static bool processExists(pid_t pid)
 {
     return pid > 1 && (kill(pid, 0) == 0 || errno == EPERM);
 }
 
-static pid_t readPidFile(const std::string& path)
+static bool readPidFile(const std::string& path, const std::string& expectedRuntime,
+    const std::string& expectedWorkdir, process::Identity& identity)
 {
-    if (path.empty()) return -1;
-    FILE* fp = std::fopen(path.c_str(), "r");
-    if (!fp) return -1;
-    long pid = -1;
-    if (std::fscanf(fp, "%ld", &pid) != 1) pid = -1;
-    std::fclose(fp);
-    return pid > 1 ? static_cast<pid_t>(pid) : -1;
+    if (path.empty() || !process::parseIdentity(readFile(path), identity))
+        return false;
+    if (!expectedWorkdir.empty() && identity.workdir != expectedWorkdir)
+        return false;
+    // The installed package path can change across an AMR upgrade while the
+    // application data directory remains stable. In that case the protected
+    // workdir is the ownership boundary and the old supervisor must still be
+    // stoppable. Runtime-only callers keep the stricter comparison.
+    if (expectedWorkdir.empty() && !expectedRuntime.empty()
+        && identity.runtimePath != expectedRuntime)
+        return false;
+    if (process::identityMatchesRunningProcess(identity))
+        return true;
+
+    // A supervisor that exited between watchdog polls remains visible in
+    // /proc as a zombie until its MiniApp parent reaps it. Zombies must not be
+    // reported as running, and leaving them unreaped would accumulate one
+    // process for every failed launch.
+    int status = 0;
+    waitpid(identity.pid, &status, WNOHANG);
+    return false;
 }
 
-static bool writePidFile(const std::string& path, pid_t pid)
+static bool writePidFile(const std::string& path, const process::Identity& identity)
 {
-    return writeFile(path, std::to_string(static_cast<long>(pid)) + "\n", 0600);
+    const std::string value = process::serializeIdentity(identity);
+    return !value.empty() && writeFileAtomic(path, value, 0600, true);
 }
 
 static bool isSafeKeyboardId(const std::string& value)
@@ -366,6 +376,34 @@ static int waitForProcessExit(pid_t pid, int timeoutMs)
     return -1;
 }
 
+static bool waitForIdentityExit(const process::Identity& identity, int timeoutMs)
+{
+    const int slices = std::max(1, timeoutMs / 100);
+    for (int i = 0; i < slices; ++i) {
+        int status = 0;
+        pid_t result = waitpid(identity.pid, &status, WNOHANG);
+        if (result == identity.pid)
+            return true;
+        if (!process::identityMatchesRunningProcess(identity))
+            return true;
+        usleep(100000);
+    }
+    int status = 0;
+    if (waitpid(identity.pid, &status, WNOHANG) == identity.pid)
+        return true;
+    return !process::identityMatchesRunningProcess(identity);
+}
+
+static bool signalIdentity(const process::Identity& identity, int signal)
+{
+    if (!process::identityMatchesRunningProcess(identity))
+        return false;
+    if (identity.processGroup > 1)
+        kill(-identity.processGroup, signal);
+    kill(identity.pid, signal);
+    return true;
+}
+
 static pid_t parseProcPid(const char* name)
 {
     if (!name || !name[0]) return -1;
@@ -376,9 +414,24 @@ static pid_t parseProcPid(const char* name)
     return static_cast<pid_t>(value);
 }
 
-static bool containsString(const std::string& value, const std::string& needle)
+static bool environmentValueEquals(const std::string& environment,
+    const std::string& key, const std::string& expected)
 {
-    return !needle.empty() && value.find(needle) != std::string::npos;
+    if (key.empty() || expected.empty())
+        return false;
+    const std::string prefix = key + "=";
+    size_t position = 0;
+    while (position < environment.size()) {
+        size_t end = environment.find('\0', position);
+        if (end == std::string::npos)
+            end = environment.size();
+        if (end - position >= prefix.size()
+            && environment.compare(position, prefix.size(), prefix) == 0
+            && environment.compare(position + prefix.size(), end - position - prefix.size(), expected) == 0)
+            return true;
+        position = end + 1;
+    }
+    return false;
 }
 
 static std::string toLowerAscii(std::string value)
@@ -413,21 +466,14 @@ static bool isBrowserProcessName(const std::string& cmdline)
         cmdline.find("WPENetworkProcess") != std::string::npos;
 }
 
-static void signalProcessTree(pid_t pid, int signo)
+static std::vector<process::Identity> collectScopedBrowserProcesses(
+    const std::string& runtimePath, const std::string& workdir)
 {
-    if (pid <= 1) return;
-    pid_t pgid = getpgid(pid);
-    if (pgid > 1) kill(-pgid, signo);
-    kill(pid, signo);
-}
-
-static std::vector<pid_t> collectScopedBrowserPids(const std::string& runtimePath, const std::string& workdir)
-{
-    std::vector<pid_t> pids;
-    if (runtimePath.empty() && workdir.empty()) return pids;
+    std::vector<process::Identity> processes;
+    if (runtimePath.empty() && workdir.empty()) return processes;
 
     DIR* proc = opendir("/proc");
-    if (!proc) return pids;
+    if (!proc) return processes;
 
     struct dirent* entry = nullptr;
     while ((entry = readdir(proc)) != nullptr) {
@@ -439,25 +485,27 @@ static std::vector<pid_t> collectScopedBrowserPids(const std::string& runtimePat
         if (cmdline.empty() || !isBrowserProcessName(cmdline)) continue;
 
         std::string environ = readFile(joinPath(procDir, "environ"));
-        const bool scoped = (!runtimePath.empty() && (containsString(cmdline, runtimePath) ||
-            containsString(environ, runtimePath))) ||
-            (!workdir.empty() && (containsString(cmdline, workdir) ||
-            containsString(environ, workdir)));
-        if (scoped) pids.push_back(pid);
+        const bool scoped = !workdir.empty()
+            ? environmentValueEquals(environ, "WPE_VAR_DIR", workdir)
+            : (!runtimePath.empty()
+                && environmentValueEquals(environ, "WPE_MESA_DIR", runtimePath));
+        process::Identity identity;
+        if (scoped && process::captureIdentity(pid, runtimePath, workdir, identity))
+            processes.push_back(identity);
     }
     closedir(proc);
-    return pids;
+    return processes;
 }
 
-static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
+static void cleanupBrowserProcesses(const std::vector<process::Identity>& processes)
 {
-    std::vector<pid_t> pids = collectScopedBrowserPids(runtimePath, workdir);
-    if (pids.empty()) return;
-    for (pid_t pid : pids) signalProcessTree(pid, SIGTERM);
+    if (processes.empty()) return;
+    for (const auto& identity : processes)
+        signalIdentity(identity, SIGTERM);
     for (int i = 0; i < 20; ++i) {
         bool anyRunning = false;
-        for (pid_t pid : pids) {
-            if (processExists(pid)) {
+        for (const auto& identity : processes) {
+            if (process::identityMatchesRunningProcess(identity)) {
                 anyRunning = true;
                 break;
             }
@@ -465,7 +513,13 @@ static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const 
         if (!anyRunning) return;
         usleep(100000);
     }
-    for (pid_t pid : pids) signalProcessTree(pid, SIGKILL);
+    for (const auto& identity : processes)
+        signalIdentity(identity, SIGKILL);
+}
+
+static void cleanupScopedBrowserProcesses(const std::string& runtimePath, const std::string& workdir)
+{
+    cleanupBrowserProcesses(collectScopedBrowserProcesses(runtimePath, workdir));
 }
 
 static bool regularFileNoFollow(const std::string& path, struct stat* result = nullptr)
@@ -642,11 +696,13 @@ public:
         const std::string panelSize = getStringProperty(ctx, options, "panelSize", viewport);
         const std::string drmMode = getStringProperty(ctx, options, "drmMode", "");
         const std::string displaySource = getStringProperty(ctx, options, "displaySource", "unknown");
-        const std::string browserMode = getStringProperty(ctx, options, "browserMode", "");
+        const std::string layoutTemplate = getStringProperty(ctx, options, "layoutTemplate", "unknown");
+        const std::string requestedBrowserMode = getStringProperty(ctx, options, "browserMode", "last");
         const std::string touchDevice = getStringProperty(ctx, options, "touchDevice", "");
         const std::string gpuMode = getStringProperty(ctx, options, "gpuMode", "auto");
         const std::string drm = getStringProperty(ctx, options, "drm", "/dev/dri/card0");
         const int rotation = getIntProperty(ctx, options, "rotation", kDefaultRotation);
+        const int layoutRotation = getIntProperty(ctx, options, "layoutRotation", rotation);
         const int touchRotation = getIntProperty(ctx, options, "touchRotation", rotation);
         const int touchOffsetX = getIntProperty(ctx, options, "touchOffsetX", 0);
         const int touchOffsetY = getIntProperty(ctx, options, "touchOffsetY", 0);
@@ -676,6 +732,17 @@ public:
             throwError(info, std::string("mkdir failed: ") + workdir);
             return;
         }
+        std::string browserMode = requestedBrowserMode == "last" || requestedBrowserMode.empty()
+            ? readDisplayMode(workdir) : normalizeDisplayMode(requestedBrowserMode);
+        if (browserMode.empty()) {
+            throwError(info, std::string("invalid browserMode: ") + requestedBrowserMode);
+            return;
+        }
+        std::string displayModeError;
+        if (!writeDisplayMode(workdir, browserMode, &displayModeError)) {
+            throwError(info, displayModeError);
+            return;
+        }
         removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "requests"));
         removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "responses"));
         removeRecursive(joinPath(keyboardDirForWorkdir(workdir), "status"));
@@ -686,7 +753,7 @@ public:
         ensureDirRecursive(parentDir(logPath));
 
         const std::string pidFile = joinPath(workdir, "browser.pid");
-        stopBrowserByPath(pidFile);
+        stopBrowserByPath(pidFile, runtimePath, workdir);
         cleanupScopedBrowserProcesses(runtimePath, workdir);
         unlink(browserExitStatusPath(workdir).c_str());
 
@@ -718,6 +785,7 @@ public:
             setenv("WPE_BROWSER_DB", joinPath(workdir, "browser.sqlite3").c_str(), 1);
             setenv("WPE_PROFILES_DIR", joinPath(workdir, "profiles").c_str(), 1);
             setenv("WPE_PROFILE_SWITCH_FILE", joinPath(workdir, "profile-switch.request").c_str(), 1);
+            setenv("WPE_DISPLAY_MODE_FILE", joinPath(workdir, "display-mode").c_str(), 1);
             setenv("WPE_CHROME_FONT", joinPath(runtimePath, "assets/fonts/miniapp/HarmonyOS_Sans_SC_Regular.ttf").c_str(), 1);
             setenv("WPE_CHROME_FONT_MEDIUM", joinPath(runtimePath, "assets/fonts/miniapp/HarmonyOS_Sans_SC_Medium.ttf").c_str(), 1);
             setenv("WPE_CHROME_FONT_BOLD", joinPath(runtimePath, "assets/fonts/miniapp/HarmonyOS_Sans_SC_Bold.ttf").c_str(), 1);
@@ -728,6 +796,7 @@ public:
             const std::string overlayZposValue = std::to_string(overlayZpos);
             setenv("WPE_DRM_ZPOS", overlayZposValue.c_str(), 1);
             const std::string rotationValue = std::to_string(rotation);
+            const std::string layoutRotationValue = std::to_string(layoutRotation);
             const std::string touchRotationValue = std::to_string(touchRotation);
             if (!panelSize.empty()) setenv("WPE_PANEL_SIZE", panelSize.c_str(), 1);
             if (!viewport.empty()) {
@@ -736,7 +805,9 @@ public:
             }
             if (!drmMode.empty()) setenv("WPE_DRM_MODE", drmMode.c_str(), 1);
             if (!displaySource.empty()) setenv("WPE_DISPLAY_SOURCE", displaySource.c_str(), 1);
-            if (!browserMode.empty()) setenv("WPE_BROWSER_MODE", browserMode.c_str(), 1);
+            if (!layoutTemplate.empty()) setenv("WPE_LAYOUT_TEMPLATE", layoutTemplate.c_str(), 1);
+            setenv("WPE_LAYOUT_ROTATION", layoutRotationValue.c_str(), 1);
+            setenv("WPE_BROWSER_MODE", browserMode.c_str(), 1);
             setenv("WPE_PANEL_ROTATION", rotationValue.c_str(), 1);
             setenv("WPE_TOUCH_ROTATION", touchRotationValue.c_str(), 1);
             if (!touchDevice.empty()) setenv("WPE_TOUCH_DEVICE", touchDevice.c_str(), 1);
@@ -771,6 +842,30 @@ public:
             _exit(127);
         }
 
+        // Establish the process group from the parent as well, closing the
+        // short race before the child reaches setpgid().
+        if (setpgid(pid, pid) != 0 && errno != EACCES && errno != EEXIST)
+            LOGI("%s warning: setpgid(%ld) failed: %s", kTag, static_cast<long>(pid), std::strerror(errno));
+
+        process::Identity identity;
+        bool identityReady = false;
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            if (process::captureIdentity(pid, runtimePath, workdir, identity)) {
+                identityReady = true;
+                break;
+            }
+            usleep(10000);
+        }
+        if (!identityReady || !writePidFile(pidFile, identity)) {
+            if (identityReady)
+                signalIdentity(identity, SIGTERM);
+            else
+                kill(pid, SIGTERM);
+            waitForProcessExit(pid, 1000);
+            throwError(info, std::string("browser process identity write failed: ") + pidFile);
+            return;
+        }
+
         {
             std::lock_guard<std::mutex> lock(processMutex_);
             browserPid_ = pid;
@@ -778,7 +873,6 @@ public:
             workdir_ = workdir;
             runtimePath_ = runtimePath;
         }
-        writePidFile(pidFile, pid);
         publishState("running", "pid=" + std::to_string(static_cast<long>(pid)));
         info.GetReturnValue().Set(static_cast<int32_t>(pid));
     }
@@ -791,36 +885,42 @@ public:
         std::string pidFile;
         std::string runtimePath;
         std::string scopedWorkdir;
-        pid_t pid = -1;
+        process::Identity identity;
+        bool identityValid = false;
         {
             std::lock_guard<std::mutex> lock(processMutex_);
             pidFile = !workdir.empty() ? joinPath(workdir, "browser.pid") : pidFile_;
             runtimePath = runtimePath_;
             scopedWorkdir = !workdir.empty() ? workdir : workdir_;
-            if (!pidFile.empty() && pidFile == pidFile_ && browserPid_ > 1) pid = browserPid_;
         }
-        if (pid <= 1) pid = readPidFile(pidFile);
+        identityValid = readPidFile(pidFile, runtimePath, scopedWorkdir, identity);
+        const auto scopedProcesses = collectScopedBrowserProcesses(runtimePath, scopedWorkdir);
 
-        // SIGTERM 同步发出;等待退出/升级 SIGKILL/残留进程清理放到后台线程,
-        // 避免最坏 ~5s 的 usleep 循环阻塞 miniapp JS 线程(startBrowser 里的
-        // 同步等待保持不变——新实例启动前必须确认旧实例释放 DRM)。
-        if (pid > 1) {
-            kill(-pid, SIGTERM);
-            kill(pid, SIGTERM);
-        }
+        // Complete cleanup before returning. The JSAPI object is a process-wide
+        // singleton and the framework may disable or unload its native module
+        // after page teardown; a detached native thread would then execute
+        // unmapped code. Normal exits complete quickly, while the waits below
+        // remain bounded for damaged processes.
+        if (identityValid)
+            signalIdentity(identity, SIGTERM);
+        else if (!pidFile.empty())
+            unlink(pidFile.c_str());
         {
             std::lock_guard<std::mutex> lock(processMutex_);
             if (pidFile.empty() || pidFile == pidFile_) browserPid_ = -1;
         }
-        std::thread([pid, pidFile, runtimePath, scopedWorkdir]() {
-            if (pid > 1 && waitForProcessExit(pid, 2000) != 0) {
-                kill(-pid, SIGKILL);
-                kill(pid, SIGKILL);
-                waitForProcessExit(pid, 1000);
-            }
-            if (!pidFile.empty()) unlink(pidFile.c_str());
-            cleanupScopedBrowserProcesses(runtimePath, scopedWorkdir);
-        }).detach();
+        if (identityValid && !waitForIdentityExit(identity, 2000)) {
+            signalIdentity(identity, SIGKILL);
+            waitForIdentityExit(identity, 1000);
+        }
+        if (identityValid && !pidFile.empty()) {
+            process::Identity recorded;
+            if (process::parseIdentity(readFile(pidFile), recorded)
+                && recorded.pid == identity.pid
+                && recorded.startTime == identity.startTime)
+                unlink(pidFile.c_str());
+        }
+        cleanupBrowserProcesses(scopedProcesses);
         publishState("stopped", "ok");
         info.GetReturnValue().Set(true);
     }
@@ -831,14 +931,17 @@ public:
         JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
         const std::string workdir = normalizeWorkdir(getStringProperty(ctx, options, "workdir", ""));
         std::string pidFile;
-        pid_t pid = -1;
+        std::string runtimePath;
+        process::Identity identity;
         {
             std::lock_guard<std::mutex> lock(processMutex_);
             pidFile = !workdir.empty() ? joinPath(workdir, "browser.pid") : pidFile_;
-            pid = browserPid_;
+            runtimePath = runtimePath_;
         }
-        if (pid <= 1) pid = readPidFile(pidFile);
-        info.GetReturnValue().Set(processExists(pid));
+        const bool running = readPidFile(pidFile, runtimePath, workdir, identity);
+        if (!running && !pidFile.empty())
+            unlink(pidFile.c_str());
+        info.GetReturnValue().Set(running);
     }
 
     void consumeBrowserExitStatus(JQFunctionInfo& info)
@@ -1089,6 +1192,7 @@ public:
 
     void getSystemDisplayConfig(JQFunctionInfo& info)
     {
+        JSContext* ctx = info.GetContext();
         const std::string cfg = readFile("/etc/miniapp/resources/cfg.json");
         int width = 0;
         int height = 0;
@@ -1100,16 +1204,32 @@ public:
         int fpsMax = 0;
         std::string touchDevice;
 
+        std::string source = cfg.empty() ? "missing" : "invalid";
         if (!cfg.empty()) {
-            parseJsonIntField(cfg, "width", width);
-            parseJsonIntField(cfg, "height", height);
-            parseJsonIntField(cfg, "direction", direction);
-            parseJsonIntField(cfg, "video_direction", videoDirection);
-            parseJsonIntField(cfg, "tp_direction", touchDirection);
-            parseJsonIntField(cfg, "tp_xoffset", touchOffsetX);
-            parseJsonIntField(cfg, "tp_yoffset", touchOffsetY);
-            parseJsonIntField(cfg, "fps_max", fpsMax);
-            touchDevice = parseJsonStringField(cfg, "tp");
+            JSValue root = JS_ParseJSON(ctx, cfg.c_str(), cfg.size(), "miniapp-display-config");
+            if (!JS_IsException(root) && JS_IsObject(root)) {
+                JSValue screen = JS_GetPropertyStr(ctx, root, "screen");
+                JSValue device = JS_GetPropertyStr(ctx, root, "device");
+                const bool dimensionsValid =
+                    getBoundedIntProperty(ctx, screen, "width", 64, 4096, width) &&
+                    getBoundedIntProperty(ctx, screen, "height", 64, 4096, height);
+                getBoundedIntProperty(ctx, screen, "direction", -1080, 1080, direction);
+                getBoundedIntProperty(ctx, screen, "video_direction", -1080, 1080, videoDirection);
+                getBoundedIntProperty(ctx, screen, "tp_direction", -1080, 1080, touchDirection);
+                getBoundedIntProperty(ctx, screen, "tp_xoffset", -4096, 4096, touchOffsetX);
+                getBoundedIntProperty(ctx, screen, "tp_yoffset", -4096, 4096, touchOffsetY);
+                getBoundedIntProperty(ctx, screen, "fps_max", 1, 240, fpsMax);
+                touchDevice = getStringObjectProperty(ctx, device, "tp");
+                if (touchDevice.size() > 255 || (!touchDevice.empty() && touchDevice[0] != '/'))
+                    touchDevice.clear();
+                source = dimensionsValid ? "system_cfg" : "invalid";
+                JS_FreeValue(ctx, screen);
+                JS_FreeValue(ctx, device);
+            } else if (JS_IsException(root)) {
+                JSValue exception = JS_GetException(ctx);
+                JS_FreeValue(ctx, exception);
+            }
+            JS_FreeValue(ctx, root);
         }
 
         direction = normalizeRotationValue(direction, kDefaultRotation);
@@ -1126,7 +1246,7 @@ public:
 
         std::ostringstream ss;
         ss << "{";
-        ss << "\"source\":\"" << (cfg.empty() ? "missing" : "system_cfg") << "\",";
+        ss << "\"source\":\"" << source << "\",";
         ss << "\"width\":" << width << ",";
         ss << "\"height\":" << height << ",";
         ss << "\"panelSize\":\"" << jsonEscape(panelSize) << "\",";
@@ -1145,6 +1265,15 @@ public:
     void getDrmScreenSize(JQFunctionInfo& info)
     {
         info.GetReturnValue().Set(currentDrmModeSpec());
+    }
+
+    void getDisplayMode(JQFunctionInfo& info)
+    {
+        JSContext* ctx = info.GetContext();
+        JSValueConst options = info.Length() > 0 ? info[0] : JS_UNDEFINED;
+        const std::string workdir = normalizeWorkdir(
+            getStringProperty(ctx, options, "workdir", ""));
+        info.GetReturnValue().Set(readDisplayMode(workdir));
     }
 
 protected:
@@ -1179,27 +1308,21 @@ private:
         info.GetReturnValue().ThrowInternalError("%s", message.c_str());
     }
 
-    void stopBrowserByPath(const std::string& pidFile)
+    void stopBrowserByPath(const std::string& pidFile, const std::string& runtimePath,
+        const std::string& workdir)
     {
-        pid_t pid = -1;
-        {
-            std::lock_guard<std::mutex> lock(processMutex_);
-            if (!pidFile.empty() && pidFile == pidFile_ && browserPid_ > 1) pid = browserPid_;
-        }
-        if (pid <= 1) pid = readPidFile(pidFile);
-        if (pid <= 1) {
+        process::Identity identity;
+        if (!readPidFile(pidFile, runtimePath, workdir, identity)) {
             if (!pidFile.empty()) unlink(pidFile.c_str());
             std::lock_guard<std::mutex> lock(processMutex_);
             if (pidFile.empty() || pidFile == pidFile_) browserPid_ = -1;
             return;
         }
 
-        kill(-pid, SIGTERM);
-        kill(pid, SIGTERM);
-        if (waitForProcessExit(pid, 2000) != 0) {
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
-            waitForProcessExit(pid, 1000);
+        signalIdentity(identity, SIGTERM);
+        if (!waitForIdentityExit(identity, 2000)) {
+            signalIdentity(identity, SIGKILL);
+            waitForIdentityExit(identity, 1000);
         }
 
         if (!pidFile.empty()) unlink(pidFile.c_str());
@@ -1240,6 +1363,7 @@ static JSValue createBrowserPlayer(JQModuleEnv* env)
     tpl->SetProtoMethod("reportKeyboardBackend", &JSBrowserPlayer::reportKeyboardBackend);
     tpl->SetProtoMethod("getSystemDisplayConfig", &JSBrowserPlayer::getSystemDisplayConfig);
     tpl->SetProtoMethod("getDrmScreenSize", &JSBrowserPlayer::getDrmScreenSize);
+    tpl->SetProtoMethod("getDisplayMode", &JSBrowserPlayer::getDisplayMode);
     return tpl->CallConstructor();
 }
 

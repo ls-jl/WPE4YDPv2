@@ -1,0 +1,87 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -1193,6 +1193,15 @@
+     if (!cache.valid)
+         refreshChromeRenderState();
+     return cache.state;
++}
++
++static bool nativeChromeCompositionRequired()
++{
++    // A direct DMA-BUF cannot be modified in place. Keep the full-panel dumb
++    // composition path alive whenever native chrome is enabled so a toolbar or
++    // menu can be shown without waiting for (or reverting to) a stale WebKit
++    // frame. This also restores the toolbar for absolute rotation 0.
++    return cachedChromeRenderState().enabled;
+ }
+ 
+ static double chromeShownFraction(const ChromeRenderState& chrome)
+@@ -3911,14 +3920,11 @@
+     auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
+ 
+     if (WPE_IS_BUFFER_DMA_BUF(buffer)) {
+-        if (rotation != OutputRotation::Rotate0)
++        if (rotation != OutputRotation::Rotate0 || nativeChromeCompositionRequired())
+             return nextRotatedDMABufBuffer(view, buffer, rotation, error);
+ 
+-        // 未旋转的 dmabuf 直接进 zero-copy scanout（无 CPU 合成步骤），
+-        // drawChromeOverlay() 只在 CPU 拷贝路径（SHM / 旋转 dumb）里调用，
+-        // 因此这条路径下不会画 WPE 侧工具栏。这是当前直扫设计的固有限制，
+-        // 不是遗漏：若默认配置（rotation=0 + WPE_DRM_BUFFER_PATH=dma_heap）
+-        // 需要工具栏常驻，要么强制走 dumb 合成路径，要么把工具栏做成独立 plane。
++        // Native chrome is disabled, so an unrotated DMA-BUF can remain on the
++        // zero-copy scanout path.
+         auto* userData = static_cast<WPEBufferDRMUserData*>(wpe_buffer_get_user_data(buffer));
+         auto* scanoutBuffer = userData ? userData->scanoutBuffer : nullptr;
+         if (!scanoutBuffer)
+@@ -3927,7 +3933,7 @@
+     }
+ 
+     if (WPE_IS_BUFFER_SHM(buffer)) {
+-        if (rotation != OutputRotation::Rotate0)
++        if (rotation != OutputRotation::Rotate0 || nativeChromeCompositionRequired())
+             return nextRotatedSHMBuffer(view, buffer, rotation, error);
+         return nextSHMDumbBuffer(view, buffer, error);
+     }
+@@ -4019,18 +4025,18 @@
+     height = mode->vdisplay;
+ 
+     if (shouldUsePanelNativeFit()) {
+-        auto panel = configuredPanelSize();
+-        bool framebufferIsRotatedPanel = buffer.width() == panel.height && buffer.height() == panel.width;
+-        if (framebufferIsRotatedPanel) {
+-            width = std::min<uint32_t>(buffer.width(), mode->hdisplay);
+-            height = std::min<uint32_t>(buffer.height(), mode->vdisplay);
+-            uint32_t maxX = mode->hdisplay > width ? mode->hdisplay - width : 0;
+-            if (auto configuredX = configuredRotatedXOffset(maxX))
+-                x = configuredX.value();
+-            else
+-                x = maxX / 2;
+-            y = mode->vdisplay > height ? (mode->vdisplay - height) / 2 : 0;
+-        }
++        // panel-native is a 1:1 pixel policy. The DRM mode is only the scanout
++        // envelope and must never silently scale a panel or content buffer.
++        // Oversized buffers are clipped; smaller buffers are centered (with an
++        // optional calibrated X offset for panels exposed through a wider mode).
++        width = std::min<uint32_t>(buffer.width(), mode->hdisplay);
++        height = std::min<uint32_t>(buffer.height(), mode->vdisplay);
++        uint32_t maxX = mode->hdisplay > width ? mode->hdisplay - width : 0;
++        if (auto configuredX = configuredRotatedXOffset(maxX))
++            x = configuredX.value();
++        else
++            x = maxX / 2;
++        y = mode->vdisplay > height ? (mode->vdisplay - height) / 2 : 0;
+         return;
+     }
+ 
+@@ -5098,7 +5104,9 @@
+ 
+ static bool bufferNeedsCPURead(WPEBuffer* buffer, OutputRotation rotation)
+ {
+-    return WPE_IS_BUFFER_SHM(buffer) || (WPE_IS_BUFFER_DMA_BUF(buffer) && rotation != OutputRotation::Rotate0);
++    return WPE_IS_BUFFER_SHM(buffer)
++        || (WPE_IS_BUFFER_DMA_BUF(buffer)
++            && (rotation != OutputRotation::Rotate0 || nativeChromeCompositionRequired()));
+ }
+ 
+ static bool waitForRenderingFence(WPEViewDRM* view, const UnixFileDescriptor& fence)

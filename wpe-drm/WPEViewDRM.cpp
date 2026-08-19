@@ -33,6 +33,7 @@
 #include "WPEToplevelDRM.h"
 #include "WPEBufferSHM.h"
 #include "WPEViewDRMPrivate.h"
+#include "VideoReleaseQueue.h"
 #include <drm_fourcc.h>
 #include <drm_mode.h>
 #include <dlfcn.h>
@@ -139,6 +140,12 @@ struct RGAHandleParameters {
     uint32_t format;
 };
 
+struct RGACachedHandle {
+    int fd { -1 };
+    RGAHandleParameters parameters { };
+    RGABufferHandle handle { 0 };
+};
+
 struct RGARect {
     int x;
     int y;
@@ -171,7 +178,8 @@ public:
         uint32_t sourceStride, uint32_t sourceFormat, int destinationFD,
         uint32_t destinationWidth, uint32_t destinationHeight,
         uint32_t destinationStride, OutputRotation rotation, gint64& durationUS,
-        RGARect destinationRect = { })
+        RGARect destinationRect = { }, RGACachedHandle* sourceCache = nullptr,
+        RGACachedHandle* destinationCache = nullptr)
     {
         durationUS = 0;
         if (!shouldAttempt())
@@ -179,7 +187,7 @@ public:
 
         int sourceRGAFormat = drmFormatToRGA(sourceFormat);
         int transform = rotationToRGA(rotation);
-        if (sourceRGAFormat < 0 || !transform)
+        if (sourceRGAFormat < 0 || (rotation != OutputRotation::Rotate0 && !transform))
             return fail("unsupported format or rotation");
 
         RGAHandleParameters sourceParameters {
@@ -192,13 +200,18 @@ public:
             destinationHeight,
             static_cast<uint32_t>(rkFormatBGRA8888),
         };
-        RGABufferHandle sourceHandle = m_importBufferFD(sourceFD, &sourceParameters);
-        RGABufferHandle destinationHandle = m_importBufferFD(destinationFD, &destinationParameters);
+        RGACachedHandle localSource;
+        RGACachedHandle localDestination;
+        auto& cachedSource = sourceCache ? *sourceCache : localSource;
+        auto& cachedDestination = destinationCache ? *destinationCache : localDestination;
+        RGABufferHandle sourceHandle = importHandle(sourceFD, sourceParameters, cachedSource);
+        RGABufferHandle destinationHandle = importHandle(destinationFD,
+            destinationParameters, cachedDestination);
         if (!sourceHandle || !destinationHandle) {
-            if (destinationHandle)
-                m_releaseBufferHandle(destinationHandle);
-            if (sourceHandle)
-                m_releaseBufferHandle(sourceHandle);
+            if (!sourceCache)
+                releaseCachedHandle(cachedSource);
+            if (!destinationCache)
+                releaseCachedHandle(cachedDestination);
             return fail("importbuffer_fd failed");
         }
 
@@ -215,27 +228,42 @@ public:
         bool useDestinationRect = destinationRect.x || destinationRect.y
             || destinationRect.width != static_cast<int>(destinationWidth)
             || destinationRect.height != static_cast<int>(destinationHeight);
-        if (useDestinationRect && m_process) {
+        bool useProcess = m_process
+            && (rotation == OutputRotation::Rotate0 || useDestinationRect);
+        if (useProcess) {
             RGABuffer pattern { };
             RGARect sourceRect { 0, 0, static_cast<int>(sourceWidth),
                 static_cast<int>(sourceHeight) };
             RGARect patternRect { };
             result = m_process(source, destination, pattern, sourceRect,
                 destinationRect, patternRect, transform);
-        } else if (!useDestinationRect)
+        } else if (!useDestinationRect && rotation != OutputRotation::Rotate0)
             result = m_rotate(source, destination, transform, 1);
         else
             result = 0;
         durationUS = g_get_monotonic_time() - startUS;
-        m_releaseBufferHandle(destinationHandle);
-        m_releaseBufferHandle(sourceHandle);
+        if (!sourceCache)
+            releaseCachedHandle(cachedSource);
+        if (!destinationCache)
+            releaseCachedHandle(cachedDestination);
         if (result <= 0)
-            return fail(useDestinationRect
-                ? "improcess inset rotation failed" : "imrotate_t failed", result);
+            return fail(useProcess ? "improcess blit failed"
+                : useDestinationRect ? "improcess inset rotation unavailable"
+                                     : "imrotate_t failed", result);
 
         m_consecutiveFailures = 0;
         return true;
     }
+
+    void releaseCachedHandle(RGACachedHandle& cache)
+    {
+        if (cache.handle && m_releaseBufferHandle)
+            m_releaseBufferHandle(cache.handle);
+        cache = { };
+    }
+
+    uint64_t importCount() const { return m_importCount; }
+    uint64_t reuseCount() const { return m_reuseCount; }
 
 private:
     using ImportBufferFDFunction = RGABufferHandle (*)(int, RGAHandleParameters*);
@@ -280,6 +308,28 @@ private:
             return 0;
         }
         return 0;
+    }
+
+    RGABufferHandle importHandle(int fd, const RGAHandleParameters& parameters,
+        RGACachedHandle& cache)
+    {
+        bool matches = cache.handle && cache.fd == fd
+            && cache.parameters.width == parameters.width
+            && cache.parameters.height == parameters.height
+            && cache.parameters.format == parameters.format;
+        if (matches) {
+            m_reuseCount++;
+            return cache.handle;
+        }
+        releaseCachedHandle(cache);
+        cache.fd = fd;
+        cache.parameters = parameters;
+        cache.handle = m_importBufferFD(fd, &cache.parameters);
+        if (cache.handle)
+            m_importCount++;
+        else
+            cache = { };
+        return cache.handle;
     }
 
     bool load()
@@ -335,6 +385,8 @@ private:
     ReleaseBufferHandleFunction m_releaseBufferHandle { nullptr };
     RotateFunction m_rotate { nullptr };
     ProcessFunction m_process { nullptr };
+    uint64_t m_importCount { 0 };
+    uint64_t m_reuseCount { 0 };
 };
 
 struct ChromeGlyph {
@@ -679,6 +731,7 @@ static uint64_t drmPlaneRotate0Value()
 }
 
 static uint32_t chromeReservedTopInset(uint32_t panelHeight);
+static uint32_t chromeFrameTopInset(uint32_t panelHeight, uint32_t sourceHeight);
 
 static void fillARGB8888(uint8_t* destination, uint32_t destinationPitch, uint32_t width, uint32_t height, uint32_t color)
 {
@@ -829,7 +882,7 @@ static void copyRotatedARGB8888(const uint8_t* source, uint32_t sourceWidth, uin
 {
     auto destinationWidth = rotatedWidth(panelWidth, panelHeight, rotation);
     auto destinationHeight = rotatedHeight(panelWidth, panelHeight, rotation);
-    auto topInset = chromeReservedTopInset(panelHeight);
+    auto topInset = chromeFrameTopInset(panelHeight, sourceHeight);
     if (topInset || panelWidth != sourceWidth || panelHeight != sourceHeight) {
         uint32_t copyWidth = std::min(sourceWidth, panelWidth);
         uint32_t availableHeight = panelHeight > topInset ? panelHeight - topInset : 0;
@@ -1193,6 +1246,15 @@ static const ChromeRenderState& cachedChromeRenderState()
     return cache.state;
 }
 
+static bool nativeChromeCompositionRequired()
+{
+    // A direct DMA-BUF cannot be modified in place. Keep the full-panel dumb
+    // composition path alive whenever native chrome is enabled so a toolbar or
+    // menu can be shown without waiting for (or reverting to) a stale WebKit
+    // frame. This also restores the toolbar for absolute rotation 0.
+    return cachedChromeRenderState().enabled;
+}
+
 static double chromeShownFraction(const ChromeRenderState& chrome)
 {
     double fraction = chrome.visible ? 1.0 : 0.0;
@@ -1218,6 +1280,48 @@ static uint32_t chromeReservedTopInset(uint32_t panelHeight)
         return (chrome.visible || hasPanel) ? chromeHeight : 0;
 
     return std::min<uint32_t>(chromeHeight, static_cast<uint32_t>(std::lround(chromeHeight * chromeShownFraction(chrome))));
+}
+
+// The render-state file and WebKit's resized frame are published through
+// independent event loops. During a toolbar toggle, a 960x222 content frame
+// can therefore arrive while the DRM side still has the previous visible
+// state. In resize mode the frame height is authoritative: a frame shorter by
+// exactly one toolbar height belongs below that toolbar, while a panel-height
+// frame starts at y=0. This prevents a short frame from being placed at the
+// top and leaving a toolbar-sized black strip at the opposite edge.
+static uint32_t chromeFrameTopInset(uint32_t panelHeight, uint32_t sourceHeight)
+{
+    auto stateInset = chromeReservedTopInset(panelHeight);
+    if (!chromeLayoutResizeEnabled() || !panelHeight)
+        return stateInset;
+
+    uint32_t frameInset = 0;
+    if (sourceHeight < panelHeight) {
+        const auto& chrome = cachedChromeRenderState();
+        auto chromeHeight = std::min<uint32_t>(
+            std::clamp<unsigned>(chrome.height, 24, 80), panelHeight - 1);
+        auto missingHeight = panelHeight - sourceHeight;
+        if (missingHeight + 2 >= chromeHeight
+            && missingHeight <= chromeHeight + 2)
+            frameInset = std::min(missingHeight, chromeHeight);
+        else
+            return stateInset;
+    }
+
+    if (frameInset != stateInset) {
+        static uint32_t lastStateInset = UINT32_MAX;
+        static uint32_t lastFrameInset = UINT32_MAX;
+        static uint32_t lastSourceHeight = UINT32_MAX;
+        if (stateInset != lastStateInset || frameInset != lastFrameInset
+            || sourceHeight != lastSourceHeight) {
+            g_message("WPEViewDRM chrome frame geometry reconciled: state_inset=%u frame_inset=%u source_height=%u panel_height=%u",
+                stateInset, frameInset, sourceHeight, panelHeight);
+            lastStateInset = stateInset;
+            lastFrameInset = frameInset;
+            lastSourceHeight = sourceHeight;
+        }
+    }
+    return frameInset;
 }
 
 static bool chromeAnimationActive()
@@ -1753,6 +1857,12 @@ static void drawChromeMenuIcon(PanelPixelWriter& painter, const char* id,
         painter.drawArc(centerX, centerY, 9, 0, 359, 2, color);
         painter.fillCircle(centerX, centerY - 4, 2, color);
         painter.drawLine(centerX, centerY, centerX, centerY + 6, 2, color);
+    } else if (!strcmp(id, "rotation")) {
+        painter.drawArc(centerX, centerY, 9, 35, 315, 2, color);
+        painter.fillTriangle(centerX + 9, centerY - 1,
+                             centerX + 2, centerY - 2,
+                             centerX + 7, centerY - 8, color);
+        painter.fillCircle(centerX - 8, centerY + 4, 1, color);
     } else {
         painter.drawArc(centerX, centerY, 7, 0, 359, 3, color);
         painter.fillCircle(centerX, centerY, 3, color);
@@ -2238,6 +2348,7 @@ struct WPEBufferDRMUserData {
     void* sourceMapping { nullptr };
     size_t sourceMappingSize { 0 };
     uint32_t sourceMappingStride { 0 };
+    RGACachedHandle rgaSourceHandle;
     void resetSourceMapping();
     ~WPEBufferDRMUserData();
 };
@@ -2393,6 +2504,7 @@ public:
     ~DRMScanoutBuffer()
     {
         finishRGAAccess();
+        RockchipRGA::singleton().releaseCachedHandle(m_rgaDestinationHandle);
         if (m_rgaPrimeFD >= 0)
             close(m_rgaPrimeFD);
 
@@ -2620,7 +2732,7 @@ public:
         size_t mapSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(sourceStride) * sourceHeight;
         int sourceFD = wpe_buffer_dma_buf_get_fd(dmaBuffer, 0);
         auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
-        auto topInset = chromeReservedTopInset(panel.height);
+        auto topInset = chromeFrameTopInset(panel.height, sourceHeight);
         uint32_t availableHeight = panel.height > topInset
             ? panel.height - topInset : 0;
         uint32_t copyWidth = std::min(sourceWidth, panel.width);
@@ -2656,9 +2768,11 @@ public:
                 struct dma_buf_sync clearEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
                 ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &clearEnd);
             }
+            auto* userData = ensureBufferUserData(buffer);
             if (m_rgaPrimeFD >= 0 && rga.rotate(sourceFD, sourceWidth, sourceHeight,
                     sourceStride, sourceFormat, m_rgaPrimeFD, m_width, m_height,
-                    m_pitch, rotation, m_lastRGADurationUS, destinationRect)) {
+                    m_pitch, rotation, m_lastRGADurationUS, destinationRect,
+                    &userData->rgaSourceHandle, &m_rgaDestinationHandle)) {
                 struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
                 if (ioctl(m_rgaPrimeFD, DMA_BUF_IOCTL_SYNC, &syncStart) < 0)
                     g_warning("WPEViewDRM rga destination sync start failed: %s", strerror(errno));
@@ -2876,7 +2990,7 @@ public:
     {
         auto* destination = static_cast<uint8_t*>(m_mapping);
         auto panel = scanoutPanelForSource(sourceWidth, sourceHeight);
-        auto topInset = chromeReservedTopInset(panel.height);
+        auto topInset = chromeFrameTopInset(panel.height, sourceHeight);
         const auto& chrome = cachedChromeRenderState();
         guint chromeHash = chromeStateCache().hash;
         bool panelOpen = chrome.panel[0] && strcmp(chrome.panel, "none");
@@ -2947,6 +3061,7 @@ private:
     uint32_t m_frameBufferID { 0 };
     void* m_mapping { nullptr };
     int m_rgaPrimeFD { -1 };
+    RGACachedHandle m_rgaDestinationHandle;
     bool m_rgaCPUAccessActive { false };
     bool m_lastCopyUsedRGA { false };
     bool m_lastCopyFellBackFromRGA { false };
@@ -2972,6 +3087,7 @@ void WPEBufferDRMUserData::resetSourceMapping()
 WPEBufferDRMUserData::~WPEBufferDRMUserData()
 {
     delete scanoutBuffer;
+    RockchipRGA::singleton().releaseCachedHandle(rgaSourceHandle);
     resetSourceMapping();
 }
 
@@ -3143,10 +3259,16 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
     if (committedWebFrame) {
         priv->committedFrameGeneration++;
         if (priv->preparedBaseGeneration) {
-            priv->chromeBasePixels = WTF::move(priv->preparedChromeBasePixels);
-            priv->chromeBaseWidth = std::exchange(priv->preparedChromeBaseWidth, 0);
-            priv->chromeBaseHeight = std::exchange(priv->preparedChromeBaseHeight, 0);
-            priv->chromeBasePitch = std::exchange(priv->preparedChromeBasePitch, 0);
+            // Swap the storage instead of moving it one way. The previous
+            // committed base becomes the next prepared buffer, so animated
+            // pages do not allocate a full-panel vector every frame.
+            std::swap(priv->chromeBasePixels, priv->preparedChromeBasePixels);
+            priv->chromeBaseWidth = priv->preparedChromeBaseWidth;
+            priv->chromeBaseHeight = priv->preparedChromeBaseHeight;
+            priv->chromeBasePitch = priv->preparedChromeBasePitch;
+            priv->preparedChromeBaseWidth = 0;
+            priv->preparedChromeBaseHeight = 0;
+            priv->preparedChromeBasePitch = 0;
             priv->chromeBaseGeneration = priv->committedFrameGeneration;
             priv->preparedBaseGeneration = 0;
         }
@@ -3169,10 +3291,12 @@ static void wpeViewDRMFinishBufferCommit(WPEViewDRM* view)
     auto commitAverageMS = priv->commitWindowCount ? priv->commitWindowTotalUS / 1000. / priv->commitWindowCount : 0.;
     auto rgaAverageMS = priv->rgaRotateWindowCount
         ? priv->rgaRotateWindowTotalUS / 1000. / priv->rgaRotateWindowCount : 0.;
-    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f frame_generation=%" G_GUINT64_FORMAT " chrome_base_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
+    auto& rga = RockchipRGA::singleton();
+    g_message("WPEViewDRM window fps=%.1f page_copy_ms=%.2f page_copy_max_ms=%.2f rga_ms=%.2f rga_max_ms=%.2f rga_frames=%" G_GUINT64_FORMAT " rga_cpu_fallback=%" G_GUINT64_FORMAT " rga_imports=%" G_GUINT64_FORMAT " rga_reuses=%" G_GUINT64_FORMAT " commit_avg_ms=%.2f commit_max_ms=%.2f frame_generation=%" G_GUINT64_FORMAT " chrome_base_generation=%" G_GUINT64_FORMAT " stale_redraw=%" G_GUINT64_FORMAT " retained=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " replaced=%" G_GUINT64_FORMAT " dropped=%" G_GUINT64_FORMAT " frames=%" G_GUINT64_FORMAT " total_frames=%" G_GUINT64_FORMAT " pageflips=%" G_GUINT64_FORMAT,
         fps, copyAverageMS, priv->copyWindowMaxUS / 1000., rgaAverageMS,
         priv->rgaRotateWindowMaxUS / 1000., priv->rgaRotateWindowCount,
-        priv->rgaCPUFallbackWindowCount, commitAverageMS, priv->commitWindowMaxUS / 1000.,
+        priv->rgaCPUFallbackWindowCount, rga.importCount(), rga.reuseCount(),
+        commitAverageMS, priv->commitWindowMaxUS / 1000.,
         priv->committedFrameGeneration, priv->chromeBaseGeneration,
         priv->staleChromeRedrawCount, priv->retainedBaseFrameCount, priv->queuedWindowCount,
         priv->replacedQueuedWindowCount, priv->droppedWindowCount,
@@ -3471,7 +3595,8 @@ static void wpeViewDRMConstructed(GObject* object)
 
 static void wpeViewDRMDispose(GObject* object)
 {
-    auto* priv = WPE_VIEW_DRM(object)->priv;
+    auto* view = WPE_VIEW_DRM(object);
+    auto* priv = view->priv;
 
     videoOverlayStop(WPE_VIEW_DRM(object));
 
@@ -3497,6 +3622,30 @@ static void wpeViewDRMDispose(GObject* object)
         g_source_destroy(priv->frameThrottleSource.get());
         priv->frameThrottleSource = nullptr;
     }
+
+    // Every buffer accepted from WPE must receive exactly one release, even
+    // when the view is destroyed while a page flip or throttled frame is
+    // pending. Avoid duplicate callbacks if a producer reuses an object.
+    std::array<WPEBuffer*, 3> released { nullptr, nullptr, nullptr };
+    size_t releasedCount = 0;
+    auto releaseBuffer = [&](GRefPtr<WPEBuffer>& buffer) {
+        if (!buffer)
+            return;
+        WPEBuffer* raw = buffer.get();
+        bool duplicate = std::find(released.begin(), released.begin() + releasedCount, raw)
+            != released.begin() + releasedCount;
+        if (!duplicate) {
+            wpe_view_buffer_released(WPE_VIEW(view), raw);
+            released[releasedCount++] = raw;
+        }
+        buffer = nullptr;
+    };
+    releaseBuffer(priv->queuedBuffer);
+    releaseBuffer(priv->pendingBuffer);
+    releaseBuffer(priv->committedBuffer);
+    priv->pendingScanoutBuffer = nullptr;
+    priv->committedScanoutBuffer = nullptr;
+    priv->updateFlags = { };
 
     G_OBJECT_CLASS(wpe_view_drm_parent_class)->dispose(object);
 }
@@ -3634,6 +3783,15 @@ static void videoOverlayPunchActiveHole(WPEViewDRM*, DRMScanoutBuffer*);
 static bool captureCommittedChromeBase(WPEViewDRM* view)
 {
     auto* priv = view->priv;
+    const auto& chrome = cachedChromeRenderState();
+    bool panelOpen = chrome.panel[0] && strcmp(chrome.panel, "none");
+    // A committed buffer with visible chrome already contains the old
+    // toolbar/menu. Recapturing it as a page base would resurrect that UI on
+    // the next animation frame. Wait for a fresh WebKit frame instead.
+    if (chrome.visible || panelOpen || chromeAnimationActive()) {
+        g_message("WPEViewDRM chrome base capture deferred: committed frame contains native chrome");
+        return false;
+    }
     auto* buffer = priv->committedScanoutBuffer;
     priv->chromeBasePixels.clear();
     priv->chromeBaseWidth = 0;
@@ -3836,14 +3994,11 @@ static DRMScanoutBuffer* drmScanoutBufferForRender(WPEViewDRM* view, WPEBuffer* 
     auto* display = WPE_DISPLAY_DRM(wpe_view_get_display(WPE_VIEW(view)));
 
     if (WPE_IS_BUFFER_DMA_BUF(buffer)) {
-        if (rotation != OutputRotation::Rotate0)
+        if (rotation != OutputRotation::Rotate0 || nativeChromeCompositionRequired())
             return nextRotatedDMABufBuffer(view, buffer, rotation, error);
 
-        // 未旋转的 dmabuf 直接进 zero-copy scanout（无 CPU 合成步骤），
-        // drawChromeOverlay() 只在 CPU 拷贝路径（SHM / 旋转 dumb）里调用，
-        // 因此这条路径下不会画 WPE 侧工具栏。这是当前直扫设计的固有限制，
-        // 不是遗漏：若默认配置（rotation=0 + WPE_DRM_BUFFER_PATH=dma_heap）
-        // 需要工具栏常驻，要么强制走 dumb 合成路径，要么把工具栏做成独立 plane。
+        // Native chrome is disabled, so an unrotated DMA-BUF can remain on the
+        // zero-copy scanout path.
         auto* userData = static_cast<WPEBufferDRMUserData*>(wpe_buffer_get_user_data(buffer));
         auto* scanoutBuffer = userData ? userData->scanoutBuffer : nullptr;
         if (!scanoutBuffer)
@@ -3852,7 +4007,7 @@ static DRMScanoutBuffer* drmScanoutBufferForRender(WPEViewDRM* view, WPEBuffer* 
     }
 
     if (WPE_IS_BUFFER_SHM(buffer)) {
-        if (rotation != OutputRotation::Rotate0)
+        if (rotation != OutputRotation::Rotate0 || nativeChromeCompositionRequired())
             return nextRotatedSHMBuffer(view, buffer, rotation, error);
         return nextSHMDumbBuffer(view, buffer, error);
     }
@@ -3944,18 +4099,18 @@ static void destinationRectForBuffer(drmModeModeInfo* mode, const DRMScanoutBuff
     height = mode->vdisplay;
 
     if (shouldUsePanelNativeFit()) {
-        auto panel = configuredPanelSize();
-        bool framebufferIsRotatedPanel = buffer.width() == panel.height && buffer.height() == panel.width;
-        if (framebufferIsRotatedPanel) {
-            width = std::min<uint32_t>(buffer.width(), mode->hdisplay);
-            height = std::min<uint32_t>(buffer.height(), mode->vdisplay);
-            uint32_t maxX = mode->hdisplay > width ? mode->hdisplay - width : 0;
-            if (auto configuredX = configuredRotatedXOffset(maxX))
-                x = configuredX.value();
-            else
-                x = maxX / 2;
-            y = mode->vdisplay > height ? (mode->vdisplay - height) / 2 : 0;
-        }
+        // panel-native is a 1:1 pixel policy. The DRM mode is only the scanout
+        // envelope and must never silently scale a panel or content buffer.
+        // Oversized buffers are clipped; smaller buffers are centered (with an
+        // optional calibrated X offset for panels exposed through a wider mode).
+        width = std::min<uint32_t>(buffer.width(), mode->hdisplay);
+        height = std::min<uint32_t>(buffer.height(), mode->vdisplay);
+        uint32_t maxX = mode->hdisplay > width ? mode->hdisplay - width : 0;
+        if (auto configuredX = configuredRotatedXOffset(maxX))
+            x = configuredX.value();
+        else
+            x = maxX / 2;
+        y = mode->vdisplay > height ? (mode->vdisplay - height) / 2 : 0;
         return;
     }
 
@@ -4200,6 +4355,8 @@ struct VideoOverlayState {
     int clientFD { -1 };
     GRefPtr<GSource> listenSource;
     GRefPtr<GSource> clientSource;
+    GRefPtr<GSource> releaseSource;
+    WPE::DRM::VideoReleaseQueue pendingReleaseAcks;
     const WPE::DRM::Plane* plane { nullptr };
     VideoOverlayFB current;
     VideoOverlayWireMessage lastFrame;
@@ -4207,6 +4364,7 @@ struct VideoOverlayState {
     bool haveFrame { false };
     bool planeEnabled { false };
     bool zposUnsupported { false };
+    bool droppingClient { false };
     unsigned commitFailLogCount { 0 };
     uint32_t loggedFrameWidth { 0 };
     uint32_t loggedFrameHeight { 0 };
@@ -4219,6 +4377,7 @@ struct VideoOverlayState {
     uint64_t failedFrames { 0 };
     uint64_t ackedFrames { 0 };
     uint64_t ackFailedFrames { 0 };
+    uint64_t ackRetriedFrames { 0 };
     uint64_t commitTotalUS { 0 };
     uint64_t commitMaxUS { 0 };
     uint64_t nextStatsFrame { 120 };
@@ -4345,26 +4504,72 @@ static void videoOverlayReleaseFB(int fd, VideoOverlayFB& fb)
     fb.sequence = 0;
 }
 
-static void videoOverlaySendRelease(VideoOverlayState* overlay, uint64_t sequence)
+static void videoOverlayDropClient(WPEViewDRM*);
+
+static bool videoOverlayFlushReleases(VideoOverlayState* overlay)
 {
-    if (!overlay || overlay->clientFD < 0 || !sequence)
-        return;
-    VideoOverlayWireMessage message = { };
-    message.version = videoOverlayProtocolVersion;
-    message.type = VideoOverlayMessageRelease;
-    message.sequence = sequence;
-    ssize_t result;
-    do {
-        result = send(overlay->clientFD, &message, sizeof(message), MSG_NOSIGNAL);
-    } while (result < 0 && errno == EINTR);
-    if (result == sizeof(message))
-        overlay->ackedFrames++;
-    else {
+    if (!overlay || overlay->clientFD < 0)
+        return false;
+    while (!overlay->pendingReleaseAcks.empty()) {
+        VideoOverlayWireMessage message = { };
+        message.version = videoOverlayProtocolVersion;
+        message.type = VideoOverlayMessageRelease;
+        message.sequence = overlay->pendingReleaseAcks.front();
+        ssize_t result;
+        do {
+            result = send(overlay->clientFD, &message, sizeof(message), MSG_NOSIGNAL | MSG_DONTWAIT);
+        } while (result < 0 && errno == EINTR);
+        if (result == sizeof(message)) {
+            overlay->ackedFrames++;
+            overlay->pendingReleaseAcks.pop();
+            continue;
+        }
+        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return false;
         overlay->ackFailedFrames++;
         if (overlay->commitFailLogCount++ < 8)
             g_warning("WPEViewDRM video overlay: release ACK failed sequence=%" G_GUINT64_FORMAT ": %s",
-                sequence, strerror(errno));
+                message.sequence, result < 0 ? strerror(errno) : "short write");
+        videoOverlayDropClient(overlay->view);
+        return false;
     }
+    return true;
+}
+
+static gboolean videoOverlayReleaseWritable(int, GIOCondition condition, gpointer userData)
+{
+    auto* overlay = static_cast<VideoOverlayState*>(userData);
+    if (!overlay || !overlay->view)
+        return G_SOURCE_REMOVE;
+    if (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) {
+        videoOverlayDropClient(overlay->view);
+        return G_SOURCE_REMOVE;
+    }
+    overlay->ackRetriedFrames += overlay->pendingReleaseAcks.size();
+    if (!videoOverlayFlushReleases(overlay))
+        return overlay->clientFD >= 0 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
+    overlay->releaseSource = nullptr;
+    return G_SOURCE_REMOVE;
+}
+
+static void videoOverlaySendRelease(VideoOverlayState* overlay, uint64_t sequence)
+{
+    if (!overlay || overlay->droppingClient || overlay->clientFD < 0 || !sequence)
+        return;
+    auto addResult = overlay->pendingReleaseAcks.add(sequence);
+    if (addResult == WPE::DRM::VideoReleaseQueue::AddResult::Overflow) {
+        g_warning("WPEViewDRM video overlay: release ACK backlog exceeded limit; reconnecting client");
+        videoOverlayDropClient(overlay->view);
+        return;
+    }
+    if (videoOverlayFlushReleases(overlay) || overlay->releaseSource || overlay->clientFD < 0)
+        return;
+    overlay->releaseSource = adoptGRef(g_unix_fd_source_new(overlay->clientFD,
+        static_cast<GIOCondition>(G_IO_OUT | G_IO_ERR | G_IO_HUP | G_IO_NVAL)));
+    g_source_set_name(overlay->releaseSource.get(), "WPE DRM video release ACK");
+    g_source_set_callback(overlay->releaseSource.get(),
+        reinterpret_cast<GSourceFunc>(reinterpret_cast<GCallback>(videoOverlayReleaseWritable)), overlay, nullptr);
+    g_source_attach(overlay->releaseSource.get(), g_main_context_get_thread_default());
 }
 
 static void videoOverlayRecordCommit(VideoOverlayState* overlay, int64_t durationUS)
@@ -4384,9 +4589,10 @@ static void videoOverlayLogStats(VideoOverlayState* overlay)
     g_message("WPEViewDRM video stats: received=%" G_GUINT64_FORMAT
         " committed=%" G_GUINT64_FORMAT " coalesced=%" G_GUINT64_FORMAT
         " failed=%" G_GUINT64_FORMAT " acked=%" G_GUINT64_FORMAT
-        " ack_failed=%" G_GUINT64_FORMAT " inflight=%u commit_avg_ms=%.2f commit_max_ms=%.2f current_fb=%u sequence=%" G_GUINT64_FORMAT,
+        " ack_failed=%" G_GUINT64_FORMAT " ack_retried=%" G_GUINT64_FORMAT " ack_pending=%zu inflight=%u commit_avg_ms=%.2f commit_max_ms=%.2f current_fb=%u sequence=%" G_GUINT64_FORMAT,
         overlay->receivedFrames, overlay->committedFrames, overlay->coalescedFrames,
         overlay->failedFrames, overlay->ackedFrames, overlay->ackFailedFrames,
+        overlay->ackRetriedFrames, overlay->pendingReleaseAcks.size(),
         overlay->current.sequence ? 1 : 0, averageMS, overlay->commitMaxUS / 1000.0,
         overlay->current.fbID, overlay->current.sequence);
     while (overlay->nextStatsFrame <= overlay->receivedFrames)
@@ -4683,15 +4889,24 @@ static void videoOverlayRecommit(WPEViewDRM* view)
 static void videoOverlayDropClient(WPEViewDRM* view)
 {
     auto* overlay = view->priv->videoOverlay;
+    if (!overlay || overlay->droppingClient)
+        return;
+    overlay->droppingClient = true;
     if (overlay->clientSource) {
         g_source_destroy(overlay->clientSource.get());
         overlay->clientSource = nullptr;
+    }
+    if (overlay->releaseSource) {
+        g_source_destroy(overlay->releaseSource.get());
+        overlay->releaseSource = nullptr;
     }
     videoOverlayDisable(view);
     if (overlay->clientFD >= 0) {
         close(overlay->clientFD);
         overlay->clientFD = -1;
     }
+    overlay->pendingReleaseAcks.clear();
+    overlay->droppingClient = false;
 }
 
 static gboolean videoOverlayClientEvent(int socketFD, GIOCondition condition, gpointer userData)
@@ -4848,7 +5063,7 @@ static void videoOverlayStart(WPEViewDRM* view)
 
     unlink(path);
     address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, path);
+    memcpy(address.sun_path, path, strlen(path) + 1);
     if (bind(listenFD, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) || listen(listenFD, 1)) {
         g_warning("WPEViewDRM video overlay: failed to listen on %s: %s", path, strerror(errno));
         close(listenFD);
@@ -4963,7 +5178,9 @@ static void setDamageRects(Vector<drm_mode_rect>& destination, const WPERectangl
 
 static bool bufferNeedsCPURead(WPEBuffer* buffer, OutputRotation rotation)
 {
-    return WPE_IS_BUFFER_SHM(buffer) || (WPE_IS_BUFFER_DMA_BUF(buffer) && rotation != OutputRotation::Rotate0);
+    return WPE_IS_BUFFER_SHM(buffer)
+        || (WPE_IS_BUFFER_DMA_BUF(buffer)
+            && (rotation != OutputRotation::Rotate0 || nativeChromeCompositionRequired()));
 }
 
 static bool waitForRenderingFence(WPEViewDRM* view, const UnixFileDescriptor& fence)
@@ -4991,9 +5208,10 @@ static bool waitForRenderingFence(WPEViewDRM* view, const UnixFileDescriptor& fe
     return false;
 }
 
-static void dropPendingFrame(WPEViewDRM* view)
+static bool abortPendingCommit(WPEViewDRM* view, const char* reason)
 {
     auto* priv = view->priv;
+    bool droppedWebFrame = !!priv->pendingBuffer;
     if (priv->pendingBuffer)
         wpe_view_buffer_released(WPE_VIEW(view), priv->pendingBuffer.get());
     priv->pendingBuffer = nullptr;
@@ -5004,9 +5222,13 @@ static void dropPendingFrame(WPEViewDRM* view)
     priv->preparedChromeBasePitch = 0;
     priv->preparedBaseGeneration = 0;
     priv->damageRects.clear();
-    priv->lastUpdateDroppedBuffer = true;
+    priv->lastUpdateDroppedBuffer = droppedWebFrame;
     priv->forceFullDamageNextFrame = true;
-    priv->droppedWindowCount++;
+    if (droppedWebFrame)
+        priv->droppedWindowCount++;
+    g_warning("WPEViewDRM pending commit aborted: reason=%s web_frame=%d",
+        reason ? reason : "unknown", droppedWebFrame);
+    return droppedWebFrame;
 }
 
 static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
@@ -5035,7 +5257,7 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
             renderingFence = UnixFileDescriptor { wpe_buffer_take_rendering_fence(buffer), UnixFileDescriptor::Adopt };
         if (pendingNeedsCPURead && !waitForRenderingFence(view, renderingFence)) {
             priv->retainedBaseFrameCount++;
-            dropPendingFrame(view);
+            abortPendingCommit(view, "rendering-fence");
             return TRUE;
         }
 
@@ -5049,8 +5271,14 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
         drmBuffer = uiOnlyRedraw
             ? nextChromeOverlayBuffer(view, error)
             : drmScanoutBufferForRender(view, buffer, rotation, error);
-        if (!drmBuffer)
+        if (!drmBuffer) {
+            if (abortPendingCommit(view, "scanout-import")) {
+                if (error)
+                    g_clear_error(error);
+                return TRUE;
+            }
             return FALSE;
+        }
 
         if (uiOnlyRedraw) {
             auto durationUS = g_get_monotonic_time() - copyStartUS;
@@ -5100,8 +5328,14 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
     gint64 commitStartUS = g_get_monotonic_time();
     if (wpe_display_drm_supports_atomic(display)) {
         auto damageID = drmBuffer ? buildDamageBlob(display, priv->damageRects, error) : std::nullopt;
-        if (damageID.has_value() && !damageID.value())
+        if (damageID.has_value() && !damageID.value()) {
+            if (abortPendingCommit(view, "damage-blob")) {
+                if (error)
+                    g_clear_error(error);
+                return TRUE;
+            }
             return FALSE;
+        }
 
         auto result = wpeViewDRMCommitAtomic(WPE_VIEW_DRM(view), drmBuffer, damageID, error);
         if (damageID)
@@ -5116,15 +5350,10 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
             priv->lastFrameCommitUS = commitStartUS;
         priv->lastCommitWasSynchronous = result && bufferUsesSynchronousCommit(drmBuffer);
         if (!result) {
-            if (!priv->pendingBuffer)
-                priv->pendingScanoutBuffer = nullptr;
-            else {
-                priv->forceFullDamageNextFrame = true;
-                priv->preparedChromeBasePixels.clear();
-                priv->preparedChromeBaseWidth = 0;
-                priv->preparedChromeBaseHeight = 0;
-                priv->preparedChromeBasePitch = 0;
-                priv->preparedBaseGeneration = 0;
+            if (abortPendingCommit(view, "atomic-commit")) {
+                if (error)
+                    g_clear_error(error);
+                return TRUE;
             }
         }
         return result;
@@ -5143,6 +5372,11 @@ static gboolean wpeViewDRMRequestUpdate(WPEViewDRM* view, GError** error)
     priv->commitWindowCount++;
     if (result)
         priv->lastFrameCommitUS = commitStartUS;
+    else if (abortPendingCommit(view, "legacy-commit")) {
+        if (error)
+            g_clear_error(error);
+        return TRUE;
+    }
     return result;
 }
 

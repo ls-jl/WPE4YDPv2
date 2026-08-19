@@ -1,0 +1,15 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp
+@@ -1797,6 +1797,12 @@ static void drawChromeMenuIcon(PanelPixelWriter& painter, const char* id,
+         painter.drawArc(centerX, centerY, 9, 0, 359, 2, color);
+         painter.fillCircle(centerX, centerY - 4, 2, color);
+         painter.drawLine(centerX, centerY, centerX, centerY + 6, 2, color);
++    } else if (!strcmp(id, "rotation")) {
++        painter.drawArc(centerX, centerY, 9, 35, 315, 2, color);
++        painter.fillTriangle(centerX + 9, centerY - 1,
++                             centerX + 2, centerY - 2,
++                             centerX + 7, centerY - 8, color);
++        painter.fillCircle(centerX - 8, centerY + 4, 1, color);
+     } else {
+         painter.drawArc(centerX, centerY, 7, 0, 359, 3, color);
+         painter.fillCircle(centerX, centerY, 3, color);

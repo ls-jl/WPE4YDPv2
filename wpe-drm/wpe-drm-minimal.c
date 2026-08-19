@@ -48,7 +48,6 @@ static GMainLoop *main_loop = NULL;
 static guint64 frame_count = 0;
 static gint64 frame_stats_window_start_us = 0;
 static guint64 frame_stats_window_start_count = 0;
-static GHashTable *tls_exception_hosts = NULL;
 static gboolean gpu_render_profile = FALSE;
 static int runtime_exit_code = 0;
 static guint gpu_first_frame_timeout_source_id = 0;
@@ -78,12 +77,10 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 #define CHROME_TABS_FOOTER_HEIGHT 0
 #define CHROME_TABS_ROW_HEIGHT 48
 #define CHROME_TABS_CLOSE_HIT_WIDTH 52
-#define CHROME_MENU_COLUMNS 3
-#define CHROME_MENU_ROWS 2
-#define CHROME_MENU_ITEMS_PER_PAGE (CHROME_MENU_COLUMNS * CHROME_MENU_ROWS)
-#define CHROME_MENU_ITEM_COUNT 6
+#define CHROME_MENU_ITEM_COUNT 7
 #define CHROME_LIST_HEADER_HEIGHT 32
 #define CHROME_LIST_ROW_HEIGHT 48
+#define CHROME_ROTATION_RESTART_CODE 72
 #define CHROME_GPU_RESTART_CODE 73
 #define CHROME_USER_EXIT_CODE 74
 
@@ -182,6 +179,7 @@ typedef struct {
     guint layout_timer;
     char site_profile[16];
     char language[8];
+    char browser_mode[16];
     BrowserCookiePolicy cookie_policy;
     char search_engine[16];
     char *custom_search_template;
@@ -319,6 +317,12 @@ typedef struct {
     BrowserToolbarGesture *toolbar_gesture;
     guint toolbar_gesture_source_id;
     guint memory_governor_source_id;
+    guint view_state_source_id;
+    guint web_process_reload_source_id;
+    char *last_web_process_crash_uri;
+    gint64 web_process_crash_window_start_us;
+    int web_process_crash_count;
+    WebKitWebProcessTerminationReason last_web_process_crash_reason;
     BrowserMemoryGovernor memory_governor;
     gint64 memory_last_summary_us;
 } AppState;
@@ -363,12 +367,24 @@ static const char *tr(const BrowserChrome *chrome, const char *message_id)
     return browser_i18n(chrome_language(chrome), message_id);
 }
 
+static const char *normalize_browser_mode(const char *value)
+{
+    if (!g_strcmp0(value, "rotate90"))
+        return "rotate90";
+    if (!g_strcmp0(value, "rotate180"))
+        return "rotate180";
+    if (!g_strcmp0(value, "rotate270"))
+        return "rotate270";
+    return "native";
+}
+
 static const char *chrome_panel_title(const BrowserChrome *chrome, ChromePanel panel)
 {
     switch (panel) {
     case CHROME_PANEL_TABS: return tr(chrome, "tabs");
     case CHROME_PANEL_SETTINGS: return tr(chrome, "settings");
     case CHROME_PANEL_LANGUAGE: return tr(chrome, "language");
+    case CHROME_PANEL_ROTATION: return tr(chrome, "rotation");
     case CHROME_PANEL_APPEARANCE: return tr(chrome, "appearance");
     case CHROME_PANEL_WEB: return tr(chrome, "web_page");
     case CHROME_PANEL_STARTUP: return tr(chrome, "startup_search");
@@ -710,6 +726,7 @@ typedef struct {
     int panel_height;
     int columns;
     int rows;
+    int items_per_page;
     int item_count;
     int page_count;
     double max_scroll;
@@ -779,16 +796,19 @@ static ChromeMenuGeometry chrome_menu_geometry(AppState *state)
     int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
     int chrome_height = state ? state->chrome.height : 44;
     int menu_x = panel_width / 3;
+    BrowserChromeMenuGridGeometry grid =
+        browser_chrome_menu_grid_geometry(panel_width, panel_height,
+                                          CHROME_MENU_ITEM_COUNT);
     ChromeMenuGeometry geometry = {
         .panel_x = menu_x,
         .panel_y = chrome_height,
         .panel_width = panel_width - menu_x,
         .panel_height = MAX(0, panel_height - chrome_height),
-        .columns = CHROME_MENU_COLUMNS,
-        .rows = CHROME_MENU_ROWS,
+        .columns = grid.columns,
+        .rows = grid.rows,
+        .items_per_page = grid.items_per_page,
         .item_count = CHROME_MENU_ITEM_COUNT,
-        .page_count = (CHROME_MENU_ITEM_COUNT + CHROME_MENU_ITEMS_PER_PAGE - 1)
-            / CHROME_MENU_ITEMS_PER_PAGE,
+        .page_count = grid.page_count,
     };
     geometry.max_scroll = MAX(0, geometry.page_count - 1) * geometry.panel_width;
     return geometry;
@@ -1046,9 +1066,11 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
         g_key_file_set_string(key_file, "panel", "line3", tr(chrome, "profiles"));
         g_key_file_set_string(key_file, "panel", "line4", tr(chrome, "privacy"));
         g_key_file_set_string(key_file, "panel", "line5", tr(chrome, "settings"));
-        line_count = 6;
+        g_key_file_set_string(key_file, "panel", "line6", tr(chrome, "rotation"));
+        line_count = 7;
         static const char *item_ids[CHROME_MENU_ITEM_COUNT] = {
-            "bookmark", "history", "bookmarks", "profiles", "privacy", "settings"
+            "bookmark", "history", "bookmarks", "profiles", "privacy", "settings",
+            "rotation"
         };
         ChromeMenuGeometry geometry = chrome_menu_geometry(state);
         g_key_file_set_integer(key_file, "panel", "x", geometry.panel_x);
@@ -1104,6 +1126,21 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                               !g_ascii_strcasecmp(chrome->language, "zh-CN") ? "*" : "", FALSE, "language");
         chrome_set_line_style(key_file, 1, "choice",
                               !g_ascii_strcasecmp(chrome->language, "en-US") ? "*" : "", FALSE, "language");
+    } else if (chrome->panel == CHROME_PANEL_ROTATION) {
+        static const char *modes[] = {
+            "native", "rotate90", "rotate180", "rotate270"
+        };
+        static const char *labels[] = {
+            "rotation_native", "rotation_90", "rotation_180", "rotation_270"
+        };
+        for (int index = 0; index < 4; ++index) {
+            snprintf(line, sizeof(line), "line%d", index);
+            g_key_file_set_string(key_file, "panel", line, tr(chrome, labels[index]));
+            chrome_set_line_style(key_file, index, "choice",
+                                  !g_strcmp0(chrome->browser_mode, modes[index]) ? "*" : "",
+                                  !g_strcmp0(chrome->browser_mode, modes[index]), "rotation");
+        }
+        line_count = 4;
     } else if (chrome->panel == CHROME_PANEL_APPEARANCE) {
         char zoom[16];
         g_snprintf(zoom, sizeof(zoom), "%d%%", (int)lround(chrome->page_zoom * 100));
@@ -3028,8 +3065,8 @@ static gboolean chrome_write_gpu_mode(gboolean enabled)
     }
     if (success)
         success = fsync(fd) == 0;
-    if (fd >= 0)
-        close(fd);
+    if (fd >= 0 && close(fd) != 0)
+        success = FALSE;
     if (success)
         success = g_rename(temporary, path) == 0;
     if (success)
@@ -3042,6 +3079,104 @@ static gboolean chrome_write_gpu_mode(gboolean enabled)
     g_free(temporary);
     g_free(fallback);
     return success;
+}
+
+static gboolean chrome_write_display_mode(const char *requested_mode)
+{
+    const char *mode = normalize_browser_mode(requested_mode);
+    if (g_strcmp0(mode, requested_mode)) {
+        g_warning("Display mode rejected: %s", requested_mode ? requested_mode : "(null)");
+        return FALSE;
+    }
+
+    const char *path = g_getenv("WPE_DISPLAY_MODE_FILE");
+    char *fallback = NULL;
+    if (!path || !path[0]) {
+        const char *var_dir = g_getenv("WPE_VAR_DIR");
+        fallback = g_build_filename(var_dir && var_dir[0] ? var_dir : "/tmp",
+                                    "display-mode", NULL);
+        path = fallback;
+    }
+    char *directory = g_path_get_dirname(path);
+    if (g_mkdir_with_parents(directory, 0700) != 0 && errno != EEXIST) {
+        g_warning("Display mode directory create failed: %s", directory);
+        g_free(directory);
+        g_free(fallback);
+        return FALSE;
+    }
+    chmod(directory, 0700);
+
+    char *temporary = g_strdup_printf("%s.tmp.%ld", path, (long)getpid());
+    int fd = g_open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    char value[24];
+    g_snprintf(value, sizeof(value), "%s\n", mode);
+    gsize length = strlen(value);
+    gsize written = 0;
+    gboolean success = fd >= 0;
+    while (success && written < length) {
+        ssize_t count = write(fd, value + written, length - written);
+        if (count > 0)
+            written += count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else
+            success = FALSE;
+    }
+    if (success)
+        success = fsync(fd) == 0;
+    if (fd >= 0)
+        close(fd);
+    if (success)
+        success = g_rename(temporary, path) == 0;
+    if (success) {
+        chmod(path, 0600);
+        int directory_fd = g_open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+        if (directory_fd < 0)
+            success = FALSE;
+        else {
+            success = fsync(directory_fd) == 0;
+            if (close(directory_fd) != 0)
+                success = FALSE;
+        }
+    }
+    if (!success) {
+        g_warning("Display mode file write failed: %s errno=%d (%s)",
+                  path, errno, strerror(errno));
+        g_unlink(temporary);
+    }
+    g_free(temporary);
+    g_free(directory);
+    g_free(fallback);
+    return success;
+}
+
+static void chrome_request_rotation_restart(AppState *state, const char *requested_mode)
+{
+    if (!state)
+        return;
+    BrowserChrome *chrome = &state->chrome;
+    const char *mode = normalize_browser_mode(requested_mode);
+    if (!g_strcmp0(chrome->browser_mode, mode)) {
+        chrome_close_panel(state);
+        chrome_update_render_state(state);
+        chrome_request_frame(state);
+        g_print("Display mode unchanged: mode=%s\n", mode);
+        return;
+    }
+    if (!chrome_write_display_mode(mode)) {
+        chrome_update_render_state(state);
+        chrome_request_frame(state);
+        return;
+    }
+    g_strlcpy(chrome->browser_mode, mode, sizeof(chrome->browser_mode));
+    chrome_save_preferences(state);
+    chrome_save_session_now(state, "rotation_restart", FALSE);
+    chrome_save_state(state);
+    runtime_exit_code = CHROME_ROTATION_RESTART_CODE;
+    g_print("Display mode switch requested: mode=%s exit=%d\n",
+            mode, runtime_exit_code);
+    if (main_loop)
+        g_main_loop_quit(main_loop);
 }
 
 static void chrome_request_gpu_restart(AppState *state, gboolean enabled)
@@ -3205,6 +3340,8 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             chrome->site_data_status[0] = '\0';
         } else if (row == 5)
             chrome_open_internal_panel(state, CHROME_PANEL_SETTINGS, TRUE);
+        else if (row == 6)
+            chrome_open_internal_panel(state, CHROME_PANEL_ROTATION, TRUE);
     } else if (chrome->panel == CHROME_PANEL_SETTINGS) {
         static const ChromePanel panels[] = {
             CHROME_PANEL_APPEARANCE,
@@ -3228,6 +3365,12 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
                 chrome_apply_language(state, TRUE);
             }
         }
+    } else if (chrome->panel == CHROME_PANEL_ROTATION) {
+        static const char *modes[] = {
+            "native", "rotate90", "rotate180", "rotate270"
+        };
+        if (row >= 0 && row < (int)G_N_ELEMENTS(modes))
+            chrome_request_rotation_restart(state, modes[row]);
     } else if (chrome->panel == CHROME_PANEL_APPEARANCE) {
         if (row == 0)
             chrome_toggle_theme(state);
@@ -3538,7 +3681,7 @@ static gboolean chrome_handle_menu_panel_tap(AppState *state, double x, double y
                        0, geometry.columns - 1);
     int row = CLAMP((int)floor((y - geometry.panel_y) * geometry.rows / grid_height),
                     0, geometry.rows - 1);
-    int item = page * CHROME_MENU_ITEMS_PER_PAGE + row * geometry.columns + column;
+    int item = page * geometry.items_per_page + row * geometry.columns + column;
     if (item < 0 || item >= geometry.item_count)
         return TRUE;
 
@@ -3807,6 +3950,9 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     g_strlcpy(chrome->language,
               browser_language_code(browser_language_parse(profile_runtime.profile.language)),
               sizeof(chrome->language));
+    g_strlcpy(chrome->browser_mode,
+              normalize_browser_mode(g_getenv("WPE_BROWSER_MODE")),
+              sizeof(chrome->browser_mode));
     g_strlcpy(chrome->search_engine,
               profile_runtime.profile.search_engine
                 ? profile_runtime.profile.search_engine : "baidu",
@@ -3889,14 +4035,14 @@ static void chrome_load_state(AppState *state, const char *initial_url)
             chrome->restore_tabs);
     g_print("Chrome profile state: name=%s guest=%d home=%s site_profile=%s cookie_policy=%s "
             "search=%s zoom=%.2f font=%u js=%d autoplay_gesture=%d smooth=%d popups_blocked=%d "
-            "restore_tabs=%d language=%s theme=%s toolbar_auto_hide=%d toolbar_gesture_immersive=%d gpu_acceleration=%d gpu_status=%s tabs=%d active=%d\n",
+            "restore_tabs=%d language=%s browser_mode=%s theme=%s toolbar_auto_hide=%d toolbar_gesture_immersive=%d gpu_acceleration=%d gpu_status=%s tabs=%d active=%d\n",
             profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
             profile_runtime.guest, chrome->home_url,
             chrome->site_profile, browser_cookie_policy_name(chrome->cookie_policy),
             chrome->search_engine, chrome->page_zoom, chrome->default_font_size,
             chrome->javascript_enabled, chrome->autoplay_requires_gesture,
             chrome->smooth_scrolling, chrome->block_popups, chrome->restore_tabs,
-            chrome->language,
+            chrome->language, chrome->browser_mode,
             chrome->global_settings.theme, chrome->global_settings.toolbar_auto_hide,
             chrome->global_settings.toolbar_gesture_in_immersive,
             chrome->global_settings.gpu_acceleration,
@@ -3918,8 +4064,10 @@ static void chrome_destroy(AppState *state)
         g_source_remove(chrome->session_save_source_id);
         chrome->session_save_source_id = 0;
     }
-    chrome_save_session_now(state, runtime_exit_code == 75 ? "profile_switch" : "shutdown",
-                            chrome->session_explicit_reduction);
+    const char *session_reason = runtime_exit_code == 75 ? "profile_switch"
+        : runtime_exit_code == CHROME_ROTATION_RESTART_CODE ? "rotation_restart"
+        : "shutdown";
+    chrome_save_session_now(state, session_reason, chrome->session_explicit_reduction);
     chrome_update_render_state(state);
     if (chrome->layout_timer) {
         g_source_remove(chrome->layout_timer);
@@ -4681,7 +4829,7 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
                         * geometry.rows / MAX(1, geometry.panel_height),
                         0, geometry.rows - 1);
                     state->chrome.pressed_row = page
-                        * CHROME_MENU_ITEMS_PER_PAGE + row * geometry.columns + column;
+                        * geometry.items_per_page + row * geometry.columns + column;
                     chrome_cancel_menu_snap(&state->chrome);
                 }
             } else if (slot->chrome_consumed
@@ -4765,9 +4913,21 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
                             slot->game_video_mapped);
                 }
                 game_reset_touch_slot(slot);
-            } else if (!slot->chrome_consumed && native_touch)
+            } else if (!slot->chrome_consumed && native_touch) {
+                /* WebKit synthesizes the trusted DOM click while handling the
+                 * native TOUCH_UP event. Record the physical tap before
+                 * dispatching UP so the keyboard message handler can
+                 * distinguish that click from a script-triggered request.
+                 * Pointer-only mode records the same gate in
+                 * dispatch_pointer_tap(). */
+                double native_tap_limit = state->touch_tap_max_move > 0
+                    ? state->touch_tap_max_move : 24;
+                if (!slot->scrolling
+                    && slot->max_move_sq <= native_tap_limit * native_tap_limit)
+                    state->last_pointer_tap_us = g_get_monotonic_time();
                 send_touch_event(state, WPE_EVENT_TOUCH_UP, i, slot->last_x,
                                  slot->last_y, time_ms);
+            }
             double tap_limit = state->touch_tap_max_move > 0 ? state->touch_tap_max_move : 24;
             if (slot->chrome_consumed) {
                 double chrome_tap_limit = env_double("WPE_CHROME_TAP_MAX_MOVE", 32);
@@ -6375,79 +6535,6 @@ static gboolean on_permission_request(WebKitWebView *web_view, WebKitPermissionR
     return FALSE;
 }
 
-typedef struct {
-    WebKitWebView *web_view;
-    char *uri;
-} TLSReloadRequest;
-
-static char *host_from_uri(const char *uri)
-{
-    if (!uri || !uri[0])
-        return NULL;
-
-    GError *error = NULL;
-    GUri *parsed = g_uri_parse(uri, G_URI_FLAGS_NONE, &error);
-    if (!parsed) {
-        g_warning("TLS host parse failed: uri=%s error=%s", uri, error ? error->message : "unknown");
-        g_clear_error(&error);
-        return NULL;
-    }
-
-    const char *host = g_uri_get_host(parsed);
-    char *result = host && host[0] ? g_strdup(host) : NULL;
-    g_uri_unref(parsed);
-    return result;
-}
-
-static gboolean reload_after_tls_exception(gpointer user_data)
-{
-    TLSReloadRequest *request = (TLSReloadRequest *)user_data;
-    g_print("Reloading after TLS host exception: %s\n", request->uri ? request->uri : "(null)");
-    load_uri_preserving_local_html(request->web_view, request->uri);
-    g_object_unref(request->web_view);
-    g_free(request->uri);
-    g_free(request);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean on_load_failed_with_tls_errors(WebKitWebView *web_view,
-                                               const gchar *failing_uri,
-                                               GTlsCertificate *certificate,
-                                               GTlsCertificateFlags errors,
-                                               gpointer user_data)
-{
-    WebKitNetworkSession *network_session = WEBKIT_NETWORK_SESSION(user_data);
-    char *host = host_from_uri(failing_uri);
-    if (!host || !certificate || !network_session) {
-        g_warning("TLS error cannot be handled: uri=%s host=%s errors=0x%x",
-                  failing_uri ? failing_uri : "(null)", host ? host : "(null)", errors);
-        g_free(host);
-        return FALSE;
-    }
-
-    if (!tls_exception_hosts)
-        tls_exception_hosts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    if (g_hash_table_contains(tls_exception_hosts, host)) {
-        g_warning("TLS error repeated after host exception: uri=%s host=%s errors=0x%x",
-                  failing_uri ? failing_uri : "(null)", host, errors);
-        g_free(host);
-        return FALSE;
-    }
-
-    g_warning("TLS error: uri=%s host=%s errors=0x%x; allowing this certificate for host",
-              failing_uri ? failing_uri : "(null)", host, errors);
-    webkit_network_session_allow_tls_certificate_for_host(network_session, certificate, host);
-    g_hash_table_add(tls_exception_hosts, g_strdup(host));
-
-    TLSReloadRequest *request = g_new0(TLSReloadRequest, 1);
-    request->web_view = WEBKIT_WEB_VIEW(g_object_ref(web_view));
-    request->uri = g_strdup(failing_uri);
-    g_idle_add(reload_after_tls_exception, request);
-
-    g_free(host);
-    return TRUE;
-}
-
 static const char *termination_reason_name(WebKitWebProcessTerminationReason reason)
 {
     switch (reason) {
@@ -6655,6 +6742,7 @@ static gboolean memory_governor_tick(gpointer user_data)
 }
 
 typedef struct {
+    AppState *state;
     WebKitWebView *web_view;
     char *uri;
 } ReloadRequest;
@@ -6706,13 +6794,45 @@ static void load_uri_preserving_local_html(WebKitWebView *web_view, const char *
 static gboolean reload_after_web_process_crash(gpointer user_data)
 {
     ReloadRequest *request = (ReloadRequest *)user_data;
+    if (request->state)
+        request->state->web_process_reload_source_id = 0;
     const char *uri = request->uri && request->uri[0] ? request->uri : default_home_url();
     g_warning("Reloading after Web process termination: %s", uri);
     load_uri_preserving_local_html(request->web_view, uri);
+    return G_SOURCE_REMOVE;
+}
+
+static void reload_request_free(gpointer user_data)
+{
+    ReloadRequest *request = (ReloadRequest *)user_data;
+    if (!request)
+        return;
     g_object_unref(request->web_view);
     g_free(request->uri);
     g_free(request);
-    return G_SOURCE_REMOVE;
+}
+
+static void cancel_web_process_reload(AppState *state)
+{
+    if (!state || !state->web_process_reload_source_id)
+        return;
+    g_source_remove(state->web_process_reload_source_id);
+    state->web_process_reload_source_id = 0;
+}
+
+static void schedule_web_process_reload(AppState *state, WebKitWebView *web_view,
+                                        const char *uri)
+{
+    if (!state || !web_view)
+        return;
+    cancel_web_process_reload(state);
+    ReloadRequest *request = g_new0(ReloadRequest, 1);
+    request->state = state;
+    request->web_view = WEBKIT_WEB_VIEW(g_object_ref(web_view));
+    request->uri = g_strdup(uri);
+    state->web_process_reload_source_id = g_timeout_add_full(
+        G_PRIORITY_DEFAULT, 500, reload_after_web_process_crash,
+        request, reload_request_free);
 }
 
 static void show_web_process_memory_error(WebKitWebView *web_view,
@@ -6741,13 +6861,13 @@ static void on_web_process_terminated(WebKitWebView *web_view,
                                       WebKitWebProcessTerminationReason reason,
                                       gpointer user_data)
 {
-    /* 熔断：同一 URL 在 120s 窗口内第 3 次被杀（典型是重型站反复撞内存上限）
-     * 时不再原样重载——那只会杀→载→杀无限循环。回主页并提示。 */
-    static char *last_crash_uri;
-    static gint64 crash_window_start_us;
-    static int crash_count_in_window;
-
-    (void)user_data;
+    /* Memory termination is not a transient crash. Reloading the same heavy
+     * page immediately only repeats the allocation pattern and looks like an
+     * unexplained page refresh. Keep its URL in the active tab and require an
+     * explicit Retry/Home choice instead. */
+    AppState *state = (AppState *)user_data;
+    if (!state)
+        return;
     const char *uri = webkit_web_view_get_uri(web_view);
     guint64 web_rss_kb = 0;
     guint64 web_swap_kb = 0;
@@ -6766,44 +6886,45 @@ static void on_web_process_terminated(WebKitWebView *web_view,
         return;
     }
 
+    if (reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT) {
+        g_warning("Web process memory recovery stopped: uri=%s auto_reload=0; showing internal error page",
+                  uri ? uri : "(null)");
+        cancel_web_process_reload(state);
+        show_web_process_memory_error(web_view, uri, default_home_url());
+        g_clear_pointer(&state->last_web_process_crash_uri, g_free);
+        state->web_process_crash_count = 0;
+        state->web_process_crash_window_start_us = 0;
+        return;
+    }
+
     gint64 now_us = g_get_monotonic_time();
-    if (uri && last_crash_uri && !strcmp(uri, last_crash_uri) &&
-        now_us - crash_window_start_us < 120 * G_USEC_PER_SEC) {
-        crash_count_in_window++;
+    if (uri && state->last_web_process_crash_uri
+        && !strcmp(uri, state->last_web_process_crash_uri)
+        && reason == state->last_web_process_crash_reason
+        && now_us - state->web_process_crash_window_start_us < 120 * G_USEC_PER_SEC) {
+        state->web_process_crash_count++;
     } else {
-        g_free(last_crash_uri);
-        last_crash_uri = g_strdup(uri ? uri : "");
-        crash_window_start_us = now_us;
-        crash_count_in_window = 1;
+        g_free(state->last_web_process_crash_uri);
+        state->last_web_process_crash_uri = g_strdup(uri ? uri : "");
+        state->web_process_crash_window_start_us = now_us;
+        state->web_process_crash_count = 1;
+        state->last_web_process_crash_reason = reason;
     }
 
-    if (reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT && crash_count_in_window >= 2) {
-        g_warning("Web process memory circuit open: uri=%s retries=1 window=120s; showing internal error page",
-                  last_crash_uri ? last_crash_uri : "(null)");
-        show_web_process_memory_error(web_view, last_crash_uri, default_home_url());
-        crash_count_in_window = 0;
-        crash_window_start_us = 0;
-        return;
-    }
-
-    if (reason != WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT && crash_count_in_window >= 3) {
+    if (state->web_process_crash_count >= 3) {
         g_warning("Web process crash circuit open: uri=%s attempts=%d window=120s; returning home",
-                  last_crash_uri ? last_crash_uri : "(null)", crash_count_in_window);
-        ReloadRequest *request = g_new0(ReloadRequest, 1);
-        request->web_view = WEBKIT_WEB_VIEW(g_object_ref(web_view));
-        request->uri = g_strdup(default_home_url());
-        crash_count_in_window = 0;
-        crash_window_start_us = 0;
-        g_timeout_add(500, reload_after_web_process_crash, request);
+                  state->last_web_process_crash_uri ? state->last_web_process_crash_uri : "(null)",
+                  state->web_process_crash_count);
+        state->web_process_crash_count = 0;
+        state->web_process_crash_window_start_us = 0;
+        schedule_web_process_reload(state, web_view, default_home_url());
         return;
     }
 
-    ReloadRequest *request = g_new0(ReloadRequest, 1);
-    request->web_view = WEBKIT_WEB_VIEW(g_object_ref(web_view));
-    request->uri = g_strdup(uri);
-    g_warning("Web process recovery scheduled: reason=%s uri=%s attempt=%d/1",
-              termination_reason_name(reason), uri ? uri : "(null)", crash_count_in_window);
-    g_timeout_add(500, reload_after_web_process_crash, request);
+    g_warning("Web process recovery scheduled: reason=%s uri=%s attempt=%d/2",
+              termination_reason_name(reason), uri ? uri : "(null)",
+              state->web_process_crash_count);
+    schedule_web_process_reload(state, web_view, uri);
 }
 
 /* Called each time a frame buffer has been rendered and scanned out */
@@ -7118,10 +7239,6 @@ int main(int argc, char **argv) {
 
     g_signal_connect(web_view, "load-failed",
                      G_CALLBACK(on_load_failed), NULL);
-    g_signal_connect(web_view, "load-failed-with-tls-errors",
-                     G_CALLBACK(on_load_failed_with_tls_errors), network_session);
-    g_signal_connect(web_view, "web-process-terminated",
-                     G_CALLBACK(on_web_process_terminated), NULL);
     g_signal_connect(web_view, "decide-policy",
                      G_CALLBACK(on_decide_policy), NULL);
     g_signal_connect(web_view, "permission-request",
@@ -7171,6 +7288,8 @@ int main(int argc, char **argv) {
         setup_game_input_user_script(user_content_manager, state);
         g_signal_connect(web_view, "load-changed",
                          G_CALLBACK(on_load_changed), state);
+        g_signal_connect(web_view, "web-process-terminated",
+                         G_CALLBACK(on_web_process_terminated), state);
         g_signal_connect(web_view, "notify::estimated-load-progress",
                          G_CALLBACK(on_estimated_load_progress_changed), state);
         g_signal_connect(web_view, "notify::title",
@@ -7204,7 +7323,7 @@ int main(int argc, char **argv) {
                          G_CALLBACK(on_buffer_rendered), NULL);
         setup_raw_touch(state);
         chrome_apply_layout(state, "startup");
-        g_timeout_add_seconds(30, print_view_state, state);
+        state->view_state_source_id = g_timeout_add_seconds(30, print_view_state, state);
         memory_governor_tick(state);
         state->memory_governor_source_id = g_timeout_add_seconds(2,
             memory_governor_tick, state);
@@ -7250,12 +7369,20 @@ int main(int argc, char **argv) {
     main_loop = NULL;
     g_main_loop_unref(finished_loop);
     if (state) {
+        if (state->native_scroll_source_id) {
+            g_source_remove(state->native_scroll_source_id);
+            state->native_scroll_source_id = 0;
+            state->native_scroll_scheduled = FALSE;
+        }
         if (state->scroll_stop_source_id)
             g_source_remove(state->scroll_stop_source_id);
         if (state->toolbar_gesture_source_id)
             g_source_remove(state->toolbar_gesture_source_id);
         if (state->memory_governor_source_id)
             g_source_remove(state->memory_governor_source_id);
+        if (state->view_state_source_id)
+            g_source_remove(state->view_state_source_id);
+        cancel_web_process_reload(state);
         for (int i = 0; i < MAX_TOUCH_SLOTS; ++i)
             game_reset_touch_slot(&state->slots[i]);
         keyboard_clear_active(state);
@@ -7265,6 +7392,7 @@ int main(int argc, char **argv) {
             close(state->touch_fd);
         browser_toolbar_gesture_free(state->toolbar_gesture);
         chrome_destroy(state);
+        g_free(state->last_web_process_crash_uri);
         g_free(state->keyboard_dir);
         g_free(state);
     }
@@ -7272,10 +7400,6 @@ int main(int argc, char **argv) {
     g_object_unref(network_session);
     g_object_unref(context);
     g_object_unref(display);
-    if (tls_exception_hosts) {
-        g_hash_table_destroy(tls_exception_hosts);
-        tls_exception_hosts = NULL;
-    }
     profile_runtime_destroy();
 
     return runtime_exit_code;

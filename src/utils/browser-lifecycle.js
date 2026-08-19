@@ -1,4 +1,39 @@
-import { browserDataPath, browserOptions, DEFAULT_BROWSER_MODE } from './display-resolver'
+import {
+  browserDataPath,
+  browserOptions,
+  LAST_BROWSER_MODE,
+  normalizeBrowserMode,
+} from './display-resolver'
+
+export function parseBrowserExitStatus(raw) {
+  if (!raw) return { reason: 'exited', code: null, browserMode: '', message: '浏览器已退出' }
+  try {
+    const status = typeof raw === 'string' ? JSON.parse(raw) : raw
+    const code = Number(status.code)
+    const normalizedCode = Number.isFinite(code) ? code : null
+    if (status.reason === 'rotation_change' && normalizedCode === 72) {
+      return {
+        reason: 'rotation_change',
+        code: 72,
+        browserMode: normalizeBrowserMode(status.browserMode),
+        message: '正在应用显示方向',
+      }
+    }
+    if (status.reason === 'user_shutdown') {
+      return { reason: 'user_shutdown', code: normalizedCode, browserMode: '', message: '浏览器已关闭' }
+    }
+    if (status.reason === 'start_failed') {
+      return { reason: 'start_failed', code: normalizedCode, browserMode: '', message: `浏览器启动失败（错误码 ${normalizedCode === null ? 'unknown' : normalizedCode}）` }
+    }
+    if (status.reason === 'crash') {
+      return { reason: 'crash', code: normalizedCode, browserMode: '', message: `浏览器异常退出（错误码 ${normalizedCode === null ? 'unknown' : normalizedCode}）` }
+    }
+    return { reason: status.reason || 'exited', code: normalizedCode, browserMode: '', message: '浏览器已退出' }
+  } catch (err) {
+    console.warn(`parse browser exit status failed ${err}`)
+    return { reason: 'invalid', code: null, browserMode: '', message: '浏览器已退出' }
+  }
+}
 
 export function createBrowserLifecycleState() {
   return {
@@ -7,6 +42,8 @@ export function createBrowserLifecycleState() {
     leaving: false,
     startToken: 0,
     watchdogTimer: null,
+    browserModeOverride: '',
+    rotationRestartCount: 0,
   }
 }
 
@@ -22,12 +59,22 @@ export class BrowserLifecycle {
   }
 
   pageOptions() {
-    return this.component.pageOptions()
+    const options = this.component.pageOptions()
+    if (!this.state.browserModeOverride) return options
+    return Object.assign({}, options, {
+      browserMode: this.state.browserModeOverride,
+    })
   }
 
   workdir() {
     const options = this.pageOptions()
     return options.workdir || browserDataPath('')
+  }
+
+  requireWorkdir() {
+    const workdir = this.workdir()
+    if (!workdir) throw new Error('MiniApp 数据目录不可用，已阻止浏览器启动')
+    return workdir
   }
 
   async resolveOptions() {
@@ -36,6 +83,12 @@ export class BrowserLifecycle {
 
   start() {
     if (this.state.starting || this.state.leaving) return
+    try {
+      this.requireWorkdir()
+    } catch (err) {
+      this.leaveFrame(err.message)
+      return
+    }
     try {
       if (this.browserPlayer.isBrowserRunning && this.browserPlayer.isBrowserRunning({ workdir: this.workdir() })) {
         this.state.running = true
@@ -98,24 +151,41 @@ export class BrowserLifecycle {
       return
     }
     this.state.running = false
-    this.leaveFrame(this.consumeExitStatus())
+    const status = this.consumeExitStatus()
+    if (status.reason === 'rotation_change') {
+      this.restartForRotation(status.browserMode)
+      return
+    }
+    this.leaveFrame(status.message)
   }
 
   consumeExitStatus() {
-    if (!this.browserPlayer.consumeBrowserExitStatus) return '浏览器已退出'
+    if (!this.browserPlayer.consumeBrowserExitStatus) return parseBrowserExitStatus('')
     try {
       const raw = this.browserPlayer.consumeBrowserExitStatus({ workdir: this.workdir() })
-      if (!raw) return '浏览器已退出'
-      const status = typeof raw === 'string' ? JSON.parse(raw) : raw
-      const code = Number(status.code)
-      if (status.reason === 'user_shutdown') return '浏览器已关闭'
-      if (status.reason === 'start_failed') return `浏览器启动失败（错误码 ${Number.isFinite(code) ? code : 'unknown'}）`
-      if (status.reason === 'crash') return `浏览器异常退出（错误码 ${Number.isFinite(code) ? code : 'unknown'}）`
-      return '浏览器已退出'
+      return parseBrowserExitStatus(raw)
     } catch (err) {
       console.warn(`consume browser exit status failed ${err}`)
-      return '浏览器已退出'
+      return parseBrowserExitStatus('')
     }
+  }
+
+  restartForRotation(browserMode) {
+    const mode = normalizeBrowserMode(browserMode)
+    this.stopWatchdog()
+    this.state.startToken += 1
+    this.state.starting = false
+    this.state.running = false
+    this.state.browserModeOverride = mode
+    this.state.rotationRestartCount += 1
+    if (this.keyboardBridge) {
+      this.keyboardBridge.stopPolling()
+      this.keyboardBridge.cancelActiveRequest('rotation change')
+    }
+    console.warn(`wpe rotation restart mode=${mode} count=${this.state.rotationRestartCount}`)
+    setTimeout(() => {
+      if (!this.state.leaving && this.state.browserModeOverride === mode) this.start()
+    }, 100)
   }
 
   stop() {
@@ -127,8 +197,10 @@ export class BrowserLifecycle {
       this.keyboardBridge.stopPolling()
       this.keyboardBridge.cancelActiveRequest('stop browser')
     }
+    const workdir = this.workdir()
+    if (!workdir) return
     try {
-      this.browserPlayer.stopBrowser({ workdir: this.workdir() })
+      this.browserPlayer.stopBrowser({ workdir })
     } catch (err) {
       console.warn(`stop browser failed ${err}`)
     }
@@ -144,7 +216,7 @@ export class BrowserLifecycle {
       try {
         $falcon.navTo(options.returnPage || 'index', {
           browserStatus: reason || 'stopped',
-          browserMode: options.browserMode || DEFAULT_BROWSER_MODE,
+          browserMode: LAST_BROWSER_MODE,
         })
       } catch (err) {
         console.warn(`nav index failed ${err}`)

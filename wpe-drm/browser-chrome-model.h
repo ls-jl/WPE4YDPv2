@@ -10,6 +10,7 @@ typedef enum {
     CHROME_PANEL_MENU,
     CHROME_PANEL_SETTINGS,
     CHROME_PANEL_LANGUAGE,
+    CHROME_PANEL_ROTATION,
     CHROME_PANEL_APPEARANCE,
     CHROME_PANEL_WEB,
     CHROME_PANEL_STARTUP,
@@ -48,6 +49,14 @@ typedef struct {
     int button_count;
 } BrowserChromeToolbarGeometry;
 
+typedef struct {
+    gboolean portrait;
+    int columns;
+    int rows;
+    int items_per_page;
+    int page_count;
+} BrowserChromeMenuGridGeometry;
+
 const ChromePanelDefinition *chrome_panel_definition(ChromePanel panel);
 const char *chrome_panel_name(ChromePanel panel);
 ChromePanel chrome_panel_from_name(const char *name);
@@ -60,5 +69,7 @@ BrowserChromeToolbarGeometry browser_chrome_toolbar_geometry(
     int portrait_height, int button_count);
 int browser_chrome_toolbar_button_at(
     const BrowserChromeToolbarGeometry *geometry, double x, double y);
+BrowserChromeMenuGridGeometry browser_chrome_menu_grid_geometry(
+    int panel_width, int panel_height, int item_count);
 
 G_END_DECLS

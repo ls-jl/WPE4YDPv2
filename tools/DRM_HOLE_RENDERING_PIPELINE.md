@@ -8,7 +8,7 @@
 
 核心链路：
 
-1. MiniApp `index` 页显示启动入口和显示模式（原生/横屏旋转）选择。
+1. MiniApp `index` 页显示启动入口，可沿用上次方向或显式选择相对系统原生方向的 `0°/90°/180°/270°`。
 2. 用户点击启动后进入 `frame` 页。
 3. `frame` 页只渲染全屏 `<hole>`，同时调用 native JSAPI 启动 WPE。
 4. JSAPI `browserPlayer.startBrowser()` fork/exec 包内 `assets/wpe-runtime/run.sh`。
@@ -52,7 +52,7 @@ flowchart LR
 `index` 页是浏览器启动页，不直接显示网页像素，也不参与 WPE 每帧刷新。它只负责：
 
 - 显示“启动浏览器”入口。
-- 提供显示模式选项：`原生模式`（跟随系统/MiniApp 框架方向）或 `横屏旋转`（在系统方向基础上旋转到横屏），只影响浏览器画面旋转，传给 WPE/DRM/触摸。
+- 提供 `last/native/rotate90/rotate180/rotate270`：`last` 读取 `$dataDir/browser/display-mode`，其余四项分别表示相对系统原生方向旋转 `0°/90°/180°/270°`。页面布局只使用已经验证的 `native` 与 `rotate270` 两套模板；最终 DRM/视频和 native 触摸方向再独立应用用户选择的角度，不旋转 MiniApp 框架。
 - 进入 `frame` 页，并把 `url/browserMode/returnPage` 作为页面参数传入；`frame` 页再结合系统显示配置解析出实际的 `rotation/panelSize/drmMode`。
 
 `index` 不 import 或调用 `browserPlayer`。native JSAPI 调用只放在 `frame` 页，避免页面切换或旋转别名导致旧 native object 被框架禁用。`index` 也不应该自动进入浏览器；自动启动会让调试和回到 MiniApp 首页时的生命周期变得不可控，也会导致 Home 后重新进入时立刻抢 DRM。
@@ -388,11 +388,19 @@ drmMode=480x960
 
 这种情况下，`WPEViewDRM` 会把 `960x266` 的源画面旋转复制到 `266x960` 的 dumb framebuffer，然后在 `480x960` 的 DRM envelope 中居中或按 `WPE_DRM_ROTATED_X/WPE_PANEL_CRTC_X` 定位。
 
-显示模式按相对原生方向的旋转量计算业务尺寸，而不是按最终绝对角度猜测横竖屏：
+页面布局和最终输出方向必须分开计算。布局只复用两套已经实机验证的模板，不允许把任意最终角度再次代入 panel reconcile：
 
-- `native` 的相对旋转为 `0`，保留系统配置的 `width x height`。
-- `rotate270` 相对原生方向旋转 `270`，因此始终交换 panel/viewport 宽高。
-- WPE 输出和触摸仍使用绝对角度 `frameworkRotation + modeDelta`。
+| 用户模式 | 布局模板 | 输出增量 | 触摸增量 |
+| --- | --- | ---: | ---: |
+| `native` | 旧 `native` | `0°` | `0°` |
+| `rotate90` | 旧 `rotate270` | `90°` | `90°` |
+| `rotate180` | 旧 `native` | `180°` | `180°` |
+| `rotate270` | 旧 `rotate270` | `270°` | `270°` |
+
+- `native/rotate180` 的 panel 和 viewport 必须完全一致，`rotate180` 只把最终 DRM 与触摸方向转 180 度。
+- `rotate90/rotate270` 的 panel 和 viewport 必须完全一致，两者复用旧 `rotate270` 尺寸模板，最终 DRM 与触摸方向相差 180 度。
+- `layoutRotation` 仅供旧模板完成 panel orientation reconcile；真正传给 WPE 的 `rotation` 是 `frameworkRotation + outputDelta`。
+- `drmMode` 仍只是 scanout envelope，不能参与网页布局比例计算。
 
 例如系统配置为 `936x280 / direction=270` 时，原生模式输出
 `panel=936x280, rotation=270`；旋转模式输出
@@ -419,7 +427,7 @@ launcher 输出的同一组 toolbar geometry，避免窄屏按钮越界或坐标
 成功日志示例：
 
 ```text
-display_resolve source=dom panel=1210x568 drm_mode=568x1210 viewport=1210x568 rotation=270
+display_resolve source=system_cfg:rotate90 layout_template=rotate270 layout_rotation=90 output_rotation=270 panel=1210x568 drm_mode=568x1210 viewport=1210x568 touch_rotation=270
 ```
 
 ## 6. WPE 主程序初始化
@@ -548,7 +556,11 @@ drawChromeOverlay(...)
 
 这一步发生在 DRM commit 前，所以工具栏和网页内容最终是同一个 WPE framebuffer。MiniApp 只负责 `<hole>`，不负责地址栏、tabs、settings 等浏览器 chrome。
 
-当前保留一个性能优先例外：`rotation=0` 且命中 `dma_heap` zero-copy 直扫路径时，buffer 直接进入 DRM commit，不经过 CPU 合成，因此不会绘制 native toolbar。这是预期行为；如果 0 度也需要 toolbar，需要改走 CPU 合成路径或后续实现独立 DRM plane toolbar。
+Native chrome 启用时，包括 `rotation=0` 在内的所有方向都进入完整
+panel dumb 合成路径：网页内容先写入内容区，再绘制 toolbar/menu，
+最后提交与 `panelSize` 一致的 framebuffer。这样在相对旋转后绝对角度恰好为
+`0` 时，toolbar 不会丢失，扣除 toolbar 高度的短内容帧也不会被直接拉伸到
+DRM mode。只有显式关闭 native chrome 时，未旋转 DMA-BUF 才保留 zero-copy 直扫。
 
 ## 8. DRM commit
 
@@ -565,6 +577,8 @@ WPE_DRM_FIT=panel-native
 - WebKit 始终按 `panelSize` 布局。
 - DRM `mode->hdisplay/vdisplay` 只作为提交 envelope。
 - 禁止 `480x960` 这类底层 mode 参与页面比例计算。
+- framebuffer 按原始像素尺寸居中或裁剪，不会隐式放大；只有
+  `WPE_DRM_FIT=stretch` 才允许铺满 mode。
 
 `WPEViewDRM` 在 `destinationRectForBuffer()` 中计算：
 
@@ -897,8 +911,8 @@ adb shell 'hal-screen on; hal-screen keep'
    ```
 5. 日志显示：
    ```text
-   display_resolve source=... panel=... drm_mode=... viewport=... rotation=...
-   WPE launch: ... panel=... drm_mode=... viewport=... rotation=...
+   display_resolve source=... layout_template=... layout_rotation=... output_rotation=... panel=... drm_mode=... viewport=... touch_rotation=...
+   WPE launch: ... panel=... drm_mode=... viewport=... layout_template=... layout_rotation=... output_rotation=... touch_rotation=...
    Panel: ...
    Viewport: ...
    WPEViewDRM commit fit=panel-native ...
@@ -1060,7 +1074,7 @@ done
 '
 
 # 2. 启动 MiniApp index
-adb shell 'miniapp_cli start 8001779591038449 --index'
+adb shell 'miniapp_cli start 8001779591038449 index'
 
 # 3. 确认没有自动启动 WPE
 adb shell 'pidof wpe-drm-minimal WPEWebProcess WPENetworkProcess 2>/dev/null || true'

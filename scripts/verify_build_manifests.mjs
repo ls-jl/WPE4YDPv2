@@ -18,7 +18,19 @@ function patchSeriesHash() {
     if (!patch || patch.startsWith('#')) continue
     hashes.push(sha256File(`wpe-drm/webkit-patches/${patch}`))
   }
-  return crypto.createHash('sha256').update(`${series}${hashes.join('\n')}\n`).digest('hex')
+  let material = `${series}${hashes.join('\n')}\n`
+  const inputsPath = 'wpe-drm/webkit-patches/inputs'
+  if (fs.existsSync(inputsPath)) {
+    const inputs = fs.readFileSync(inputsPath, 'utf8')
+    const inputHashes = []
+    for (const rawLine of inputs.split('\n')) {
+      const input = rawLine.trim()
+      if (!input || input.startsWith('#')) continue
+      inputHashes.push(sha256File(input))
+    }
+    material += `${inputs}${inputHashes.join('\n')}\n`
+  }
+  return crypto.createHash('sha256').update(material).digest('hex')
 }
 
 function verifyArtifacts(manifest) {

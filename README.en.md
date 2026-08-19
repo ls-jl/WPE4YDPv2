@@ -21,7 +21,7 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
 - **Low-risk memory policy**: global swappiness and `drop_caches` remain untouched by default. System-wide experiments are available only through explicit diagnostic switches.
 - **Mobile UA + per-site profiles**: defaults to an Android Chrome UA; supports switching between desktop/mobile profiles per site.
 - **Persistent user profiles and cookies**: up to eight persistent profiles plus Guest. Cookies, LocalStorage, IndexedDB, service workers, cache, tabs, history, bookmarks, and site mode are isolated. Browser metadata uses SQLite WAL; each profile has its own WebKit SQLite CookieJar.
-- Native toolbar `inset` layout (show/hide without resizing the WebView), Chrome-style overflow menu, direct address editing, horizontal scrolling, system keyboard bridge, and dual display modes (native/landscape rotation).
+- Native toolbar `resize` layout (a visible toolbar reserves a real WebView content inset), Chrome-style overflow menu, direct address editing, horizontal scrolling, system keyboard bridge, and `0°/90°/180°/270°` modes relative to the device-native orientation. All four modes reuse only the proven legacy `native` and `rotate270` page-layout templates; DRM output and touch rotations are applied independently after layout selection so a landscape viewport is never stretched into portrait.
 
 ## Directory Structure
 
@@ -39,7 +39,7 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
   - `GStreamerHolePunchQuirkRockchip.{h,cpp}`: the WebProcess-side quirk for direct video output, corresponding to `Source/WebCore/platform/gstreamer/`.
   - `browser-chrome-model.*`, `browser-navigation.*`, and `browser-profile-store.*`: independently testable native logic.
   - `runtime/`: supervisor modules copied into the package at build time.
-  - `webkit-patches/{revision,series}`: four production patches replayed from an exact clean WebKit revision.
+  - `webkit-patches/{revision,series}`: the ordered production patch series replayed from an exact clean WebKit revision.
 - `tests/fixtures/web/`: local RAF, touch, audio, video, and page fixtures.
 - `tools/diagnostics/`: diagnostic C utilities with a shared Makefile.
 - `8001779591038449.1_0_0.amr`: the packaged build artifact (checked into Git LFS).
@@ -59,10 +59,12 @@ rm -rf .falcon_ .falcon_tmp && npm run build
 
 The WebKit core and `wpe-drm-minimal` are built on the ARM64 cross-compilation server. `scripts/build_webrtc_runtime_pve.sh` creates an isolated worktree at the recorded revision, replays `series`, and emits `build-manifest.json` with the revision, patch hash, build switches, and ELF SHA256 values. Do not patch a long-lived shared WebKit tree in place.
 
+The only supported build checkout is `pve@192.168.100.118:/home/pve/web-browser-src`; the old Parallels builder is retired. After syncing the repository, run both builds on PVE with `PROJECT_ROOT=$PWD JOBS=72`.
+
 ## Running
 
 1. Install the amr (`miniapp_cli install <amr>`).
-2. Launch the MiniApp to enter the `index` launcher page, select a display mode, and tap to start the browser; or directly run `miniapp_cli start 8001779591038449 frame`.
+2. Launch the MiniApp to enter the `index` launcher page, reuse the last orientation or choose an explicit recovery orientation, and start the browser. The WPE overflow menu also exposes a Rotation page; a change exits with code `72` and restarts inside the same `frame`/`<hole>` host without clearing profiles, cookies, or tabs.
 3. The `frame` page shows a full-screen `<hole>`, and WPE starts from the in-package runtime and renders directly via DRM. On Home/exit, JSAPI stops WPE and releases DRM.
 
 Writable data lives under `$dataDir/browser/`: `wpe-drm.log`, `browser.sqlite3` (profiles/tabs/history/bookmarks), `profiles/p<ID>/runtime/{data,cache}` (site data), `profiles/p<ID>/cookies.sqlite`, `chrome-render-state.ini` (lightweight drawing IPC), `keyboard/`, and `fontconfig-cache/`. Legacy `browser-state.ini` and `runtime-tmp` are imported into DEFAULT once; the INI is renamed to `.migrated.bak`.
