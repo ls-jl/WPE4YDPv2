@@ -24,6 +24,7 @@
 #include "browser-touch-gesture.h"
 #include <errno.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <gio/gio.h>
 #include <glib-unix.h>
@@ -286,6 +287,8 @@ typedef struct {
     guint64 scroll_stats_last_frame_count;
     gboolean cloud_autostart;
     gboolean cloud_launch_requested;
+    guint cloud_launch_attempts;
+    gint64 cloud_launch_last_tap_us;
     gboolean page_fullscreen;
     gboolean chrome_visible_before_fullscreen;
     gboolean game_media_immersive;
@@ -310,7 +313,7 @@ typedef struct {
     WebKitScriptMessageReply *keyboard_frame_reply;
     JSCContext *keyboard_frame_context;
     gint64 keyboard_active_us;
-    gint64 last_pointer_tap_us;
+    gint64 last_keyboard_activation_us;
     BrowserChrome chrome;
     RawTouchSlot raw_slots[MAX_TOUCH_SLOTS];
     TouchSlot slots[MAX_TOUCH_SLOTS];
@@ -2658,8 +2661,12 @@ static gboolean on_keyboard_script_message_with_reply(
     if (!g_strcmp0(operation, "open")) {
         gint64 pointer_gate_us =
             (gint64)env_double("WPE_KEYBOARD_POINTER_GATE_MS", 2000) * 1000;
-        gint64 since_pointer_us = state->last_pointer_tap_us > 0
-            ? g_get_monotonic_time() - state->last_pointer_tap_us
+        const char *trigger = params_get_string(params, "trigger", "unknown");
+        const char *tag = params_get_string(params, "tag", "unknown");
+        const char *input_type = params_get_string(params, "type", "");
+        const char *input_mode = params_get_string(params, "inputmode", "");
+        gint64 since_pointer_us = state->last_keyboard_activation_us > 0
+            ? g_get_monotonic_time() - state->last_keyboard_activation_us
             : G_MAXINT64;
         gboolean opened = FALSE;
         if (pointer_gate_us <= 0 || since_pointer_us <= pointer_gate_us) {
@@ -2669,9 +2676,13 @@ static gboolean on_keyboard_script_message_with_reply(
                 params_get_string(params, "inputType", "ZhCNPreferred"),
                 params_get_int(params, "maxlength", 100),
                 params_get_bool(params, "multiLinesEditVisible", FALSE));
+            g_print("Keyboard web_input gate: result=%s trigger=%s tag=%s type=%s inputmode=%s activation_age_ms=%.1f\n",
+                    opened ? "accepted" : "request_failed", trigger, tag,
+                    input_type, input_mode, since_pointer_us / 1000.0);
         } else {
-            g_print("Keyboard web_input ignored: no recent pointer tap since_us=%"
-                    G_GINT64_FORMAT "\n", since_pointer_us);
+            g_print("Keyboard web_input gate: result=rejected reason=no_recent_user_activation trigger=%s tag=%s type=%s inputmode=%s activation_age_ms=%.1f\n",
+                    trigger, tag, input_type, input_mode,
+                    since_pointer_us == G_MAXINT64 ? -1.0 : since_pointer_us / 1000.0);
         }
         if (opened && state->keyboard_active_id) {
             char *payload = g_strdup_printf("op=opened&id=%s",
@@ -2823,14 +2834,23 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "window.__haasKeyboardTargetId='';"
         "window.__haasKeyboardSeq=1;"
         "window.__haasKeyboardInFlight=false;"
-        "function editable(el){return !!(el&&((el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(el.type||''))||el.tagName==='TEXTAREA'||el.isContentEditable)&&!el.disabled&&!el.readOnly);}"
+        "window.__haasKeyboardActivation=0;"
+        "window.__haasKeyboardActivationAt=0;"
+        "window.__haasKeyboardActivationStartAt=0;"
+        "window.__haasKeyboardHandledActivation=0;"
+        "function editable(el){return !!(el&&((el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|file|hidden|image|range|color)$/i.test(el.type||''))||el.tagName==='TEXTAREA'||el.isContentEditable)&&!el.disabled&&!el.readOnly);}"
         "function closestEditable(el){while(el&&el!==document){if(editable(el))return el;el=el.parentElement;}return null;}"
+        "function pathEditable(e){var path=e&&e.composedPath?e.composedPath():null;for(var i=0;path&&i<path.length;i++){if(editable(path[i]))return path[i];}return closestEditable(e&&e.target);}"
         "function enc(v){return encodeURIComponent(v==null?'':String(v));}"
         "function dec(v){try{return decodeURIComponent(String(v||'').replace(/\\+/g,' '));}catch(e){return String(v||'');}}"
         "function parse(v){var out={};String(v||'').split('&').forEach(function(part){var at=part.indexOf('=');var k=at<0?part:part.slice(0,at);var x=at<0?'':part.slice(at+1);if(k)out[k]=dec(x);});return out;}"
         "function post(v){try{return Promise.resolve(window.webkit.messageHandlers.haasKeyboard.postMessage(v));}catch(e){return Promise.reject(e);}}"
         "function valueOf(el){return el.isContentEditable?(el.innerText||el.textContent||''):(el.value||'');}"
-        "function typeOf(el){var t=String(el.getAttribute('type')||'').toLowerCase();if(t==='number'||t==='tel')return 'Number';if(t==='email'||t==='url'||t==='password')return 'EnUSPreferred';return 'ZhCNPreferred';}"
+        "function attr(el,name){try{return String(el.getAttribute(name)||'');}catch(e){return '';}}"
+        "function typeOf(el){var t=attr(el,'type').toLowerCase(),m=attr(el,'inputmode').toLowerCase(),a=attr(el,'autocomplete').toLowerCase();if(t==='number'||t==='tel'||m==='numeric'||m==='decimal'||a==='one-time-code')return 'Number';if(t==='email'||t==='url'||t==='password'||m==='email'||m==='url')return 'EnUSPreferred';return 'ZhCNPreferred';}"
+        "function otpLike(el){var s=[attr(el,'autocomplete'),attr(el,'name'),attr(el,'id'),attr(el,'placeholder'),attr(el,'aria-label')].join(' ').toLowerCase();return /one-time-code|one.?time|otp|verify|verification|captcha|sms.?code|验证码/.test(s);}"
+        "function noteActivation(e){if(e&&e.isTrusted===false)return 0;var now=Date.now(),kind=String(e&&e.type||'');if(kind==='click'){if(!window.__haasKeyboardActivation||now-window.__haasKeyboardActivationAt>1500){window.__haasKeyboardActivation++;window.__haasKeyboardActivationAt=now;}}else if(!window.__haasKeyboardActivationStartAt||now-window.__haasKeyboardActivationStartAt>80){window.__haasKeyboardActivation++;window.__haasKeyboardActivationAt=now;window.__haasKeyboardActivationStartAt=now;}return window.__haasKeyboardActivation;}"
+        "function activationValid(){return !!window.__haasKeyboardActivation&&Date.now()-window.__haasKeyboardActivationAt<=1500;}"
         "function mark(el){var id=el.getAttribute('data-haas-keyboard-id');if(!id){id='hk'+Date.now().toString(36)+(window.__haasKeyboardSeq++).toString(36);try{el.setAttribute('data-haas-keyboard-id',id);}catch(e){}}window.__haasKeyboardTargetId=id||'';return id||'';}"
         "function findTarget(){var el=window.__haasKeyboardTarget;if(editable(el)&&document.documentElement&&document.documentElement.contains(el))return el;var id=window.__haasKeyboardTargetId;if(id&&document.querySelector){try{el=document.querySelector('[data-haas-keyboard-id=\"'+id+'\"]');if(editable(el))return el;}catch(e){}}el=document.activeElement;if(editable(el))return el;return null;}"
         "function diffType(oldv,newv){oldv=String(oldv==null?'':oldv);newv=String(newv==null?'':newv);if(newv.length<oldv.length){return oldv.indexOf(newv)===0?'deleteContentBackward':'deleteContentForward';}if(newv.length>oldv.length){return newv.indexOf(oldv)===0?'insertText':'insertReplacementText';}return 'insertReplacementText';}"
@@ -2841,8 +2861,10 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "function applyText(value,commit){return new Promise(function(resolve){var el=findTarget();if(!editable(el)){resolve({applied:false,observed:'',alive:false});return;}value=String(value==null?'':value);try{applyCore(el,value);}catch(e){resolve({applied:false,observed:valueOf(el),alive:true});return;}nextFrame(function(){if(valueOf(el)!==value){try{applyCore(el,value);}catch(e){}}nextFrame(function(){var observed=valueOf(el);var applied=observed===value;if(commit&&applied){try{var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}catch(e){}}resolve({applied:applied,observed:observed,alive:editable(el)});});});});}"
         "function finish(){window.__haasKeyboardInFlight=false;window.__haasKeyboardTarget=null;window.__haasKeyboardTargetId='';}"
         "function wait(id,ack){var msg='op=wait&id='+enc(id);if(ack){msg+='&ackSequence='+enc(ack.sequence)+'&applied='+(ack.applied?'1':'0')+'&observed='+enc(ack.observed||'');}return post(msg).then(function(raw){var cmd=parse(raw);if(cmd.op==='update'||cmd.op==='commit'){var sequence=parseInt(cmd.sequence||'0',10)||0;return applyText(cmd.text||'',cmd.op==='commit').then(function(result){return wait(id,{sequence:sequence,applied:result.applied,observed:result.observed});});}if(cmd.op==='complete'||cmd.op==='expired'||cmd.op==='superseded'||cmd.op==='rejected'){finish();return;}return wait(id,null);}).catch(function(){finish();});}"
-        "function request(el){el=closestEditable(el);if(window.__haasKeyboardInFlight||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(el.getAttribute('maxlength')||'',10);if(!isFinite(max)||max<=0)max=ml?512:100;var fallback=(navigator.language||'').toLowerCase().indexOf('zh')===0?'请输入内容':'Enter text';var ph=el.getAttribute('placeholder')||el.getAttribute('aria-label')||fallback;var msg='op=open&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');post(msg).then(function(raw){var opened=parse(raw);if(opened.op!=='opened'||!opened.id){finish();return;}wait(opened.id,null);}).catch(function(){finish();});}"
-        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;var path=e.composedPath?e.composedPath():null;var el=closestEditable(path&&path.length?path[0]:e.target);if(el)setTimeout(function(){request(el);},0);},true);"
+        "function request(el,trigger){el=closestEditable(el)||el;if(window.__haasKeyboardInFlight||!activationValid()||window.__haasKeyboardHandledActivation===window.__haasKeyboardActivation||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardHandledActivation=window.__haasKeyboardActivation;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(attr(el,'maxlength'),10);if(!isFinite(max)||max<=0)max=ml?512:(otpLike(el)?8:100);var fallback=(navigator.language||'').toLowerCase().indexOf('zh')===0?'请输入内容':'Enter text';var ph=attr(el,'placeholder')||attr(el,'aria-label')||fallback;var msg='op=open&trigger='+enc(trigger||'unknown')+'&tag='+enc(String(el.tagName||'').toLowerCase())+'&type='+enc(attr(el,'type').toLowerCase())+'&inputmode='+enc(attr(el,'inputmode').toLowerCase())+'&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');post(msg).then(function(raw){var opened=parse(raw);if(opened.op!=='opened'||!opened.id){finish();return;}wait(opened.id,null);}).catch(function(){finish();});}"
+        "['pointerdown','touchstart','mousedown'].forEach(function(name){document.addEventListener(name,function(e){noteActivation(e);},true);});"
+        "document.addEventListener('focusin',function(e){if(!activationValid())return;var el=pathEditable(e)||document.activeElement;if(editable(el))setTimeout(function(){request(el,'focusin');},0);},true);"
+        "document.addEventListener('click',function(e){if(e.isTrusted===false)return;noteActivation(e);var el=pathEditable(e);if(el)setTimeout(function(){request(el,'click');},0);},true);"
         "})();";
     WebKitUserScript *script = webkit_user_script_new(source,
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
@@ -4451,7 +4473,7 @@ static void dispatch_pointer_tap(AppState *state, double x, double view_y,
                                  double screen_x, double screen_y,
                                  gboolean video_mapped, guint32 time_ms)
 {
-    state->last_pointer_tap_us = g_get_monotonic_time();
+    state->last_keyboard_activation_us = g_get_monotonic_time();
     wpe_view_focus_in(state->view);
 
     WPEEvent *move = wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, state->view,
@@ -4792,6 +4814,8 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             slot->max_move_sq = 0;
             slot->scrolling = FALSE;
             slot->chrome_consumed = chrome_touch_down_consumes(state, slot->x, slot->y);
+            if (!slot->chrome_consumed)
+                state->last_keyboard_activation_us = g_get_monotonic_time();
             slot->panel_gesture = CHROME_PANEL_GESTURE_NONE;
             slot->panel_start_offset = 0;
             slot->panel_velocity = 0;
@@ -4914,17 +4938,15 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
                 }
                 game_reset_touch_slot(slot);
             } else if (!slot->chrome_consumed && native_touch) {
-                /* WebKit synthesizes the trusted DOM click while handling the
-                 * native TOUCH_UP event. Record the physical tap before
-                 * dispatching UP so the keyboard message handler can
-                 * distinguish that click from a script-triggered request.
-                 * Pointer-only mode records the same gate in
-                 * dispatch_pointer_tap(). */
+                /* Refresh the trusted activation immediately before WebKit
+                 * synthesizes the DOM click on TOUCH_UP. TOUCH_DOWN records
+                 * the same gate so custom controls that focus an internal
+                 * input before click can open the system keyboard. */
                 double native_tap_limit = state->touch_tap_max_move > 0
                     ? state->touch_tap_max_move : 24;
                 if (!slot->scrolling
                     && slot->max_move_sq <= native_tap_limit * native_tap_limit)
-                    state->last_pointer_tap_us = g_get_monotonic_time();
+                    state->last_keyboard_activation_us = g_get_monotonic_time();
                 send_touch_event(state, WPE_EVENT_TOUCH_UP, i, slot->last_x,
                                  slot->last_y, time_ms);
             }
@@ -5976,6 +5998,20 @@ static gboolean on_cloud_launch_script_message_with_reply(
         const char *dtls = params_get_string(params, "dtls", "(none)");
         g_print("Cloud JS RTC state: reason=%s connection=%s ice=%s signaling=%s gathering=%s dtls=%s\n",
                 reason, connection, ice, signaling, gathering, dtls);
+    } else if (!g_strcmp0(op, "dc-state")) {
+        const char *reason = params_get_string(params, "reason", "unknown");
+        const char *ready = params_get_string(params, "ready", "unknown");
+        const char *source = params_get_string(params, "source", "unknown");
+        g_print("Cloud JS DataChannel: reason=%s ready=%s source=%s\n",
+                reason, ready, source);
+    } else if (!g_strcmp0(op, "rtc-stats")) {
+        const char *audio_packets = params_get_string(params, "audio_packets", "0");
+        const char *video_packets = params_get_string(params, "video_packets", "0");
+        const char *video_bytes = params_get_string(params, "video_bytes", "0");
+        const char *frames = params_get_string(params, "frames", "0");
+        const char *dc_open = params_get_string(params, "dc_open", "0");
+        g_print("Cloud JS RTC stats: audio_packets=%s video_packets=%s video_bytes=%s frames=%s dc_open=%s\n",
+                audio_packets, video_packets, video_bytes, frames, dc_open);
     } else if (!g_strcmp0(op, "click")) {
         /* Keep the trace structural: page text, URLs and event payloads may be private. */
         g_print("Cloud page click: host=%s top=%s tag=%s trusted=%s\n",
@@ -5985,21 +6021,43 @@ static gboolean on_cloud_launch_script_message_with_reply(
     } else if (g_strcmp0(top_text, "1")) {
         g_print("Cloud launch target observed in child frame: host=%s css=%.1f,%.1f\n",
             host, css_x, css_y);
-    } else if (state->cloud_launch_requested) {
-        g_print("Cloud launch target ignored: already requested css=%.1f,%.1f\n", css_x, css_y);
     } else if (!state->cloud_autostart) {
         g_print("Cloud launch target observed: css=%.1f,%.1f auto=off\n", css_x, css_y);
     } else {
+        gint64 now_us = g_get_monotonic_time();
+        gint64 retry_us = (gint64)env_double("WPE_CLOUD_AUTOSTART_RETRY_MS", 1500) * 1000;
+        if (state->cloud_launch_attempts >= 3
+            || (state->cloud_launch_last_tap_us > 0
+                && now_us - state->cloud_launch_last_tap_us < retry_us)) {
+            g_print("Cloud launch target deferred: attempts=%u age_ms=%.1f css=%.1f,%.1f\n",
+                    state->cloud_launch_attempts,
+                    state->cloud_launch_last_tap_us > 0
+                        ? (now_us - state->cloud_launch_last_tap_us) / 1000.0 : -1.0,
+                    css_x, css_y);
+            keyboard_reply_message(value, reply, "op=ok");
+            g_hash_table_unref(params);
+            g_free(message);
+            return TRUE;
+        }
         double zoom = webkit_web_view_get_zoom_level(state->web_view);
         double screen_x = css_x * zoom;
         double screen_y = css_y * zoom + chrome_page_top_inset(state);
-        if (screen_x < 0 || screen_x >= state->viewport_width || screen_y < 0 || screen_y >= state->viewport_height) {
-            g_warning("Cloud launch target rejected: css=%.1f,%.1f zoom=%.2f screen=%.1f,%.1f viewport=%dx%d",
-                css_x, css_y, zoom, screen_x, screen_y, state->viewport_width, state->viewport_height);
+        int screen_width = state->panel_width > 0
+            ? state->panel_width : state->viewport_width;
+        int screen_height = state->panel_height > 0
+            ? state->panel_height : state->viewport_height;
+        if (screen_x < 0 || screen_x >= screen_width
+            || screen_y < 0 || screen_y >= screen_height) {
+            g_warning("Cloud launch target rejected: css=%.1f,%.1f zoom=%.2f screen=%.1f,%.1f panel=%dx%d viewport=%dx%d",
+                css_x, css_y, zoom, screen_x, screen_y,
+                screen_width, screen_height,
+                state->viewport_width, state->viewport_height);
         } else {
             state->cloud_launch_requested = TRUE;
-            g_print("Cloud launch native tap: css=%.1f,%.1f zoom=%.2f screen=%.1f,%.1f\n",
-                css_x, css_y, zoom, screen_x, screen_y);
+            state->cloud_launch_attempts++;
+            state->cloud_launch_last_tap_us = now_us;
+            g_print("Cloud launch native tap: attempt=%u css=%.1f,%.1f zoom=%.2f screen=%.1f,%.1f\n",
+                state->cloud_launch_attempts, css_x, css_y, zoom, screen_x, screen_y);
             send_pointer_tap(state, screen_x, screen_y,
                 (guint32)(g_get_monotonic_time() / 1000));
         }
@@ -6028,7 +6086,7 @@ static void setup_cloud_autostart_user_script(WebKitUserContentManager *manager,
         "if(window.__haasCloudLaunchInstalled)return;"
         "window.__haasCloudLaunchInstalled=true;"
         "if(!/(?:^|\\.)(?:mihoyo\\.com|mihoyocg\\.com)$/.test(location.hostname))return;"
-        "var sent=false,attempts=0;"
+        "var launchClicked=false,targetReports=0,lastTargetReport=0,attempts=0,launchReadyAt=Date.now()+15000;"
         "function normalized(s){return (s||'').replace(/\\s+/g,'').trim();}"
         "function post(s){try{Promise.resolve(window.webkit.messageHandlers.haasCloudLaunch.postMessage(s)).catch(function(){});}catch(e){}}"
         "post('op=probe&host='+encodeURIComponent(location.hostname)+'&top='+(window.top===window?'1':'0'));"
@@ -6088,6 +6146,15 @@ static void setup_cloud_autostart_user_script(WebKitUserContentManager *manager,
         "   +'&sctpmap='+(legacy?'1':'0')+'&host='+encodeURIComponent(location.hostname)"
         "   +'&top='+(window.top===window?'1':'0'));"
         " }catch(e){}}"
+        " function observeDc(channel,source){try{"
+        "  if(!channel||channel.__haasDcObserved)return;channel.__haasDcObserved=true;"
+        "  function report(reason){post('op=dc-state&reason='+encodeURIComponent(reason)"
+        "   +'&ready='+encodeURIComponent(channel.readyState||'unknown')"
+        "   +'&source='+encodeURIComponent(source||'unknown'));}"
+        "  ['open','close','closing','error'].forEach(function(name){channel.addEventListener(name,function(){report(name);});});"
+        "  var first=true;channel.addEventListener('message',function(){if(first){first=false;report('first-message');}});"
+        "  report('attach');"
+        " }catch(e){}}"
         " function observePc(peer){try{"
         "  if(!peer||peer.__haasRtcStateObserved)return;"
         "  peer.__haasRtcStateObserved=true;"
@@ -6108,6 +6175,8 @@ static void setup_cloud_autostart_user_script(WebKitUserContentManager *manager,
         "   'icegatheringstatechange'].forEach(function(name){"
         "    peer.addEventListener(name,function(){reportState(name);});"
         "  });"
+        "  peer.addEventListener('datachannel',function(e){observeDc(e.channel,'remote');});"
+        "  var statsTicks=0,statsLast='';setInterval(function(){if(++statsTicks>30||!peer.getStats)return;peer.getStats().then(function(report){var ap=0,vp=0,vb=0,fd=0,dcOpen=0;report.forEach(function(s){if(s.type==='inbound-rtp'&&!s.isRemote){if(s.kind==='audio'||s.mediaType==='audio')ap+=Number(s.packetsReceived||0);if(s.kind==='video'||s.mediaType==='video'){vp+=Number(s.packetsReceived||0);vb+=Number(s.bytesReceived||0);fd+=Number(s.framesDecoded||0);}}if(s.type==='data-channel'&&s.state==='open')dcOpen++;});var snapshot=[ap,vp,vb,fd,dcOpen].join('|');if(snapshot!==statsLast){statsLast=snapshot;post('op=rtc-stats&audio_packets='+ap+'&video_packets='+vp+'&video_bytes='+vb+'&frames='+fd+'&dc_open='+dcOpen);}}).catch(function(){});},2000);"
         "  var ticks=0,timer=setInterval(function(){"
         "   reportState('poll'); if(++ticks>=120)clearInterval(timer);"
         "  },250);"
@@ -6121,16 +6190,19 @@ static void setup_cloud_autostart_user_script(WebKitUserContentManager *manager,
         "   proto.setRemoteDescription=function(desc){observePc(this);reportSdp('remote',desc);return setRemote.apply(this,arguments);};"
         "   var setLocal=proto.setLocalDescription;"
         "   proto.setLocalDescription=function(desc){observePc(this);reportSdp('local',desc);return setLocal.apply(this,arguments);};"
+        "   var createChannel=proto.createDataChannel;"
+        "   proto.createDataChannel=function(){observePc(this);var channel=createChannel.apply(this,arguments);observeDc(channel,'local');return channel;};"
         "  }"
         " }"
         "}catch(e){}"
         "document.addEventListener('click',function(e){"
         " var t=e.target||{},tag=String(t.tagName||'').slice(0,24);"
+        " for(var n=t,d=0;n&&n!==document&&d<6;n=n.parentElement,d++){if(normalized(n.innerText||n.textContent)==='进入游戏'){launchClicked=true;break;}}"
         " post('op=click&tag='+encodeURIComponent(tag)+'&trusted='+(e.isTrusted?'1':'0')"
         "  +'&host='+encodeURIComponent(location.hostname)+'&top='+(window.top===window?'1':'0'));"
         "},true);"
         "function report(el,r){"
-        " if(sent)return; sent=true;"
+        " var now=Date.now();if(launchClicked||targetReports>=3||now-lastTargetReport<1500)return;targetReports++;lastTargetReport=now;"
         " var payload='op=target&x='+encodeURIComponent(String(r.left+r.width/2))"
         "+'&y='+encodeURIComponent(String(r.top+r.height/2))"
         "+'&tag='+encodeURIComponent(el.tagName||'')"
@@ -6139,14 +6211,14 @@ static void setup_cloud_autostart_user_script(WebKitUserContentManager *manager,
         " post(payload);"
         "}"
         "function find(){"
-        " attempts++; var nodes=document.querySelectorAll('button,[role=button],[role=link],a,div');"
+        " attempts++;if(Date.now()<launchReadyAt)return;var nodes=document.querySelectorAll('button,[role=button],[role=link],a,div');"
         " for(var i=0;i<nodes.length&&i<1200;i++){var el=nodes[i];"
         "  if(normalized(el.innerText||el.textContent)!=='进入游戏')continue;"
         "  if(el.disabled||el.getAttribute('aria-disabled')==='true')continue;"
         "  var r=el.getBoundingClientRect();"
         "  if(r.width>=48&&r.height>=16&&r.right>0&&r.bottom>0&&r.left<innerWidth&&r.top<innerHeight){report(el,r);return;}"
         " }"
-        " if(attempts>=80)clearInterval(window.__haasCloudLaunchTimer);"
+        " if(launchClicked||attempts>=120)clearInterval(window.__haasCloudLaunchTimer);"
         "}"
         "window.__haasCloudLaunchTimer=setInterval(find,250);find();"
         "})();";
@@ -6245,6 +6317,11 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
     if (load_event == WEBKIT_LOAD_STARTED || load_event == WEBKIT_LOAD_REDIRECTED || load_event == WEBKIT_LOAD_COMMITTED) {
         update_input_profile_for_uri(state, uri);
         update_page_zoom_for_uri(state, uri);
+    }
+    if (load_event == WEBKIT_LOAD_STARTED) {
+        state->cloud_launch_requested = FALSE;
+        state->cloud_launch_attempts = 0;
+        state->cloud_launch_last_tap_us = 0;
     }
     if (!is_internal_error_load && tab && uri && uri[0] && g_strcmp0(tab->url, uri)) {
         if (!chrome->suppress_history && tab->url[0]) {
@@ -6678,6 +6755,33 @@ static void named_process_memory_snapshot(const char *prefix,
     closedir(proc);
 }
 
+static void view_drm_trim_caches_optional(WPEView *view, gboolean critical)
+{
+    typedef void (*TrimCachesFunction)(WPEViewDRM *, gboolean);
+    static TrimCachesFunction function;
+    static gsize resolved;
+    if (g_once_init_enter(&resolved)) {
+        function = (TrimCachesFunction)dlsym(RTLD_DEFAULT,
+            "wpe_view_drm_trim_caches");
+        g_once_init_leave(&resolved, 1);
+    }
+    if (function && view)
+        function((WPEViewDRM *)view, critical);
+}
+
+static guint64 view_drm_cache_bytes_optional(WPEView *view)
+{
+    typedef guint64 (*GetCacheBytesFunction)(WPEViewDRM *);
+    static GetCacheBytesFunction function;
+    static gsize resolved;
+    if (g_once_init_enter(&resolved)) {
+        function = (GetCacheBytesFunction)dlsym(RTLD_DEFAULT,
+            "wpe_view_drm_get_cache_bytes");
+        g_once_init_leave(&resolved, 1);
+    }
+    return function && view ? function((WPEViewDRM *)view) : 0;
+}
+
 static gboolean memory_governor_tick(gpointer user_data)
 {
     AppState *state = user_data;
@@ -6707,8 +6811,8 @@ static gboolean memory_governor_tick(gpointer user_data)
     gboolean periodic = !state->memory_last_summary_us
         || now - state->memory_last_summary_us >= 30 * G_USEC_PER_SEC;
     if (transitioned && pressure_level > BROWSER_MEMORY_PRESSURE_NORMAL
-        && state->view && WPE_IS_VIEW_DRM(state->view)) {
-        wpe_view_drm_trim_caches(WPE_VIEW_DRM(state->view),
+        && state->view) {
+        view_drm_trim_caches_optional(state->view,
             pressure_level == BROWSER_MEMORY_PRESSURE_CRITICAL);
 #if defined(__GLIBC__)
         if (pressure_level == BROWSER_MEMORY_PRESSURE_CRITICAL)
@@ -6716,8 +6820,8 @@ static gboolean memory_governor_tick(gpointer user_data)
 #endif
     }
     if (periodic && pressure_level > BROWSER_MEMORY_PRESSURE_NORMAL
-        && state->view && WPE_IS_VIEW_DRM(state->view))
-        wpe_view_drm_trim_caches(WPE_VIEW_DRM(state->view),
+        && state->view)
+        view_drm_trim_caches_optional(state->view,
             pressure_level == BROWSER_MEMORY_PRESSURE_CRITICAL);
 
     if (transitioned || periodic) {
@@ -6728,8 +6832,7 @@ static gboolean memory_governor_tick(gpointer user_data)
         named_process_memory_snapshot("WPEWebProcess", &web);
         named_process_memory_snapshot("WPENetwork", &network);
         guint used_percent = (guint)((memory.total_kb - MIN(memory.available_kb, memory.total_kb)) * 100 / memory.total_kb);
-        guint64 cache_bytes = state->view && WPE_IS_VIEW_DRM(state->view)
-            ? wpe_view_drm_get_cache_bytes(WPE_VIEW_DRM(state->view)) : 0;
+        guint64 cache_bytes = view_drm_cache_bytes_optional(state->view);
         g_print("Memory governor: profile=%s level=%s used=%u%% available=%" G_GUINT64_FORMAT "kB swap_free=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT "kB launcher=%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT "kB web=%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT "kB network=%" G_GUINT64_FORMAT "+%" G_GUINT64_FORMAT "kB native_cache=%" G_GUINT64_FORMAT "B transition=%d\n",
             g_getenv("WPE_MEMORY_PROFILE") ? g_getenv("WPE_MEMORY_PROFILE") : "unknown",
             browser_memory_pressure_name(pressure_level), used_percent,

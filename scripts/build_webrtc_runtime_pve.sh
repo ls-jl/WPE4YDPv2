@@ -194,6 +194,11 @@ if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdtls.so" ] || \
   apply_patch_once "$GST_BAD_SOURCE" "$GST_WEBRTC_PATCH"
   apply_patch_once "$GST_BAD_SOURCE" "$GST_ICE_ROLE_PATCH"
   apply_patch_once "$GST_BAD_SOURCE" "$GST_DTLS_MTU_PATCH"
+  if grep -qE 'Keep the cloud-game A/B|RED is a redundancy wrapper' \
+      "$GST_BAD_SOURCE/ext/webrtc/gstwebrtcbin.c"; then
+    echo "Refusing untracked cloud codec filtering in gstwebrtcbin.c" >&2
+    exit 1
+  fi
   meson_build gst-bad "$GST_BAD_SOURCE" \
     -Ddtls=enabled -Dsctp=enabled -Dsrtp=enabled -Dwebrtc=enabled \
     -Dsctp-internal-usrsctp=enabled -Dexamples=disabled -Dtests=disabled

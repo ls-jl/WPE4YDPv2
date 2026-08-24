@@ -31,6 +31,7 @@ dynamic_info() {
 
 echo '[1/8] JavaScript fixtures'
 node scripts/test_keyboard_event.mjs
+node scripts/test_keyboard_trigger.mjs
 node scripts/test_display_resolver.mjs
 node scripts/test_browser_lifecycle.mjs
 node scripts/test_navigation.mjs

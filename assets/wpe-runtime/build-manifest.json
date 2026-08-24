@@ -16,6 +16,6 @@
   },
   "artifacts": {
     "lib/libWPEWebKit-2.0.so.1": "ea41cf7148bd382705a8088edb0221200d54714cea1223943b4aed9c02594f89",
-    "wpe-drm-minimal": "e4872cb1aa6e24f7c0aaba9157a241defe42820b33e4cc54cb3bfe8c16328ca1"
+    "wpe-drm-minimal": "e7bb8dfd81887efecc49aef69f902267be8344b898d4c7721272b4af477e36a6"
   }
 }

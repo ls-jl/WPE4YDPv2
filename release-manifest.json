@@ -3,9 +3,9 @@
   "webkit_revision": "9effc8745be9b7b0fab96b29cc69716c9a5c4ae0",
   "patch_series_sha256": "ae080d1313817c9f586c7ec5c857b0ec560b27623d3e8d2eab91e51b8c4749fe",
   "artifacts": {
-    "8001779591038449.1_0_0.amr": "6019c06d0abdf8955d1cefad7e2133834b641b798dfd53b03404c55ae2cc630e",
+    "8001779591038449.1_0_0.amr": "076aa6efdb46b5a09f6b7040f8bcfb6a45073df649752d7c8f385a677e972358",
     "libs/arm64-orange/libjsapi_browser.so": "4dd482e65cdf50265b493172c5c15c802d20564ccfc9c8743192b28800c1d28e",
-    "assets/wpe-runtime/wpe-drm-minimal": "e4872cb1aa6e24f7c0aaba9157a241defe42820b33e4cc54cb3bfe8c16328ca1",
+    "assets/wpe-runtime/wpe-drm-minimal": "e7bb8dfd81887efecc49aef69f902267be8344b898d4c7721272b4af477e36a6",
     "assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1": "ea41cf7148bd382705a8088edb0221200d54714cea1223943b4aed9c02594f89"
   }
 }
