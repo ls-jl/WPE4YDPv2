@@ -21,6 +21,16 @@ this source snapshot, rather than publishing unresolved new LFS pointers:
 | `8001779591038449.1_0_0.amr` | 172135904 | `b3ce392beac43480dba0ada9ac01289a692a2dfb57c71905f9c588bd889b2cf1` |
 | `assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1` | 160069592 | `c21f52147ec9ae082da3fa719e8f1cd5e5646eec855c01d04db1f4698de98811` |
 
+To inspect sources while the LFS quota is blocked, skip automatic LFS downloads:
+
+```sh
+GIT_LFS_SKIP_SMUDGE=1 git clone --branch wpe-final-source https://github.com/ls-jl/WPE4YDPv2.git
+```
+
+Existing LFS dependencies inherited from the remote baseline still require
+LFS access or a verified local copy. Skipping downloads is for source inspection;
+it does not produce a complete runnable runtime or satisfy packaging checks.
+
 The final AMR was hash-verified, contained one WebKit ELF, and passed the
 private Mali/KO/disputed-plugin archive scan. This is not a blanket license
 or hardware acceptance statement. Preserve upstream notices and use the
