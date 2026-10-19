@@ -49,13 +49,13 @@ export default {
   mounted() {
     this.applyPageOptions(this.pageOptions(), true)
   },
-  onShow() {
-    this.applyPageOptions(this.pageOptions(), true)
-  },
-  onNewOptions(options) {
-    this.applyPageOptions(options || {}, true)
-  },
   methods: {
+    onShow() {
+      this.applyPageOptions(this.pageOptions(), true)
+    },
+    onNewOptions(options) {
+      this.applyPageOptions(options || {}, true)
+    },
     pageOptions() {
       return this.$page && this.$page.options ? this.$page.options : {}
     },
@@ -230,9 +230,6 @@ export default {
   text-align: center;
   border-radius: 6px;
   font-size: 15px;
-}
-
-.primary-button {
   color: #081018;
   background-color: #79d66b;
 }

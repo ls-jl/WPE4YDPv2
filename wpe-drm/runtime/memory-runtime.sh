@@ -50,10 +50,13 @@ memory_runtime_init() {
         WPE_MEMORY_PROFILE=large
         WPE_WEB_PROCESS_MEMORY_LIMIT_MB=640
         WPE_WEB_PROCESS_MEMORY_LIMIT_SOURCE=adaptive-large
+    # Linux reserves a swap header page; allow page sizes up to 64 KiB.
     elif [ "$WPE_MEMORY_TOTAL_KB" -ge 921600 ] \
         && [ "$WPE_MEMORY_AVAILABLE_KB" -ge 196608 ] \
-        && [ "$WPE_MEMORY_SWAP_TOTAL_KB" -ge 524288 ] \
-        && [ "$WPE_MEMORY_SWAP_FREE_KB" -ge 262144 ]; then
+        && [ "$WPE_MEMORY_SWAP_TOTAL_KB" -ge 524224 ] \
+        && { [ "$WPE_MEMORY_SWAP_FREE_KB" -ge 262144 ] \
+             || { [ "$WPE_MEMORY_AVAILABLE_KB" -ge 393216 ] \
+                  && [ "$WPE_MEMORY_SWAP_FREE_KB" -ge 131072 ]; }; }; then
         WPE_MEMORY_PROFILE=balanced
         WPE_WEB_PROCESS_MEMORY_LIMIT_MB=512
         WPE_WEB_PROCESS_MEMORY_LIMIT_SOURCE=adaptive-balanced

@@ -1,0 +1,18 @@
+diff --git a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
+--- a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
+@@ -515,9 +515,11 @@ void ViewPlatform::handleGesture(WPEEvent* event)
+         break;
+     case WPE_GESTURE_DRAG:
+         if (double x, y, dx, dy; wpe_gesture_controller_get_gesture_position(gestureController, &x, &y) && wpe_gesture_controller_get_gesture_delta(gestureController, &dx, &dy)) {
+-            auto phase = wpe_gesture_controller_is_drag_begin(gestureController)
+-                ? WebWheelEvent::Phase::Began
+-                : (wpe_event_get_event_type(event) == WPE_EVENT_TOUCH_UP) ? WebWheelEvent::Phase::Ended : WebWheelEvent::Phase::Changed;
++            // A single MOVE leaves dragBegin set until the next MOVE. UP must
++            // end that gesture, not emit a second Began and leave scrolling open.
++            auto phase = wpe_event_get_event_type(event) == WPE_EVENT_TOUCH_UP
++                ? WebWheelEvent::Phase::Ended
++                : wpe_gesture_controller_is_drag_begin(gestureController) ? WebWheelEvent::Phase::Began : WebWheelEvent::Phase::Changed;
+ 
+             // The last WPE_EVENT_TOUCH_UP will normally be preceded by a WPE_EVENT_TOUCH_MOVE with both
+             // reporting the same position. In case a platform implementation would not do that, the deltas

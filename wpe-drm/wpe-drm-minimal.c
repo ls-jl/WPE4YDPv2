@@ -17,11 +17,14 @@
 #include <wpe/drm/wpe-drm.h>
 #include "ChromeMotionState.h"
 #include "browser-chrome-model.h"
+#include "browser-chrome-publisher.h"
 #include "browser-i18n.h"
 #include "browser-memory-policy.h"
 #include "browser-navigation.h"
 #include "browser-profile-store.h"
 #include "browser-touch-gesture.h"
+#include "BrowserTouchCoordinates.h"
+#include "ChromeAutoVisibility.h"
 #include <errno.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -36,6 +39,7 @@
 #endif
 #include <math.h>
 #include <stdint.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -51,7 +55,9 @@ static gint64 frame_stats_window_start_us = 0;
 static guint64 frame_stats_window_start_count = 0;
 static gboolean gpu_render_profile = FALSE;
 static int runtime_exit_code = 0;
+static gboolean shutdown_requested = FALSE;
 static guint gpu_first_frame_timeout_source_id = 0;
+static gboolean gpu_first_frame_timeout(gpointer user_data);
 
 typedef struct {
     BrowserProfileStore *store;
@@ -112,6 +118,8 @@ typedef struct {
     double down_x;
     double down_y;
     double max_move_sq;
+    BrowserTouchCoordinates view_coordinates;
+    guint32 browser_sequence_id;
     gboolean scrolling;
     gboolean chrome_consumed;
     ChromePanelGesture panel_gesture;
@@ -218,6 +226,7 @@ typedef struct {
     guint session_save_source_id;
     char *session_save_reason;
     guint64 session_generation;
+    BrowserChromePublisher publisher;
 } BrowserChrome;
 
 typedef struct {
@@ -232,9 +241,14 @@ typedef struct {
     int panel_rotation;
     int touch_rotation;
     int touch_fd;
+    gboolean touch_clock_monotonic;
+    gboolean touch_mt_tracking;
+    gboolean touch_discard_until_syn;
     guint touch_source_id;
     guint64 touch_event_count;
     gint64 touch_dispatch_frame_us;
+    ChromeAutoVisibility auto_chrome;
+    guint auto_chrome_source_id;
     int current_slot;
     int abs_x_code;
     int abs_y_code;
@@ -440,20 +454,6 @@ static double env_double(const char *name, double default_value)
     if (end == value)
         return default_value;
     return result;
-}
-
-static gboolean chrome_layout_resize_enabled(void)
-{
-    const char *value = g_getenv("WPE_CHROME_LAYOUT");
-    if (!value || !value[0])
-        return FALSE;
-    if (!g_ascii_strcasecmp(value, "resize"))
-        return TRUE;
-    if (!g_ascii_strcasecmp(value, "inset") ||
-        !g_ascii_strcasecmp(value, "visual-inset") ||
-        !g_ascii_strcasecmp(value, "overlay"))
-        return FALSE;
-    return env_enabled("WPE_CHROME_LAYOUT", TRUE);
 }
 
 static gboolean parse_int_range(const char *value, int *minimum, int *maximum)
@@ -690,6 +690,7 @@ static void chrome_apply_web_preferences(AppState *state, gboolean reload)
 static void chrome_apply_layout(AppState *state, const char *reason);
 static void chrome_set_visible(AppState *state, gboolean visible);
 static void chrome_update_render_state(AppState *state);
+static void chrome_publish_render_state(AppState *state, gboolean structural);
 static void chrome_save_state(AppState *state);
 static void chrome_save_preferences(AppState *state);
 static void chrome_schedule_session_save(AppState *state, const char *reason,
@@ -703,50 +704,15 @@ static void chrome_request_frame(AppState *state)
 {
     if (!state || !state->view)
         return;
-    int width = state->viewport_width > 0 ? state->viewport_width : wpe_view_get_width(state->view);
-    int height = state->viewport_height > 0 ? state->viewport_height : wpe_view_get_height(state->view);
-    wpe_view_resized(state->view, width, height);
+    if (WPE_IS_VIEW_DRM(state->view))
+        wpe_view_drm_request_chrome_redraw(WPE_VIEW_DRM(state->view));
 }
 
-typedef struct {
-    int panel_x;
-    int panel_y;
-    int panel_width;
-    int panel_height;
-    int list_top;
-    int list_height;
-    int footer_top;
-    int row_height;
-    int header_height;
-    int footer_height;
-    double max_scroll;
-} ChromeTabsGeometry;
-
-typedef struct {
-    int panel_x;
-    int panel_y;
-    int panel_width;
-    int panel_height;
-    int columns;
-    int rows;
-    int items_per_page;
-    int item_count;
-    int page_count;
-    double max_scroll;
-} ChromeMenuGeometry;
-
-typedef struct {
-    int panel_x;
-    int panel_y;
-    int panel_width;
-    int panel_height;
-    int header_height;
-    int row_height;
-    int list_top;
-    int list_height;
-    int line_count;
-    double max_scroll;
-} ChromeListGeometry;
+static void chrome_notify_snapshot(GObject *view)
+{
+    if (WPE_IS_VIEW_DRM(view))
+        wpe_view_drm_request_chrome_redraw(WPE_VIEW_DRM(view));
+}
 
 static BrowserChromeToolbarGeometry chrome_toolbar_geometry(AppState *state)
 {
@@ -775,22 +741,8 @@ static ChromeTabsGeometry chrome_tabs_geometry(AppState *state)
     int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
     int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
     int chrome_height = state ? state->chrome.height : 44;
-    int tabs_width = MAX(1, panel_width / 2);
-    ChromeTabsGeometry geometry = {
-        .panel_x = panel_width - tabs_width,
-        .panel_y = chrome_height,
-        .panel_width = tabs_width,
-        .panel_height = MAX(0, panel_height - chrome_height),
-        .row_height = CHROME_TABS_ROW_HEIGHT,
-        .header_height = CHROME_TABS_HEADER_HEIGHT,
-        .footer_height = CHROME_TABS_FOOTER_HEIGHT,
-    };
-    geometry.list_top = geometry.panel_y + geometry.header_height;
-    geometry.footer_top = panel_height - geometry.footer_height;
-    geometry.list_height = MAX(0, geometry.footer_top - geometry.list_top);
-    int content_height = (state ? state->chrome.tab_count : 0) * geometry.row_height;
-    geometry.max_scroll = MAX(0, content_height - geometry.list_height);
-    return geometry;
+    return browser_chrome_tabs_geometry(panel_width, panel_height, chrome_height,
+        state ? state->chrome.tab_count : 0, CHROME_TABS_ROW_HEIGHT);
 }
 
 static ChromeMenuGeometry chrome_menu_geometry(AppState *state)
@@ -798,23 +750,8 @@ static ChromeMenuGeometry chrome_menu_geometry(AppState *state)
     int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
     int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
     int chrome_height = state ? state->chrome.height : 44;
-    int menu_x = panel_width / 3;
-    BrowserChromeMenuGridGeometry grid =
-        browser_chrome_menu_grid_geometry(panel_width, panel_height,
-                                          CHROME_MENU_ITEM_COUNT);
-    ChromeMenuGeometry geometry = {
-        .panel_x = menu_x,
-        .panel_y = chrome_height,
-        .panel_width = panel_width - menu_x,
-        .panel_height = MAX(0, panel_height - chrome_height),
-        .columns = grid.columns,
-        .rows = grid.rows,
-        .items_per_page = grid.items_per_page,
-        .item_count = CHROME_MENU_ITEM_COUNT,
-        .page_count = grid.page_count,
-    };
-    geometry.max_scroll = MAX(0, geometry.page_count - 1) * geometry.panel_width;
-    return geometry;
+    return browser_chrome_menu_geometry(panel_width, panel_height, chrome_height,
+        CHROME_MENU_ITEM_COUNT);
 }
 
 static ChromeListGeometry chrome_list_geometry(AppState *state, ChromePanel panel)
@@ -822,20 +759,8 @@ static ChromeListGeometry chrome_list_geometry(AppState *state, ChromePanel pane
     int panel_width = state && state->panel_width > 0 ? state->panel_width : 960;
     int panel_height = state && state->panel_height > 0 ? state->panel_height : 266;
     int chrome_height = state ? state->chrome.height : 44;
-    ChromeListGeometry geometry = {
-        .panel_x = 0,
-        .panel_y = chrome_height,
-        .panel_width = panel_width,
-        .panel_height = MAX(0, panel_height - chrome_height),
-        .header_height = CHROME_LIST_HEADER_HEIGHT,
-        .row_height = CHROME_LIST_ROW_HEIGHT,
-        .line_count = chrome_panel_line_count(state, panel),
-    };
-    geometry.list_top = geometry.panel_y + geometry.header_height;
-    geometry.list_height = MAX(0, geometry.panel_height - geometry.header_height);
-    geometry.max_scroll = MAX(0, geometry.line_count * geometry.row_height
-                                  - geometry.list_height);
-    return geometry;
+    return browser_chrome_list_geometry(panel_width, panel_height, chrome_height,
+        chrome_panel_line_count(state, panel), CHROME_LIST_ROW_HEIGHT, CHROME_LIST_HEADER_HEIGHT);
 }
 
 static void chrome_clamp_list_scroll(AppState *state, ChromePanel panel)
@@ -903,6 +828,7 @@ static void chrome_publish_motion(AppState *state, gboolean dragging)
     chrome->motion.sequence++;
     if (!chrome->motion.sequence)
         chrome->motion.sequence = 1;
+    chrome_request_frame(state);
 }
 
 static void chrome_close_panel(AppState *state)
@@ -1238,6 +1164,10 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
                               gpu_runtime_status_label(&chrome->global_settings),
                               FALSE, "renderer");
         chrome_set_line_style(key_file, 4, "info", display, FALSE, "display");
+        g_key_file_set_string(key_file, "panel", "line5", tr(chrome, "project_website"));
+        chrome_set_line_style(key_file, 5, "navigation",
+                              "github.com/ls-jl/WPE4YDPv2", FALSE, "web");
+        line_count = 6;
     } else if (chrome->panel == CHROME_PANEL_PRIVACY) {
         snprintf(line, sizeof(line), "%s  %s", tr(chrome, "cookie_policy"),
                  cookie_policy_label(chrome, chrome->cookie_policy));
@@ -1409,23 +1339,12 @@ static void chrome_write_panel_lines(GKeyFile *key_file, AppState *state)
 
 /* 内容未变化时跳过写盘：chrome 状态在 load/title/滚动等事件里高频重写，
  * 而合成器侧按文件 hash 轮询，重复写既浪费 IO 又触发无谓的重绘检查。 */
-static gboolean chrome_write_file_if_changed(const char *path, const char *data, gsize length, gchar **last_written, gsize *last_length)
+static void chrome_update_render_state(AppState *state)
 {
-    if (*last_written && *last_length == length && !memcmp(*last_written, data, length))
-        return TRUE;
-    char *dir = g_path_get_dirname(path);
-    g_mkdir_with_parents(dir, 0700);
-    g_free(dir);
-    if (!g_file_set_contents(path, data, length, NULL))
-        return FALSE;
-    chmod(path, 0600);
-    g_free(*last_written);
-    *last_written = g_strndup(data, length);
-    *last_length = length;
-    return TRUE;
+    chrome_publish_render_state(state, TRUE);
 }
 
-static void chrome_update_render_state(AppState *state)
+static void chrome_publish_render_state(AppState *state, gboolean structural)
 {
     if (!state)
         return;
@@ -1482,15 +1401,8 @@ static void chrome_update_render_state(AppState *state)
     g_key_file_set_string(key_file, "chrome", "title", tab && tab->title[0] ? tab->title : "");
     chrome_write_panel_lines(key_file, state);
 
-    gsize length = 0;
-    gchar *data = g_key_file_to_data(key_file, &length, NULL);
-    if (data) {
-        static gchar *last_render_state;
-        static gsize last_render_state_length;
-        if (!chrome_write_file_if_changed(chrome->render_state_path, data, length, &last_render_state, &last_render_state_length))
-            g_warning("Failed to write chrome render state: %s", chrome->render_state_path);
-    }
-    g_free(data);
+    browser_chrome_publish(&chrome->publisher, G_OBJECT(state->view), key_file,
+        chrome->render_state_path, structural, chrome_notify_snapshot);
     g_key_file_unref(key_file);
 }
 
@@ -1717,6 +1629,11 @@ static void chrome_set_tab_url(BrowserTab *tab, const char *url)
 
 static void chrome_set_visible(AppState *state, gboolean visible)
 {
+    if (state->auto_chrome_source_id) {
+        g_source_remove(state->auto_chrome_source_id);
+        state->auto_chrome_source_id = 0;
+    }
+    state->auto_chrome.pending = FALSE;
     BrowserChrome *chrome = &state->chrome;
     if (chrome->visible == visible)
         return;
@@ -1781,16 +1698,13 @@ static int chrome_page_top_inset(AppState *state)
     BrowserChrome *chrome = &state->chrome;
     if (chrome->panel != CHROME_PANEL_NONE)
         return chrome->height;
-    if (chrome_layout_resize_enabled())
-        return chrome->visible ? chrome->height : 0;
-    double fraction = chrome_shown_fraction(chrome);
-    return (int)lround((double)chrome->height * fraction);
+    return chrome->visible ? chrome->height : 0;
 }
 
 static double web_event_y(AppState *state, double screen_y)
 {
     double y = screen_y - chrome_page_top_inset(state);
-    int height = chrome_layout_resize_enabled() && state->viewport_height > 0
+    int height = state->viewport_height > 0
         ? state->viewport_height
         : (state->panel_height > 0 ? state->panel_height : state->viewport_height);
     if (height <= 0)
@@ -2710,11 +2624,21 @@ static gboolean on_keyboard_script_message_with_reply(
         guint64 ack_sequence = params_get_uint64(params, "ackSequence", 0);
         if (state->keyboard_apply_in_flight) {
             gboolean sequence_matches = ack_sequence == state->keyboard_sent_sequence;
+            if (!sequence_matches) {
+                g_print("Keyboard frame ack ignored: stale_sequence=%" G_GUINT64_FORMAT
+                        " expected=%" G_GUINT64_FORMAT "\n",
+                        ack_sequence, state->keyboard_sent_sequence);
+                keyboard_reply_message(value, reply, "op=stale");
+                g_hash_table_unref(params);
+                g_free(message);
+                return TRUE;
+            }
             gboolean applied = params_get_bool(params, "applied", FALSE);
+            gboolean alive = params_get_bool(params, "alive", FALSE);
             const char *observed = g_hash_table_lookup(params, "observed");
             gboolean value_matches = observed && state->keyboard_sent_text &&
                 !g_strcmp0(observed, state->keyboard_sent_text);
-            gboolean verified = sequence_matches && applied && value_matches;
+            gboolean verified = sequence_matches && applied && alive && value_matches;
             g_print("Keyboard frame ack: id=%s sequence=%" G_GUINT64_FORMAT
                     " expected=%" G_GUINT64_FORMAT " applied=%d value_match=%d commit=%d\n",
                     state->keyboard_active_id, ack_sequence,
@@ -2728,7 +2652,7 @@ static gboolean on_keyboard_script_message_with_reply(
             g_clear_pointer(&state->keyboard_sent_text, g_free);
             if (terminal_commit) {
                 keyboard_store_frame_waiter(state, value, reply);
-                keyboard_finish_active(state, "confirmed",
+                keyboard_finish_active(state, verified ? "confirmed" : "failed",
                                        verified ? "applied" : "apply_failed");
                 g_hash_table_unref(params);
                 g_free(message);
@@ -2852,15 +2776,18 @@ static void setup_keyboard_user_script(WebKitUserContentManager *manager, AppSta
         "function noteActivation(e){if(e&&e.isTrusted===false)return 0;var now=Date.now(),kind=String(e&&e.type||'');if(kind==='click'){if(!window.__haasKeyboardActivation||now-window.__haasKeyboardActivationAt>1500){window.__haasKeyboardActivation++;window.__haasKeyboardActivationAt=now;}}else if(!window.__haasKeyboardActivationStartAt||now-window.__haasKeyboardActivationStartAt>80){window.__haasKeyboardActivation++;window.__haasKeyboardActivationAt=now;window.__haasKeyboardActivationStartAt=now;}return window.__haasKeyboardActivation;}"
         "function activationValid(){return !!window.__haasKeyboardActivation&&Date.now()-window.__haasKeyboardActivationAt<=1500;}"
         "function mark(el){var id=el.getAttribute('data-haas-keyboard-id');if(!id){id='hk'+Date.now().toString(36)+(window.__haasKeyboardSeq++).toString(36);try{el.setAttribute('data-haas-keyboard-id',id);}catch(e){}}window.__haasKeyboardTargetId=id||'';return id||'';}"
-        "function findTarget(){var el=window.__haasKeyboardTarget;if(editable(el)&&document.documentElement&&document.documentElement.contains(el))return el;var id=window.__haasKeyboardTargetId;if(id&&document.querySelector){try{el=document.querySelector('[data-haas-keyboard-id=\"'+id+'\"]');if(editable(el))return el;}catch(e){}}el=document.activeElement;if(editable(el))return el;return null;}"
+        "function targetAlive(el){return editable(el)&&el.ownerDocument===document&&el.isConnected;}"
+        "function findTarget(){var el=window.__haasKeyboardTarget;if(targetAlive(el))return el;var id=window.__haasKeyboardTargetId;if(id&&document.querySelector){try{el=document.querySelector('[data-haas-keyboard-id=\"'+id+'\"]');if(targetAlive(el))return el;}catch(e){}}return null;}"
         "function diffType(oldv,newv){oldv=String(oldv==null?'':oldv);newv=String(newv==null?'':newv);if(newv.length<oldv.length){return oldv.indexOf(newv)===0?'deleteContentBackward':'deleteContentForward';}if(newv.length>oldv.length){return newv.indexOf(oldv)===0?'insertText':'insertReplacementText';}return 'insertReplacementText';}"
         "function makeInputEvent(name,typ,data,cancelable){try{return new InputEvent(name,{bubbles:true,cancelable:!!cancelable,inputType:typ,data:data});}catch(e){var ev=document.createEvent('Event');ev.initEvent(name,true,!!cancelable);try{ev.inputType=typ;ev.data=data;}catch(_e){}return ev;}}"
         "function nativeSet(el,value,oldv){if(el.isContentEditable){var ok=false;try{var sel=window.getSelection();var range=document.createRange();range.selectNodeContents(el);sel.removeAllRanges();sel.addRange(range);ok=document.execCommand&&document.execCommand('insertText',false,value);}catch(e){}if(!ok||valueOf(el)!==value)el.textContent=value;return;}var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,value);else el.value=value;var tracker=el._valueTracker;if(tracker){try{tracker.setValue(oldv);}catch(e){}}if(el.setSelectionRange){try{el.setSelectionRange(String(value).length,String(value).length);}catch(e){}}}"
-        "function applyCore(el,value){var oldv=valueOf(el);var typ=diffType(oldv,value);var data=typ.indexOf('delete')===0?null:value;try{el.focus();}catch(e){}el.dispatchEvent(makeInputEvent('beforeinput',typ,data,true));nativeSet(el,value,oldv);el.dispatchEvent(makeInputEvent('input',typ,data,false));return typ;}"
+        "function applyCore(el,value){var oldv=valueOf(el);var typ=diffType(oldv,value);var data=typ.indexOf('delete')===0?null:value;try{el.focus();}catch(e){}if(!el.dispatchEvent(makeInputEvent('beforeinput',typ,data,true)))return typ;nativeSet(el,value,oldv);el.dispatchEvent(makeInputEvent('input',typ,data,false));return typ;}"
         "function nextFrame(fn){var done=false;var run=function(){if(done)return;done=true;fn();};setTimeout(run,50);if(window.requestAnimationFrame)requestAnimationFrame(run);}"
-        "function applyText(value,commit){return new Promise(function(resolve){var el=findTarget();if(!editable(el)){resolve({applied:false,observed:'',alive:false});return;}value=String(value==null?'':value);try{applyCore(el,value);}catch(e){resolve({applied:false,observed:valueOf(el),alive:true});return;}nextFrame(function(){if(valueOf(el)!==value){try{applyCore(el,value);}catch(e){}}nextFrame(function(){var observed=valueOf(el);var applied=observed===value;if(commit&&applied){try{var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}catch(e){}}resolve({applied:applied,observed:observed,alive:editable(el)});});});});}"
+        "function applyText(value,commit){return new Promise(function(resolve){var el=findTarget();if(!el){resolve({applied:false,observed:'',alive:false});return;}value=String(value==null?'':value);try{applyCore(el,value);}catch(e){resolve({applied:false,observed:valueOf(el),alive:targetAlive(el)});return;}"
+        "nextFrame(function(){el=findTarget();if(!el){resolve({applied:false,observed:'',alive:false});return;}if(valueOf(el)!==value){try{applyCore(el,value);}catch(e){}}"
+        "nextFrame(function(){el=findTarget();var observed=el?valueOf(el):'';var applied=!!el&&observed===value;if(commit&&applied){try{var ev=document.createEvent('HTMLEvents');ev.initEvent('change',true,false);el.dispatchEvent(ev);}catch(e){}}resolve({applied:applied,observed:observed,alive:!!el});});});});}"
         "function finish(){window.__haasKeyboardInFlight=false;window.__haasKeyboardTarget=null;window.__haasKeyboardTargetId='';}"
-        "function wait(id,ack){var msg='op=wait&id='+enc(id);if(ack){msg+='&ackSequence='+enc(ack.sequence)+'&applied='+(ack.applied?'1':'0')+'&observed='+enc(ack.observed||'');}return post(msg).then(function(raw){var cmd=parse(raw);if(cmd.op==='update'||cmd.op==='commit'){var sequence=parseInt(cmd.sequence||'0',10)||0;return applyText(cmd.text||'',cmd.op==='commit').then(function(result){return wait(id,{sequence:sequence,applied:result.applied,observed:result.observed});});}if(cmd.op==='complete'||cmd.op==='expired'||cmd.op==='superseded'||cmd.op==='rejected'){finish();return;}return wait(id,null);}).catch(function(){finish();});}"
+        "function wait(id,ack){var msg='op=wait&id='+enc(id);if(ack){msg+='&ackSequence='+enc(ack.sequence)+'&applied='+(ack.applied?'1':'0')+'&alive='+(ack.alive?'1':'0')+'&observed='+enc(ack.observed||'');}return post(msg).then(function(raw){var cmd=parse(raw);if(cmd.op==='stale')return;if(cmd.op==='update'||cmd.op==='commit'){var sequence=parseInt(cmd.sequence||'0',10)||0;return applyText(cmd.text||'',cmd.op==='commit').then(function(result){return wait(id,{sequence:sequence,applied:result.applied,observed:result.observed,alive:targetAlive(findTarget())});});}if(cmd.op==='complete'||cmd.op==='expired'||cmd.op==='superseded'||cmd.op==='rejected'){finish();return;}return wait(id,null);}).catch(function(){finish();});}"
         "function request(el,trigger){el=closestEditable(el)||el;if(window.__haasKeyboardInFlight||!activationValid()||window.__haasKeyboardHandledActivation===window.__haasKeyboardActivation||!editable(el)||!window.webkit||!window.webkit.messageHandlers||!window.webkit.messageHandlers.haasKeyboard)return;window.__haasKeyboardHandledActivation=window.__haasKeyboardActivation;window.__haasKeyboardInFlight=true;window.__haasKeyboardTarget=el;mark(el);var ml=(el.tagName==='TEXTAREA'||el.isContentEditable);var max=parseInt(attr(el,'maxlength'),10);if(!isFinite(max)||max<=0)max=ml?512:(otpLike(el)?8:100);var fallback=(navigator.language||'').toLowerCase().indexOf('zh')===0?'请输入内容':'Enter text';var ph=attr(el,'placeholder')||attr(el,'aria-label')||fallback;var msg='op=open&trigger='+enc(trigger||'unknown')+'&tag='+enc(String(el.tagName||'').toLowerCase())+'&type='+enc(attr(el,'type').toLowerCase())+'&inputmode='+enc(attr(el,'inputmode').toLowerCase())+'&text='+enc(valueOf(el))+'&placeholder='+enc(ph)+'&inputType='+enc(typeOf(el))+'&maxlength='+max+'&multiLinesEditVisible='+(ml?'1':'0');post(msg).then(function(raw){var opened=parse(raw);if(opened.op!=='opened'||!opened.id){finish();return;}wait(opened.id,null);}).catch(function(){finish();});}"
         "['pointerdown','touchstart','mousedown'].forEach(function(name){document.addEventListener(name,function(e){noteActivation(e);},true);});"
         "document.addEventListener('focusin',function(e){if(!activationValid())return;var el=pathEditable(e)||document.activeElement;if(editable(el))setTimeout(function(){request(el,'focusin');},0);},true);"
@@ -3480,6 +3407,10 @@ static void chrome_select_panel_row(AppState *state, double x, int row)
             chrome_open_internal_panel(state, CHROME_PANEL_CLEAR_HISTORY, TRUE);
         }
     } else if (chrome->panel == CHROME_PANEL_ABOUT) {
+        if (row == 5) {
+            chrome_load_url(state, "https://github.com/ls-jl/WPE4YDPv2", TRUE);
+            return;
+        }
         g_print("About: Direct WPE DRM browser profile=%s guest=%d renderer=%s display=%dx%d rotation=%d\n",
                 profile_runtime.profile.name ? profile_runtime.profile.name : "DEFAULT",
                 profile_runtime.guest, gpu_render_profile ? "mali-gpu" : "skia-cpu",
@@ -3875,6 +3806,40 @@ static gboolean chrome_touch_down_consumes(AppState *state, double x, double y)
     return FALSE;
 }
 
+static gboolean chrome_auto_visibility_tick(gpointer data)
+{
+    AppState *state = data;
+    BrowserChrome *chrome = &state->chrome;
+    if (!chrome->enabled || state->page_fullscreen || !chrome->global_settings.toolbar_auto_hide
+        || chrome->panel != CHROME_PANEL_NONE) {
+        state->auto_chrome.pending = FALSE;
+        state->auto_chrome_source_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+    gboolean active = FALSE;
+    for (int i = 0; i < MAX_TOUCH_SLOTS; ++i)
+        active |= state->slots[i].active;
+    if (!chrome_auto_visibility_ready(&state->auto_chrome, g_get_monotonic_time(), active))
+        return G_SOURCE_CONTINUE;
+    gboolean visible = state->auto_chrome.visible;
+    state->auto_chrome.pending = FALSE;
+    state->auto_chrome_source_id = 0;
+    if (visible != chrome->visible) {
+        chrome_set_visible(state, visible);
+        chrome_save_state(state);
+        chrome_request_frame(state);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void chrome_queue_auto_visibility(AppState *state, gboolean visible)
+{
+    state->auto_chrome.pending = TRUE;
+    state->auto_chrome.visible = visible;
+    if (!state->auto_chrome_source_id)
+        state->auto_chrome_source_id = g_timeout_add(16, chrome_auto_visibility_tick, state);
+}
+
 static void chrome_note_scroll(AppState *state, double finger_delta_y, guint32 time_ms)
 {
     BrowserChrome *chrome = &state->chrome;
@@ -3917,29 +3882,27 @@ static void chrome_note_scroll(AppState *state, double finger_delta_y, guint32 t
     chrome->scroll_last_time_ms = time_ms;
 
     chrome->scroll_accum += distance;
+    gboolean effective_visible = state->auto_chrome.pending
+        ? state->auto_chrome.visible : chrome->visible;
 
     if (direction < 0) {
-        if (chrome->scroll_accum >= chrome->hide_down_px && chrome->visible && chrome->panel == CHROME_PANEL_NONE) {
-            chrome_set_visible(state, FALSE);
+        if (chrome->scroll_accum >= chrome->hide_down_px && effective_visible && chrome->panel == CHROME_PANEL_NONE) {
+            chrome_queue_auto_visibility(state, FALSE);
             chrome->panel = CHROME_PANEL_NONE;
             chrome->scroll_accum = 0;
             chrome->scroll_velocity_peak = 0;
             chrome->scroll_last_time_ms = 0;
             chrome->scroll_direction = 0;
-            chrome_save_state(state);
-            chrome_request_frame(state);
         }
     } else if (direction > 0) {
         gboolean fast_enough = chrome->show_up_min_velocity_px_s <= 0 ||
             chrome->scroll_velocity_peak >= chrome->show_up_min_velocity_px_s;
-        if (chrome->scroll_accum >= chrome->show_up_px && fast_enough && !chrome->visible) {
-            chrome_set_visible(state, TRUE);
+        if (chrome->scroll_accum >= chrome->show_up_px && fast_enough && !effective_visible) {
+            chrome_queue_auto_visibility(state, TRUE);
             chrome->scroll_accum = 0;
             chrome->scroll_velocity_peak = 0;
             chrome->scroll_last_time_ms = 0;
             chrome->scroll_direction = 0;
-            chrome_save_state(state);
-            chrome_request_frame(state);
         }
     }
 }
@@ -3989,6 +3952,7 @@ static void chrome_load_state(AppState *state, const char *initial_url)
     chrome->smooth_scrolling = profile_runtime.profile.smooth_scrolling;
     chrome->block_popups = profile_runtime.profile.block_popups;
     chrome->restore_tabs = profile_runtime.profile.restore_tabs;
+    gboolean session_restore_failed = FALSE;
     browser_profile_store_get_global_settings(profile_runtime.store,
                                               &chrome->global_settings);
     chrome->tab_count = 1;
@@ -4020,9 +3984,10 @@ static void chrome_load_state(AppState *state, const char *initial_url)
         guint next_tab_id = 2;
         GPtrArray *stored_tabs = browser_profile_store_load_tabs(profile_runtime.store,
             profile_runtime.profile.id, &next_tab_id, &error);
-        if (!stored_tabs)
+        if (!stored_tabs) {
+            session_restore_failed = TRUE;
             g_warning("Profile tabs load failed: %s", error ? error->message : "unknown");
-        else if (stored_tabs->len) {
+        } else if (stored_tabs->len) {
             chrome_clear_tab(&chrome->tabs[0]);
             chrome->tab_count = MIN((int)stored_tabs->len, MAX_BROWSER_TABS);
             chrome->active = 0;
@@ -4047,7 +4012,7 @@ static void chrome_load_state(AppState *state, const char *initial_url)
         g_clear_error(&error);
         g_clear_pointer(&stored_tabs, g_ptr_array_unref);
     }
-    chrome->session_loaded = TRUE;
+    chrome->session_loaded = !session_restore_failed;
     chrome->restored_tab_count = chrome->tab_count;
     chrome->session_generation = 1;
     g_print("session_loaded profile=%" G_GINT64_FORMAT
@@ -4081,6 +4046,8 @@ static void chrome_destroy(AppState *state)
     chrome_cancel_menu_snap(chrome);
     if (state->view)
         g_object_set_data(G_OBJECT(state->view), WPE_CHROME_MOTION_DATA_KEY, NULL);
+    if (state->view)
+        g_object_set_data(G_OBJECT(state->view), WPE_LAST_INPUT_DATA_KEY, NULL);
     chrome_save_preferences(state);
     if (chrome->session_save_source_id) {
         g_source_remove(chrome->session_save_source_id);
@@ -4091,6 +4058,7 @@ static void chrome_destroy(AppState *state)
         : "shutdown";
     chrome_save_session_now(state, session_reason, chrome->session_explicit_reduction);
     chrome_update_render_state(state);
+    browser_chrome_publisher_clear(&chrome->publisher, G_OBJECT(state->view));
     if (chrome->layout_timer) {
         g_source_remove(chrome->layout_timer);
         chrome->layout_timer = 0;
@@ -4151,7 +4119,7 @@ static gboolean chrome_deferred_layout_cb(gpointer user_data)
 
 static void chrome_apply_layout(AppState *state, const char *reason)
 {
-    if (!state || !state->view || !state->chrome.enabled || !chrome_layout_resize_enabled())
+    if (!state || !state->view || !state->chrome.enabled)
         return;
 
     ensure_panel_size(state);
@@ -4280,8 +4248,10 @@ static void update_touch_position(AppState *state, TouchSlot *slot)
     slot->y = clamp_double(ty, 0, 1) * MAX(0, height - 1);
 }
 
-static guint32 input_event_time_ms(const struct input_event *event)
+static guint32 input_event_time_ms(AppState *state, const struct input_event *event)
 {
+    if (!state->touch_clock_monotonic)
+        return (guint32)(g_get_monotonic_time() / 1000);
     return (guint32)(((uint64_t)event->time.tv_sec * 1000 + (uint64_t)event->time.tv_usec / 1000) & 0xffffffffu);
 }
 
@@ -4425,7 +4395,7 @@ static gboolean uses_native_touch_events(AppState *state)
         && (state->send_touch_events || state->game_input_active);
 }
 
-static void send_touch_event(AppState *state, WPEEventType type, guint32 sequence_id, double x, double y, guint32 time_ms)
+static void send_touch_event(AppState *state, WPEEventType type, guint32 slot_index, double x, double y, guint32 time_ms)
 {
     if (!state->send_touch_events && !state->game_input_active)
         return;
@@ -4434,6 +4404,12 @@ static void send_touch_event(AppState *state, WPEEventType type, guint32 sequenc
     double screen_y = y;
     gboolean video_mapped = transform_game_video_point(state, &x, &y);
     double view_y = video_mapped ? y : web_event_y(state, y);
+    if (slot_index >= MAX_TOUCH_SLOTS)
+        return;
+    TouchSlot *slot = &state->slots[slot_index];
+    guint32 sequence_id = slot->browser_sequence_id;
+    if (!video_mapped && slot->view_coordinates.viewport_height > 0)
+        view_y = browser_touch_content_y(slot->view_coordinates, y);
     WPEEvent *event = wpe_event_touch_new(type, state->view, WPE_INPUT_SOURCE_TOUCHSCREEN, time_ms, 0, sequence_id, x, view_y);
     wpe_view_event(state->view, event);
     wpe_event_unref(event);
@@ -4680,14 +4656,16 @@ static gboolean native_scroll_tick(gpointer user_data)
 
 static void queue_scroll_event(AppState *state, double x, double y, double delta_x, double delta_y, guint32 time_ms)
 {
-    if (!state->touch_scroll_fallback)
-        return;
     if (delta_x > -0.5 && delta_x < 0.5 && delta_y > -0.5 && delta_y < 0.5)
+        return;
+    if (state->touch_scroll_fallback
+        || g_object_get_data(G_OBJECT(state->view), "wpe-browser-native-drag"))
+        chrome_note_scroll(state, delta_y, time_ms);
+    if (!state->touch_scroll_fallback)
         return;
 
     if (!state->touch_horizontal_scroll)
         delta_x = 0;
-    chrome_note_scroll(state, delta_y, time_ms);
     delta_x *= state->touch_scroll_scale;
     delta_y *= state->touch_scroll_scale;
     /* delta 来自 update_touch_position 旋转映射后的 panel 坐标，已是屏幕方向，
@@ -4812,6 +4790,13 @@ static void process_touch_syn(AppState *state, guint32 time_ms)
             slot->down_x = slot->x;
             slot->down_y = slot->y;
             slot->max_move_sq = 0;
+            slot->view_coordinates.top_inset = chrome_page_top_inset(state);
+            slot->view_coordinates.viewport_height = state->viewport_height > 0
+                ? state->viewport_height : state->panel_height;
+            state->next_touch_sequence++;
+            if (!state->next_touch_sequence)
+                state->next_touch_sequence++;
+            slot->browser_sequence_id = state->next_touch_sequence;
             slot->scrolling = FALSE;
             slot->chrome_consumed = chrome_touch_down_consumes(state, slot->x, slot->y);
             if (!slot->chrome_consumed)
@@ -5237,6 +5222,14 @@ static void toolbar_gesture_schedule(AppState *state)
 static void handle_touch_frame(AppState *state,
                                const BrowserTouchFrame *frame)
 {
+    if (state && frame) {
+        for (int i = 0; i < MAX_TOUCH_SLOTS; ++i) {
+            if (frame->contacts[i].active || frame->contacts[i].just_down || frame->contacts[i].just_up) {
+                state->auto_chrome.last_input_us = MAX(state->auto_chrome.last_input_us, frame->monotonic_us);
+                break;
+            }
+        }
+    }
     if (!state || !frame || !state->toolbar_gesture) {
         dispatch_touch_frame(frame, state);
         return;
@@ -5289,10 +5282,62 @@ static void build_touch_frame(AppState *state, guint32 time_ms,
     }
 }
 
+static void reset_raw_touch_stream(AppState *state, guint32 time_ms,
+                                   const char *reason)
+{
+    if (state->toolbar_gesture_source_id) {
+        g_source_remove(state->toolbar_gesture_source_id);
+        state->toolbar_gesture_source_id = 0;
+    }
+    if (state->toolbar_gesture)
+        browser_toolbar_gesture_reset(state->toolbar_gesture);
+    cancel_speculative_touch_stream(state, time_ms);
+    for (int index = 0; index < MAX_TOUCH_SLOTS; ++index) {
+        int x = state->raw_slots[index].raw_x;
+        int y = state->raw_slots[index].raw_y;
+        memset(&state->raw_slots[index], 0, sizeof(state->raw_slots[index]));
+        state->raw_slots[index].tracking_id = -1;
+        state->raw_slots[index].raw_x = x;
+        state->raw_slots[index].raw_y = y;
+    }
+    state->current_slot = 0;
+    g_warning("Raw touch resync: reason=%s contacts_cancelled=1", reason);
+}
+
+static void refresh_raw_touch_positions(AppState *state, int fd)
+{
+    int codes[] = { state->abs_x_code, state->abs_y_code };
+    for (int axis = 0; axis < 2; ++axis) {
+        if (state->touch_mt_tracking) {
+            int values[MAX_TOUCH_SLOTS + 1];
+            values[0] = codes[axis];
+            for (int index = 0; index < MAX_TOUCH_SLOTS; ++index)
+                values[index + 1] = axis ? state->raw_slots[index].raw_y : state->raw_slots[index].raw_x;
+            if (ioctl(fd, EVIOCGMTSLOTS(sizeof(values)), values) < 0)
+                continue;
+            for (int index = 0; index < MAX_TOUCH_SLOTS; ++index) {
+                if (axis)
+                    state->raw_slots[index].raw_y = values[index + 1];
+                else
+                    state->raw_slots[index].raw_x = values[index + 1];
+            }
+        } else {
+            struct input_absinfo info;
+            if (ioctl(fd, EVIOCGABS(codes[axis]), &info) < 0)
+                continue;
+            if (axis)
+                state->raw_slots[0].raw_y = info.value;
+            else
+                state->raw_slots[0].raw_x = info.value;
+        }
+    }
+}
+
 static gboolean touch_io_cb(gint fd, GIOCondition condition, gpointer user_data)
 {
     AppState *state = (AppState *)user_data;
     if (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) {
+        reset_raw_touch_stream(state, (guint32)(g_get_monotonic_time() / 1000), "device_closed");
         g_warning("Touch fd closed: condition=0x%x", condition);
         state->touch_source_id = 0;
         return G_SOURCE_REMOVE;
@@ -5300,7 +5345,19 @@ static gboolean touch_io_cb(gint fd, GIOCondition condition, gpointer user_data)
 
     struct input_event event;
     while (read(fd, &event, sizeof(event)) == (ssize_t)sizeof(event)) {
-        guint32 time_ms = input_event_time_ms(&event);
+        guint32 time_ms = input_event_time_ms(state, &event);
+        if (event.type == EV_SYN && event.code == SYN_DROPPED) {
+            reset_raw_touch_stream(state, time_ms, "syn_dropped");
+            state->touch_discard_until_syn = TRUE;
+            continue;
+        }
+        if (state->touch_discard_until_syn) {
+            if (event.type == EV_SYN && event.code == SYN_REPORT) {
+                state->touch_discard_until_syn = FALSE;
+                refresh_raw_touch_positions(state, fd);
+            }
+            continue;
+        }
         RawTouchSlot *slot = &state->raw_slots[state->current_slot];
 
         if (event.type == EV_ABS) {
@@ -5313,6 +5370,15 @@ static gboolean touch_io_cb(gint fd, GIOCondition condition, gpointer user_data)
             slot = &state->raw_slots[state->current_slot];
             if (event.code == ABS_MT_TRACKING_ID) {
                 if (event.value >= 0) {
+                    // A replacement or UP+DOWN in one packet must retire the
+                    // old WPE contact before allocating another sequence.
+                    if (slot->just_up || (slot->active
+                            && slot->tracking_id != event.value)) {
+                        reset_raw_touch_stream(state, time_ms, "tracking_replaced");
+                        state->current_slot = (int)(slot - state->raw_slots);
+                        slot = &state->raw_slots[state->current_slot];
+                    } else if (slot->active)
+                        continue;
                     slot->tracking_id = event.value;
                     slot->active = TRUE;
                     slot->just_down = TRUE;
@@ -5326,10 +5392,13 @@ static gboolean touch_io_cb(gint fd, GIOCondition condition, gpointer user_data)
                 slot->raw_x = event.value;
             else if (event.code == state->abs_y_code)
                 slot->raw_y = event.value;
-        } else if (event.type == EV_KEY && event.code == BTN_TOUCH) {
+        } else if (event.type == EV_KEY && event.code == BTN_TOUCH
+                   && !state->touch_mt_tracking) {
             slot = &state->raw_slots[0];
             state->current_slot = 0;
             if (event.value) {
+                if (slot->active)
+                    continue;
                 slot->tracking_id = 0;
                 slot->active = TRUE;
                 slot->just_down = TRUE;
@@ -5371,6 +5440,10 @@ static void setup_raw_touch(AppState *state)
     }
 
     state->touch_fd = fd;
+    int clock_id = CLOCK_MONOTONIC;
+    state->touch_clock_monotonic = ioctl(fd, EVIOCSCLOCKID, &clock_id) == 0;
+    g_print("Raw touch clock: %s\n", state->touch_clock_monotonic
+        ? "kernel_monotonic" : "receipt_monotonic");
     state->abs_x_code = ABS_MT_POSITION_X;
     state->abs_y_code = ABS_MT_POSITION_Y;
     if (!read_abs_range(fd, ABS_MT_POSITION_X, &state->abs_x_min, &state->abs_x_max) ||
@@ -5387,6 +5460,11 @@ static void setup_raw_touch(AppState *state)
     }
 
     state->touch_swap_xy = env_enabled("WPE_TOUCH_SWAP_XY", FALSE);
+    struct input_absinfo tracking_info;
+    state->touch_mt_tracking = state->abs_x_code == ABS_MT_POSITION_X
+        && ioctl(fd, EVIOCGABS(ABS_MT_TRACKING_ID), &tracking_info) == 0;
+    g_print("Raw touch protocol: mt_tracking=%d button_fallback=%d\n",
+            state->touch_mt_tracking, !state->touch_mt_tracking);
     state->touch_invert_x = env_enabled("WPE_TOUCH_INVERT_X", FALSE);
     state->touch_invert_y = env_enabled("WPE_TOUCH_INVERT_Y", FALSE);
     state->touch_active_x_enabled = parse_int_range(g_getenv("WPE_TOUCH_ACTIVE_X"), &state->touch_active_x_min, &state->touch_active_x_max);
@@ -5455,6 +5533,8 @@ static void setup_raw_touch(AppState *state)
     };
     state->toolbar_gesture = browser_toolbar_gesture_new(&toolbar_gesture_config);
     init_touch_slots(state);
+    // evdev does not repeat unchanged coordinates for a new reader/contact.
+    refresh_raw_touch_positions(state, fd);
 
     state->touch_source_id = g_unix_fd_add(fd, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL, touch_io_cb, state);
     g_print("Raw touch: device=%s fd=%d panel=%dx%d panel_rotation=%d touch_rotation=%d touch_offset=%d,%d x_code=%d range=%d..%d active_x=%s%d..%d y_code=%d range=%d..%d active_y=%s%d..%d swap=%d inv_x=%d inv_y=%d send_touch=%d pointer_tap=%d game_drag=%.1f game_hold=%ums scroll_fallback=%d native_scroll=%d js_scroll=%d hscroll=%d scroll_invert_y=%d scroll_scale=%.2f max_step=%.1f pending_limit=%.1f tap_max=%.1f interval=%dms stop_delay=%dms\n",
@@ -6303,6 +6383,11 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
             webkit_web_view_get_estimated_load_progress(web_view));
     if (!state)
         return;
+    if (gpu_render_profile && !frame_count && !gpu_first_frame_timeout_source_id
+        && (load_event == WEBKIT_LOAD_COMMITTED || load_event == WEBKIT_LOAD_FINISHED)) {
+        gpu_first_frame_timeout_source_id = g_timeout_add_seconds(12, gpu_first_frame_timeout, NULL);
+        g_print("GPU first-frame health check armed: document_ready=1\n");
+    }
     BrowserChrome *chrome = &state->chrome;
     BrowserTab *tab = chrome_active_tab(chrome);
     const char *uri = webkit_web_view_get_uri(web_view);
@@ -6319,6 +6404,8 @@ static void on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event,
         update_page_zoom_for_uri(state, uri);
     }
     if (load_event == WEBKIT_LOAD_STARTED) {
+        if (state->keyboard_active_id && !g_strcmp0(state->keyboard_active_kind, "web_input"))
+            keyboard_finish_active(state, "superseded", "document navigation");
         state->cloud_launch_requested = FALSE;
         state->cloud_launch_attempts = 0;
         state->cloud_launch_last_tap_us = 0;
@@ -6377,7 +6464,7 @@ static void on_estimated_load_progress_changed(WebKitWebView *web_view, GParamSp
     if (!chrome->loading)
         return;
     chrome->load_progress = webkit_web_view_get_estimated_load_progress(web_view);
-    chrome_update_render_state(state);
+    chrome_publish_render_state(state, FALSE);
 }
 
 static void on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointer user_data) {
@@ -6476,11 +6563,13 @@ static gboolean print_view_state(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
-/* Signal handler for clean shutdown */
-static void on_signal(int sig) {
-    (void)sig;
+/* Run shutdown on the main context, never inside a POSIX signal handler. */
+static gboolean on_shutdown_signal(gpointer user_data) {
+    (void)user_data;
+    shutdown_requested = TRUE;
     if (main_loop)
         g_main_loop_quit(main_loop);
+    return G_SOURCE_CONTINUE;
 }
 
 static gboolean gpu_first_frame_timeout(gpointer user_data)
@@ -7094,8 +7183,8 @@ int main(int argc, char **argv) {
         g_setenv("WPE_PANEL_ROTATION", g_getenv("WPE_DRM_ROTATION") ? g_getenv("WPE_DRM_ROTATION") : "0", TRUE);
     gpu_render_profile = g_strcmp0(g_getenv("WPE_RENDER_PROFILE"), "gpu") == 0;
 
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
+    guint interrupt_source = g_unix_signal_add(SIGINT, on_shutdown_signal, NULL);
+    guint terminate_source = g_unix_signal_add(SIGTERM, on_shutdown_signal, NULL);
 
     g_print("WPE DRM Minimal Launcher\n");
     g_print("URL: %s\n", url);
@@ -7336,9 +7425,7 @@ int main(int argc, char **argv) {
         NULL);
     g_object_unref(settings);
 
-    /* 基底背景保持默认白：大量页面不设自身背景色、依赖 UA 默认白底，
-     * 设黑会让这类页面整页变黑（m.baidu.com 实测回归）。inset 布局下
-     * 工具栏显隐不再 resize WebView，原"白条"根因已不存在。 */
+    /* Keep the default white page background for sites without their own. */
 
     g_signal_connect(web_view, "load-failed",
                      G_CALLBACK(on_load_failed), NULL);
@@ -7372,6 +7459,7 @@ int main(int argc, char **argv) {
         state->web_view = web_view;
         state->network_session = network_session;
         state->touch_fd = -1;
+        g_object_set_data(G_OBJECT(wpe_view), WPE_LAST_INPUT_DATA_KEY, &state->auto_chrome.last_input_us);
         state->cloud_autostart = env_enabled("WPE_CLOUD_AUTOSTART", FALSE);
         state->viewport_width = width;
         state->viewport_height = height;
@@ -7459,11 +7547,12 @@ int main(int argc, char **argv) {
 
     /* 5. Run GLib main loop — WPEViewDRM handles everything internally */
     main_loop = g_main_loop_new(NULL, FALSE);
-    if (gpu_render_profile)
-        gpu_first_frame_timeout_source_id = g_timeout_add_seconds(12, gpu_first_frame_timeout, NULL);
-    g_main_loop_run(main_loop);
+    if (!shutdown_requested)
+        g_main_loop_run(main_loop);
 
     /* Cleanup */
+    g_source_remove(interrupt_source);
+    g_source_remove(terminate_source);
     if (gpu_first_frame_timeout_source_id) {
         g_source_remove(gpu_first_frame_timeout_source_id);
         gpu_first_frame_timeout_source_id = 0;
@@ -7479,6 +7568,8 @@ int main(int argc, char **argv) {
         }
         if (state->scroll_stop_source_id)
             g_source_remove(state->scroll_stop_source_id);
+        if (state->auto_chrome_source_id)
+            g_source_remove(state->auto_chrome_source_id);
         if (state->toolbar_gesture_source_id)
             g_source_remove(state->toolbar_gesture_source_id);
         if (state->memory_governor_source_id)

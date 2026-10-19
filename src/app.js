@@ -3,10 +3,6 @@ class App extends $falcon.App {
   /**
    * 构造函数,应用生命周期内只构造一次
    */
-  constructor() {
-    super()
-  }
-
   /**
    * 应用生命周期:应用启动. 初始化完成时回调,全局只触发一次.
    * @param {Object} options 启动参数

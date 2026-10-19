@@ -57,6 +57,32 @@ typedef struct {
     int page_count;
 } BrowserChromeMenuGridGeometry;
 
+typedef struct {
+    int panel_x, panel_y, panel_width, panel_height;
+    int list_top, list_height, footer_top;
+    int row_height, header_height, footer_height;
+    double max_scroll;
+} ChromeTabsGeometry;
+
+typedef struct {
+    int panel_x, panel_y, panel_width, panel_height;
+    int columns, rows, items_per_page, item_count, page_count;
+    double max_scroll;
+} ChromeMenuGeometry;
+
+typedef struct {
+    int panel_x, panel_y, panel_width, panel_height;
+    int header_height, row_height, list_top, list_height, line_count;
+    double max_scroll;
+} ChromeListGeometry;
+
+ChromeTabsGeometry browser_chrome_tabs_geometry(int width, int height,
+    int toolbar_height, int tab_count, int row_height);
+ChromeMenuGeometry browser_chrome_menu_geometry(int width, int height,
+    int toolbar_height, int item_count);
+ChromeListGeometry browser_chrome_list_geometry(int width, int height,
+    int toolbar_height, int line_count, int row_height, int header_height);
+
 const ChromePanelDefinition *chrome_panel_definition(ChromePanel panel);
 const char *chrome_panel_name(ChromePanel panel);
 ChromePanel chrome_panel_from_name(const char *name);

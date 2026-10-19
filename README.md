@@ -15,6 +15,7 @@ MiniApp 只负责启动页、生命周期、系统键盘桥和全屏 `<hole>` �
 
 - **包内自包含 runtime**：WebKit、Mesa 软渲染、GStreamer、OpenSSL、libnice、libsrtp、MPP 硬解、ALSA、字体和 CA 证书全部随包，安装后不依赖外部 runtime；本地构建可额外带 Mali G52 runtime/KO。
 - **GPU 自动探测与可靠回退**：`WPE_GPU_MODE=auto` 在 `/dev/mali0` 可用或 ARM64 `5.10.160` KO 成功加载后，继续验证 Mali EGL/GLES、linear DMA-BUF、CPU map 和 DRM framebuffer；任何一步失败都回到 Skia CPU + dma-heap/SHM。
+- **GPU 兼容组合**：网页图块默认由 3 个 Skia CPU worker 绘制，Mali 继续负责最终合成和 WebGL，视频仍走 VPU overlay。避免 Mali 图块路径快速往返滚动后的持久白块；不等于关闭 GPU，也不承诺所有 2D Canvas 都由 GPU 绘制。
 - **RGA 页面旋转快路径**：旋转设备上的 WebKit DMABuf 由包内 `librga.so.2` 直接写入 DRM dumb scanout，避免 CPU 每帧映射、读取和旋转 Mali buffer；RGA 不可用时自动回退原 CPU 路径。
 - **视频 KMS overlay 直出（hole-punch）**：`mppvideodec` VPU 硬解 + RGA 硬件预旋转输出 NV12 dmabuf，经 v2 unix socket 协议送 UI 进程放到空闲 Esmart overlay plane；解码样本在收到对应 sequence release ACK 前不会复用。
 - **WebRTC 云游戏链路**：WebKit 使用 GStreamer PeerConnection backend，包内提供 ICE/DTLS/SRTP/SCTP/RTP/Opus；允许远端音视频和 DataChannel，默认拒绝麦克风、摄像头和屏幕采集。云原神域名自动切换到原生多点触摸 `game` 输入模式。
@@ -57,21 +58,39 @@ npm run build          # 产出 8001779591038449.1_0_0.amr
 npm test               # 逻辑 fixture、SQLite、shell、runtime 与 patch series 检查
 ```
 
-构建前自动执行 `scripts/sync_generated.sh` 同步单源文件。**assets 变更后打包若报 xkb 相关 ENOENT，先清缓存**：
+现在使用本机 x86_64 Linux 交叉编译，不再要求连接旧服务器。本机重编与打包记录见
+`tools/MIGRATION_STATUS.md`；构建成功不等于实机验收通过。
 
 ```sh
-rm -rf .falcon_ .falcon_tmp && npm run build
+sudo bash scripts/install_host_deps.sh
+bash scripts/prepare_host_tools.sh
+source scripts/build-env.sh
+npm ci
+npm run setup:sdk              # 首次准备；已有 sysroot 不覆盖
+npm run setup:media            # GStreamer 1.22.12 开发层
+npm run setup:abi              # ICU72 与 JPEG ABI-8
+npm run check:build            # 汇总缺项，不隐式安装或构建
+npm run build:jsapi            # 仅写独立 staging，不覆盖包内旧 so
+npm run build:runtime
+npm run build:gpu-helpers
+npm run stage:gpu              # 私有 staging
+npm run assemble:runtime
+bash scripts/promote_native.sh /srv/wpe-build/build/stage/bundle
+npm run build:cpu
+npm run build:gpu
 ```
 
-WebKit 内核与 `wpe-drm-minimal` 在 ARM64 交叉编译服务器上构建。`scripts/build_webrtc_runtime_pve.sh` 会从 `wpe-drm/webkit-patches/revision` 创建隔离 worktree，按 `series` 重放生产补丁，并输出记录 revision、series hash、编译开关和 ELF SHA256 的 `build-manifest.json`。禁止继续原地修改长期共享 WebKit 源码树。
+`scripts/build-env.sh` 自动解析项目和 dictpen 目录，SDK/下载/构建默认放在
+`/srv/wpe-build`；可覆盖 `DICTPEN_ROOT/WPE_SDK_ROOT/WPE_BUILD_ROOT/WEBKIT_BASE/JOBS`。
+默认编译 6 线程、链接 1 任务、ThinLTO 2 线程。旧名字的构建脚本保留为兼容入口，
+实际执行本机构建；已有 worktree 不会被强制删除，仅在输入及内容指纹一致时复用。
+旧 CMakeCache 只提供功能配置参考。重复生成产物时用 `WEBRTC_STAGE` 和
+`WPE_BUNDLE_STAGE` 指定新的 staging 路径，不覆盖已有结果。
 
-当前唯一构建机源码目录为 `pve@192.168.100.118:/home/pve/web-browser-src`；旧 Parallels 构建机已废弃。同步源码后在 PVE 执行：
-
-```sh
-cd /home/pve/web-browser-src
-PROJECT_ROOT=$PWD JOBS=72 scripts/build_jsapi_remote.sh
-PROJECT_ROOT=$PWD JOBS=72 scripts/build_webrtc_runtime_pve.sh
-```
+`npm run build` / `build:cpu` 使用独立打包目录并排除 GPU 私有组件；`build:gpu`
+输出到 `.cache/releases/gpu/`，不覆盖公开 AMR。两者要求新版来源 manifest，旧基线包
+不会因复制或改写 manifest 自动获得新构建资格。`build:dev` 也使用隔离目录，避免
+CLI 清理根目录 AMR。打包后逐项核对 archive 内 native 文件哈希。
 
 ## 运行
 
@@ -86,7 +105,7 @@ PROJECT_ROOT=$PWD JOBS=72 scripts/build_webrtc_runtime_pve.sh
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `WPE_VIDEO_OVERLAY` | `1` | 视频 KMS overlay 直出，`0` 回退软件路径 |
-| `WPE_CHROME_LAYOUT` | `resize` | 工具栏展开时真实压缩网页 viewport，避免覆盖页面顶部 |
+| `WPE_CHROME_LAYOUT` | `resize` | 固定布局；工具栏展开时真实压缩网页 viewport，显隐端点各一次 resize |
 | `WPE_USE_SYSTEM_GST` | `0` | `1` 时附加系统 GStreamer 插件目录（调试用） |
 | `WPE_GPU_MODE` | `auto` | `auto` 探测失败回 CPU；`off` 强制 CPU；`required` GPU 失败即退出 |
 | `WPE_GPU_MODE_FILE` | `$WPE_VAR_DIR/gpu-mode` | 设置页 GPU 开关的启动前镜像；`auto` 开启，`off` 关闭 |
@@ -156,9 +175,25 @@ git lfs install && git lfs pull
 
 `wpe-drm/` 目录下镜像自 WPE WebKit 项目的文件保留其原始许可证（BSD-2-Clause / LGPL-2.0-or-later），**不受根目录 `LICENSE` 覆盖**。完整的第三方许可清单、原因见 `wpe-drm/webkit-patches/README.md`。
 
-Mali 用户态 blob 与内核模块属于厂商专有内容，不由本仓库 MIT 许可证授权再分发，也不会提交到公开 Git；使用者须自行确认设备厂商授权。
+可选 Mali 用户态驱动已改为固定版本的 G52 g13p0 GBM，附带明确允许有条件再分发的 ARM EULA，详见 [来源与授权范围](licenses/mali/README.md)。它不是 MIT 或开源驱动；包内保留完整许可证和版权声明。固件包装库和 `libmali_hook` 不再使用。KO 不在此 EULA 授权范围内，含 KO 的 GPU 包仍只用于本地，公开 CPU 包政策不变。
+
+浏览器内可通过“三点菜单 → 设置 → 关于 → 项目主页（源码与更新）”查看并打开 `https://github.com/ls-jl/WPE4YDPv2`。
 
 ## 后续方向
+
+### 稳定性重构与发布限制
+
+修复进度和未验收项目见 `tools/STABILITY_REFACTOR_STATUS.md`；本机重编产物见
+`tools/MIGRATION_STATUS.md`。实机交互、性能和稳定性仍需分别验收。
+
+`npm run verify:public` 会扫描 AMR 内部，拒绝 Mali blob、KO 和不安全路径。
+`npm run upload` 和公开 release manifest 生成前都会执行该检查。含 GPU 文件的
+历史基线保留为本地回滚，不在本轮改写 Git 历史。当前根目录 AMR 是 CPU 构建，
+GPU 构建仅在 `.cache/releases/gpu/`；不能仅凭 `.gitignore` 判断压缩包是否可发布。
+
+云游戏自动点击及过期证书例外默认关闭。显式诊断开关分别为
+`WPE_CLOUD_AUTOSTART=1` 和 `WPE_CLOUDGAME_ALLOW_EXPIRED_TLS=1`；后者降低安全性，
+不应作为发布默认值。浏览器启动不再强制解除系统静音。
 
 - 视频 overlay 二期：无 RGA 场景 CPU NV12 旋转兜底；plane 空闲时 in-fence 同步。
 - runtime 瘦身基线与白名单策略：见 `tools/RUNTIME_INVENTORY.md`。

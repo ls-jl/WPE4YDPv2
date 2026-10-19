@@ -50,7 +50,7 @@ class FakeElement {
   setSelectionRange() {}
 }
 
-function createHarness(script) {
+function createHarness(script, commands = []) {
   const listeners = new Map()
   const messages = []
   const document = {
@@ -93,7 +93,7 @@ function createHarness(script) {
           messages.push(message)
           const operation = new URLSearchParams(message).get('op')
           if (operation === 'open') return 'op=opened&id=test-request'
-          if (operation === 'wait') return new Promise(() => {})
+          if (operation === 'wait') return commands.length ? commands.shift() : new Promise(() => {})
           return 'op=invalid'
         },
       },
@@ -105,6 +105,8 @@ function createHarness(script) {
     document,
     messages,
     dispatch(name, target, path = [target], isTrusted = true) {
+      target.ownerDocument = document
+      target.isConnected = true
       const event = {
         type: name,
         target,
@@ -113,8 +115,8 @@ function createHarness(script) {
       }
       for (const callback of listeners.get(name) || []) callback(event)
     },
-    async flush() {
-      await new Promise((resolve) => setTimeout(resolve, 5))
+    async flush(ms = 5) {
+      await new Promise((resolve) => setTimeout(resolve, ms))
     },
   }
 }
@@ -183,4 +185,31 @@ new Function(keyboardScript)
   assert.equal(request.get('maxlength'), '6')
 }
 
-console.log('keyboard trigger fixtures passed: autofocus, trusted focusin, dedupe, numeric OTP')
+{
+  const harness = createHarness(keyboardScript, ['op=commit&id=test-request&sequence=1&text=123456'])
+  const input = new FakeElement('input', { type: 'tel' })
+  harness.document.documentElement.contains = () => false // Shadow DOM boundary.
+  harness.dispatch('click', input)
+  await harness.flush(130)
+  const ack = harness.messages.map(message => new URLSearchParams(message)).find(message => message.has('ackSequence'))
+  assert.equal(input.value, '123456')
+  assert.equal(ack.get('applied'), '1')
+  assert.equal(ack.get('alive'), '1')
+}
+{
+  const harness = createHarness(keyboardScript, ['op=commit&id=test-request&sequence=1&text=wrong-target'])
+  const input = new FakeElement('input')
+  const unrelated = new FakeElement('input')
+  harness.dispatch('click', input)
+  await harness.flush(10)
+  input.isConnected = false
+  unrelated.ownerDocument = harness.document
+  unrelated.isConnected = true
+  harness.document.activeElement = unrelated
+  await harness.flush(130)
+  const ack = harness.messages.map(message => new URLSearchParams(message)).find(message => message.has('ackSequence'))
+  assert.equal(ack.get('applied'), '0', 'detached target cannot report success')
+  assert.equal(ack.get('alive'), '0')
+  assert.equal(unrelated.value, '', 'must not fall back to unrelated focused control')
+}
+console.log('keyboard trigger fixtures passed: activation, OTP, Shadow DOM writeback, detached target')

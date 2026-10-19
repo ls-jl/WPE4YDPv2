@@ -9,7 +9,14 @@ REVISION="$(tr -d '[:space:]' < "$PATCH_ROOT/revision")"
 
 git -C "$WEBKIT_BASE" cat-file -e "$REVISION^{commit}"
 if [ -e "$WEBKIT_WORKTREE/.git" ]; then
-    git -C "$WEBKIT_BASE" worktree remove --force "$WEBKIT_WORKTREE"
+    if [ -f "$WEBKIT_WORKTREE/.wpe-replay.json" ] && \
+        node "$ROOT/scripts/webkit_replay_state.mjs" check "$ROOT" "$WEBKIT_WORKTREE"; then
+        echo "Reusing verified patch replay: $WEBKIT_WORKTREE"
+        exit 0
+    fi
+    echo "error: preserving existing worktree: $WEBKIT_WORKTREE" >&2
+    echo 'Choose a fresh WEBKIT_WORKTREE; existing worktrees are never force-removed.' >&2
+    exit 1
 elif [ -e "$WEBKIT_WORKTREE" ]; then
     echo "error: refusing to replace non-worktree path: $WEBKIT_WORKTREE" >&2
     exit 1
@@ -31,16 +38,9 @@ while IFS= read -r patch; do
     git -C "$WEBKIT_WORKTREE" apply "$patch_path"
 done < "$PATCH_ROOT/series"
 
-angle_zlib="$WEBKIT_WORKTREE/Source/ThirdParty/ANGLE/third_party/zlib/google"
-mkdir -p "$angle_zlib"
-cp "$ROOT/wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.h" "$angle_zlib/"
-cp "$ROOT/wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.cc" "$angle_zlib/"
-cp "$ROOT/wpe-drm/ChromeMotionState.h" \
-    "$WEBKIT_WORKTREE/Source/WebKit/WPEPlatform/wpe/drm/ChromeMotionState.h"
-cp "$ROOT/wpe-drm/VideoReleaseQueue.h" \
-    "$WEBKIT_WORKTREE/Source/WebKit/WPEPlatform/wpe/drm/VideoReleaseQueue.h"
-cp "$ROOT/wpe-drm/GPUFrameValidity.h" \
-    "$WEBKIT_WORKTREE/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/GPUFrameValidity.h"
+node "$ROOT/scripts/apply_webkit_overlays.mjs" "$ROOT" "$WEBKIT_WORKTREE"
+
+node "$ROOT/scripts/webkit_replay_state.mjs" write "$ROOT" "$WEBKIT_WORKTREE"
 
 printf 'WebKit worktree ready: source=%s revision=%s\n' "$WEBKIT_WORKTREE" "$REVISION"
 git -C "$WEBKIT_WORKTREE" diff --stat

@@ -17,16 +17,30 @@
     "start": "aiot-cli preview",
     "clean:falcon": "sh scripts/prepare_falcon_stage.sh",
     "sync": "sh scripts/sync_generated.sh",
-    "build": "npm run clean:falcon && npm run sync && aiot-cli -p && sh scripts/verify_amr_runtime.sh && sh scripts/generate_release_manifest.sh",
-    "build:dev": "npm run clean:falcon && npm run sync && aiot-cli",
-    "build:bin": "npm run clean:falcon && npm run sync && aiot-cli -q -p && sh scripts/verify_amr_runtime.sh",
-    "build:prod": "npm run clean:falcon && npm run sync && aiot-cli -c -q -p && sh scripts/verify_amr_runtime.sh",
-    "build:bin-nopack": "npm run clean:falcon && npm run sync && aiot-cli -q",
+    "build": "bash scripts/build_package.sh cpu",
+    "build:cpu": "bash scripts/build_package.sh cpu",
+    "build:gpu": "bash scripts/build_package.sh gpu",
+    "build:jsapi": "bash scripts/build_jsapi_remote.sh",
+    "build:runtime": "bash scripts/build_webrtc_runtime_pve.sh",
+    "setup:host": "bash scripts/prepare_host_tools.sh",
+    "setup:sdk": "bash scripts/prepare_sdk.sh",
+    "setup:media": "bash scripts/prepare_media_sdk.sh",
+    "setup:abi": "bash scripts/prepare_abi_overlay.sh",
+    "build:gpu-helpers": "bash scripts/build_gpu_helpers.sh",
+    "stage:gpu": "bash scripts/stage_gpu_runtime.sh",
+    "assemble:runtime": "bash scripts/assemble_runtime.sh",
+    "test:sanitizers": "bash scripts/test_sanitizers.sh",
+    "check:build": "bash scripts/check_build_env.sh --all",
+    "build:dev": "bash scripts/build_package.sh dev",
+    "build:bin": "npm run build:cpu",
+    "build:prod": "npm run build:cpu",
+    "build:bin-nopack": "bash scripts/build_package.sh dev",
     "build:web": "aiot-cli build-web",
     "build:simulator": "aiot-cli simulator ./",
-    "upload": "aiot-cli upload -n",
+    "upload": "npm run verify:public && aiot-cli upload -n",
+    "verify:public": "node scripts/verify_public_archive.mjs",
     "test": "sh scripts/check_repo.sh",
-    "test:keyboard": "node scripts/test_keyboard_event.mjs",
+    "test:keyboard": "node scripts/test_keyboard_event.mjs && node scripts/test_keyboard_state.mjs && node scripts/test_keyboard_trigger.mjs",
     "test:display": "node scripts/test_display_resolver.mjs",
     "check": "aiot-cli check",
     "check:beta": "aiot-cli check -b"
@@ -35,8 +49,10 @@
     "iot",
     "miniapp"
   ],
-  "devDependencies": {},
+  "devDependencies": {
+    "aiot-vue-cli": "1.0.32"
+  },
   "dependencies": {
-    "falcon-ui": "^2.0.2"
+    "falcon-ui": "2.0.2"
   }
 }

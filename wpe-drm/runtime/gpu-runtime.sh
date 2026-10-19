@@ -175,26 +175,28 @@ configure_gpu_profile() {
     export LD_PRELOAD="$GPU_SHIM"
     unset LIBGL_DRIVERS_PATH GBM_BACKENDS_PATH GBM_BACKEND
     unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE
-    export WEBKIT_SKIA_ENABLE_CPU_RENDERING=0
+    # Mali tile raster/replay leaves persistent missing content after rapid
+    # scrolls. Raster tiles on CPU; keep Mali composition and WebGL enabled.
+    export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
     export WEBKIT_SKIA_CPU_COMPOSITOR=0
     if [ "$WPE_FORCE_FULL_REPAINT_OVERRIDE_SET" = 1 ]; then
         export WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT="$WPE_FORCE_FULL_REPAINT_OVERRIDE"
     else
         export WEBKIT_FORCE_FULL_COMPOSITOR_REPAINT=0
     fi
-    export WEBKIT_SKIA_GPU_PAINTING_THREADS=1
-    unset WEBKIT_SKIA_CPU_PAINTING_THREADS
+    export WEBKIT_SKIA_GPU_PAINTING_THREADS=0
+    export WEBKIT_SKIA_CPU_PAINTING_THREADS="${WPE_CPU_PAINTING_THREADS:-3}"
     export WEBKIT_WEBGL_DISABLE_GBM=0
-    export WEBKIT_DISABLE_DMABUF_ATLAS=0
+    export WEBKIT_DISABLE_DMABUF_ATLAS=1
     export WPE_DRM_BUFFER_PATH=auto
     export WPE_DRM_FORCE_SHM=0
     export WPE_DMABUF_BUFFER_FORMAT=AR24:0:scanout
-    export WEBKIT_SKIA_USE_LINEAR_TILE_TEXTURES=1
+    export WEBKIT_SKIA_USE_LINEAR_TILE_TEXTURES=0
 }
 
 gpu_assets_ready() {
     [ -x "$GPU_PROBE" ] && [ -f "$GPU_SHIM" ] && \
-    [ -f "$MALI_LIB/libmali.so.1" ] && [ -f "$MALI_LIB/libmali_hook.so.1" ] && \
+    [ -f "$MALI_LIB/libmali.so.1" ] && \
     [ -f "$MALI_LIB/libEGL.so.1" ] && [ -f "$MALI_LIB/libGLESv2.so.2" ] && \
     [ -f "$MALI_LIB/libgbm.so.1" ]
 }

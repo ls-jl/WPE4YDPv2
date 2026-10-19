@@ -1,0 +1,36 @@
+diff --git a/Source/WTF/wtf/MemoryPressureHandler.cpp b/Source/WTF/wtf/MemoryPressureHandler.cpp
+index 7125641..a254952 100644
+--- a/Source/WTF/wtf/MemoryPressureHandler.cpp
++++ b/Source/WTF/wtf/MemoryPressureHandler.cpp
+@@ -25,6 +25,10 @@
+ 
+ #include "config.h"
+ #include <wtf/MemoryPressureHandler.h>
++#if PLATFORM(WPE)
++#include "MemoryReliefCadence.h"
++#include <wtf/MonotonicTime.h>
++#endif
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -241,6 +245,20 @@ void MemoryPressureHandler::measurementTimerFired()
+ 
+     setMemoryUsagePolicyBasedOnFootprint(footprint);
+ 
++#if PLATFORM(WPE)
++    // Refilling the active page's image/font caches is not sustained growth.
++    // Retain the pre-relief high-water mark so stable pages do not repeatedly
++    // decode the same assets. The kill check above always runs first.
++    static MemoryReliefCadence reliefCadence;
++    auto nowUS = static_cast<uint64_t>(MonotonicTime::now().secondsSinceEpoch().microseconds());
++    auto policy = m_memoryUsagePolicy == MemoryUsagePolicy::Strict ? 2u
++        : m_memoryUsagePolicy == MemoryUsagePolicy::Conservative ? 1u : 0u;
++    if (!reliefCadence.shouldReclaim(policy, footprint, nowUS,
++            m_memoryPressureStatus != SystemMemoryPressureStatus::Normal))
++        return;
++    reliefCadence.didReclaim(policy, footprint, nowUS);
++#endif
++
+     switch (m_memoryUsagePolicy) {
+     case MemoryUsagePolicy::Unrestricted:
+         break;

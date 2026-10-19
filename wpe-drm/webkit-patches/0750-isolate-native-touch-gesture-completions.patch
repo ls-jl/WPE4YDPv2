@@ -1,0 +1,148 @@
+diff --git a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
+index 3b6eb2a..fa622b0 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.cpp
+@@ -388,42 +388,49 @@ gboolean ViewPlatform::handleEvent(WPEEvent* event)
+         }
+         auto filterResult = m_inputMethodFilter.filterKeyEvent(event);
+         if (!filterResult.handled)
+             page().handleKeyboardEvent(WebKit::NativeWebKeyboardEvent(event, filterResult.keyText, m_keyAutoRepeatHandler.keyPress(wpe_event_keyboard_get_keycode(event))));
+         return TRUE;
+     }
+     case WPE_EVENT_KEYBOARD_KEY_UP: {
+         m_keyAutoRepeatHandler.keyRelease();
+         auto filterResult = m_inputMethodFilter.filterKeyEvent(event);
+         if (!filterResult.handled)
+             page().handleKeyboardEvent(WebKit::NativeWebKeyboardEvent(event, String(), false));
+         return TRUE;
+     }
+     case WPE_EVENT_TOUCH_DOWN:
+ #if ENABLE(TOUCH_EVENTS)
++        m_nativeTouchGesture.begin(wpe_event_touch_get_sequence_id(event), !m_touchEvents.isEmpty());
++        // A late DOM DOWN can outlive its UP. Reset on physical DOWN, and
++        // reject completions from older groups before they touch this detector.
++        if (auto* controller = wpe_view_get_gesture_controller(m_wpeView.get()))
++            wpe_gesture_controller_cancel(controller);
+         g_object_set_data(G_OBJECT(m_wpeView.get()), "wpe-browser-native-drag", nullptr);
+         if (m_nativeScroll.active(wpe_event_touch_get_sequence_id(event)))
+             m_nativeScroll.finish(wpe_event_touch_get_sequence_id(event), wpe_event_get_time(event) - 1);
+         m_touchEvents.set(wpe_event_touch_get_sequence_id(event), event);
+         page().handleTouchEvent(nullptr, NativeWebTouchEvent(event, touchPointsForEvent(event)));
+ #endif
+         return TRUE;
+     case WPE_EVENT_TOUCH_UP:
+     case WPE_EVENT_TOUCH_CANCEL: {
+ #if ENABLE(TOUCH_EVENTS)
+         m_touchEvents.set(wpe_event_touch_get_sequence_id(event), event);
+         auto sequence = wpe_event_touch_get_sequence_id(event);
++        if (wpe_event_get_event_type(event) == WPE_EVENT_TOUCH_CANCEL)
++            m_nativeTouchGesture.cancel();
+         if (m_nativeScroll.active(sequence)) {
+             m_nativeScroll.advance(sequence, wpe_event_get_time(event));
+             if (wpe_event_get_event_type(event) == WPE_EVENT_TOUCH_UP)
+                 handleGesture(event);
+             else {
+                 double x = 0, y = 0;
+                 wpe_event_get_position(event, &x, &y);
+                 GRefPtr<WPEEvent> stop = adoptGRef(wpe_event_scroll_new(m_wpeView.get(),
+                     WPE_INPUT_SOURCE_TOUCHSCREEN, wpe_event_get_time(event), static_cast<WPEModifiers>(0),
+                     0, 0, TRUE, TRUE, x, y));
+                 page().handleNativeWheelEvent(NativeWebWheelEvent(stop.get(), WebWheelEvent::Phase::Ended));
+                 if (auto* controller = wpe_view_get_gesture_controller(m_wpeView.get()))
+                     wpe_gesture_controller_cancel(controller);
+             }
+             m_nativeScroll.finish(sequence, wpe_event_get_time(event));
+@@ -443,30 +450,32 @@ gboolean ViewPlatform::handleEvent(WPEEvent* event)
+         if (m_nativeScroll.active(wpe_event_touch_get_sequence_id(event))) {
+             g_object_set_data(G_OBJECT(m_wpeView.get()), "wpe-browser-native-drag", GINT_TO_POINTER(1));
+             m_nativeScroll.advance(wpe_event_touch_get_sequence_id(event), wpe_event_get_time(event));
+             handleGesture(event);
+             return TRUE;
+         }
+         page().handleTouchEvent(nullptr, NativeWebTouchEvent(event, touchPointsForEvent(event)));
+ #endif
+         return TRUE;
+     };
+     return FALSE;
+ }
+ 
+ bool ViewPlatform::consumesGestureCompletion(WPEEvent* event) const
+ {
++    if (!m_nativeTouchGesture.acceptsCompletion(wpe_event_touch_get_sequence_id(event)))
++        return true;
+     if (wpe_event_get_event_type(event) == WPE_EVENT_TOUCH_DOWN)
+         return false;
+     return m_nativeScroll.consumesCompletion(wpe_event_touch_get_sequence_id(event), wpe_event_get_time(event));
+ }
+ 
+ void ViewPlatform::handleGesture(WPEEvent* event)
+ {
+     auto* gestureController = wpe_view_get_gesture_controller(m_wpeView.get());
+     if (!gestureController)
+         return;
+ 
+     if (!wpe_gesture_controller_handle_event(gestureController, event))
+         return;
+ 
+     if (wpe_event_get_event_type(event) == WPE_EVENT_TOUCH_DOWN)
+diff --git a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.h b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.h
+index 54115e2..9ca581b 100644
+--- a/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.h
++++ b/Source/WebKit/UIProcess/API/wpe/WPEWebViewPlatform.h
+@@ -17,30 +17,31 @@
+  * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+  * THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
+ #pragma once
+ 
+ #if ENABLE(WPE_PLATFORM)
+ 
+ #include "RendererBufferDescription.h"
+ #include "NativeScrollGestureState.h"
++#include "NativeTouchGestureState.h"
+ #include "WPEWebView.h"
+ #include <wpe/GRefPtrWPE.h>
+ #include <wpe/wpe-platform.h>
+ #include <wtf/HashMap.h>
+ #include <wtf/Vector.h>
+ #include <wtf/glib/GRefPtr.h>
+ 
+ namespace WebKit {
+ class AcceleratedBackingStore;
+ class ViewSnapshot;
+ class WebPlatformTouchPoint;
+ }
+ 
+ namespace WKWPE {
+ 
+@@ -92,23 +93,24 @@ private:
+ #if ENABLE(TOUCH_EVENTS)
+     Vector<WebKit::WebPlatformTouchPoint> touchPointsForEvent(WPEEvent*);
+ #endif
+ 
+     void dispatchPendingNextPresentationUpdateCallbacks();
+ 
+     gboolean handleEvent(WPEEvent*);
+ 
+     GRefPtr<WPEView> m_wpeView;
+     RefPtr<WebKit::AcceleratedBackingStore> m_backingStore;
+     uint32_t m_displayID { 0 };
+     unsigned long m_bufferRenderedID { 0 };
+     Vector<CompletionHandler<void()>> m_nextPresentationUpdateCallbacks;
+     HashMap<uint32_t, GRefPtr<WPEEvent>, IntHash<uint32_t>, WTF::UnsignedWithZeroKeyHashTraits<uint32_t>> m_touchEvents;
+     WPE::NativeScrollGestureState m_nativeScroll;
++    WPE::NativeTouchGestureState m_nativeTouchGesture;
+ #if ENABLE(FULLSCREEN_API)
+     bool m_viewWasAlreadyInFullScreen { false };
+ #endif
+ };
+ 
+ } // namespace WKWPE
+ 
+ #endif // ENABLE(WPE_PLATFORM)

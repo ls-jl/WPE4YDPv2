@@ -530,7 +530,7 @@ static bool regularFileNoFollow(const std::string& path, struct stat* result = n
     return true;
 }
 
-static bool normalizePackagedWebKitLibrary(const std::string& runtimeDir, std::string& error)
+static bool validatePackagedWebKitLibrary(const std::string& runtimeDir, std::string& error)
 {
     const std::string libDir = joinPath(runtimeDir, "lib");
     const std::string canonical = joinPath(libDir, "libWPEWebKit-2.0.so.1");
@@ -539,25 +539,8 @@ static bool normalizePackagedWebKitLibrary(const std::string& runtimeDir, std::s
 
     struct stat canonicalStat;
     if (!regularFileNoFollow(canonical, &canonicalStat)) {
-        struct stat rawStat;
-        const bool canonicalIsSymlink = lstat(canonical.c_str(), &rawStat) == 0 && S_ISLNK(rawStat.st_mode);
-        if (!regularFileNoFollow(legacyVersioned)) {
-            error = "runtime WebKit library missing: " + canonical;
-            return false;
-        }
-        if (canonicalIsSymlink && unlink(canonical.c_str()) != 0) {
-            error = "runtime WebKit legacy symlink cleanup failed: " + canonical + ": " + std::strerror(errno);
-            return false;
-        }
-        if (rename(legacyVersioned.c_str(), canonical.c_str()) != 0) {
-            error = "runtime WebKit canonical rename failed: " + std::string(std::strerror(errno));
-            return false;
-        }
-        if (!regularFileNoFollow(canonical, &canonicalStat)) {
-            error = "runtime WebKit canonical file invalid: " + canonical;
-            return false;
-        }
-        LOGI("%s migrated legacy WebKit runtime to %s", kTag, canonical.c_str());
+        error = "runtime WebKit canonical file missing or not regular: " + canonical;
+        return false;
     }
 
     const off_t minimumSize = static_cast<off_t>(90) * 1024 * 1024;
@@ -570,10 +553,8 @@ static bool normalizePackagedWebKitLibrary(const std::string& runtimeDir, std::s
     for (const std::string& alias : obsoleteAliases) {
         struct stat st;
         if (lstat(alias.c_str(), &st) != 0) continue;
-        if (unlink(alias.c_str()) == 0)
-            LOGI("%s removed duplicate WebKit runtime %s", kTag, alias.c_str());
-        else
-            LOGI("%s warning: could not remove duplicate WebKit runtime %s: %s", kTag, alias.c_str(), std::strerror(errno));
+        error = "runtime contains duplicate WebKit alias; reinstall a validated package: " + alias;
+        return false;
     }
     return true;
 }
@@ -627,7 +608,7 @@ static bool ensurePackagedRuntimeReady(const std::string& runtimeDir, std::strin
         }
     }
 
-    if (!normalizePackagedWebKitLibrary(runtimeDir, error)) return false;
+    if (!validatePackagedWebKitLibrary(runtimeDir, error)) return false;
     if (!directoryHasFontFile(joinPath(runtimeDir, "assets/fonts/dejavu"))) {
         error = "runtime fonts missing: " + joinPath(runtimeDir, "assets/fonts/dejavu");
         return false;

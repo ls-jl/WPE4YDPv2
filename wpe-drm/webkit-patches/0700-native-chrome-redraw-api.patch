@@ -1,0 +1,10 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.h
++++ b/Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.h
+@@ -44,5 +44,7 @@
+ WPE_API void wpe_view_drm_trim_caches (WPEViewDRM *view,
+                                        gboolean critical);
++
++WPE_API void wpe_view_drm_request_chrome_redraw (WPEViewDRM *view);
+ 
+ G_END_DECLS
+ 

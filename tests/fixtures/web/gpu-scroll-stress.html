@@ -1,0 +1,91 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU scroll and composition regression</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #eef1f4; color: #172126; font: 16px sans-serif; }
+  #marker { position: fixed; z-index: 10; top: 0; width: 100%; height: 8px; }
+  #stats { position: fixed; z-index: 10; top: 8px; background: white; padding: 4px; }
+  .row { height: 120px; display: flex; align-items: center; border-bottom: 2px solid #35454c; }
+  .row:nth-child(even) { background: #d5e5ee; }
+  canvas { width: 96px; height: 96px; margin: 8px; }
+  .moving { width: 40px; height: 40px; background: #008bd2; will-change: transform; }
+</style>
+<div id="marker"></div><div id="stats">Starting</div><main id="rows"></main>
+<script>
+  const markers = [];
+  for (let i = 0; i < 80; ++i) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 96;
+    const context = canvas.getContext('2d');
+    for (let y = 0; y < 8; ++y) {
+      for (let x = 0; x < 8; ++x) {
+        context.fillStyle = (x + y) % 2 ? '#ecb72b' : '#245772';
+        context.fillRect(x * 12, y * 12, 12, 12);
+      }
+    }
+    row.appendChild(canvas);
+    const text = document.createElement('span');
+    text.textContent = 'Row ' + i + ' - fixed bands and tiles must remain coherent';
+    row.appendChild(text);
+    const moving = document.createElement('div');
+    moving.className = 'moving';
+    row.appendChild(moving);
+    markers.push(moving);
+    rows.appendChild(row);
+  }
+  let start, last, frames = 0, worst = 0;
+  let drawGL = () => {};
+  if (location.search.includes('webgl') || location.pathname.endsWith('-webgl.html')) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 768;
+    canvas.height = 192;
+    canvas.style.cssText = 'position:fixed;bottom:0;right:0;width:75%;height:96px;opacity:.65;z-index:5';
+    document.body.appendChild(canvas);
+    const gl = canvas.getContext('webgl');
+    if (gl) {
+      function shader(type, source) {
+        const result = gl.createShader(type);
+        gl.shaderSource(result, source);
+        gl.compileShader(result);
+        if (!gl.getShaderParameter(result, gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(result));
+        return result;
+      }
+      const program = gl.createProgram();
+      gl.attachShader(program, shader(gl.VERTEX_SHADER,
+        'attribute vec2 p; void main(){gl_Position=vec4(p,0.,1.);}'));
+      gl.attachShader(program, shader(gl.FRAGMENT_SHADER,
+        'precision mediump float; uniform float t; void main(){vec2 p=gl_FragCoord.xy/192.; float v=0.; for(int i=0;i<12;i++){v+=sin(p.x*float(i+1)+t)*cos(p.y*float(i+1)-t);} gl_FragColor=vec4(.5+.4*sin(v),.5+.4*cos(v),.7,1.);}'));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(program));
+      gl.useProgram(program);
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const position = gl.getAttribLocation(program, 'p');
+      gl.enableVertexAttribArray(position);
+      gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+      const time = gl.getUniformLocation(program, 't');
+      drawGL = t => { gl.uniform1f(time, t); gl.drawArrays(gl.TRIANGLES, 0, 3); };
+    }
+  }
+  function tick(t) {
+    if (start === undefined) start = last = t;
+    worst = Math.max(worst, t - last);
+    last = t;
+    const phase = (t - start) / 1000;
+    drawGL(phase);
+    const maxScroll = document.documentElement.scrollHeight - innerHeight;
+    const y = Math.abs(((phase * 1700) % (maxScroll * 2)) - maxScroll);
+    scrollTo(0, y);
+    markers.forEach((node, i) => {
+      node.style.transform = 'translateX(' + Math.round(Math.sin(phase * 3 + i) * 24) + 'px)';
+    });
+    marker.style.background = ++frames % 2 ? '#ff365a' : '#00ad82';
+    if (!(frames % 30)) stats.textContent = 'frames=' + frames + ' max-gap=' + Math.round(worst) + 'ms';
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>

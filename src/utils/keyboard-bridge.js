@@ -25,6 +25,9 @@ export function createKeyboardBridgeState() {
     activeBackend: '',
     attemptedBackends: {},
     probeTimer: null,
+    focusTimer: null,
+    inactiveTimer: null,
+    generation: 0,
     backendSwitchTimer: null,
     returnCancelTimer: null,
     sequence: 0,
@@ -68,8 +71,16 @@ export class KeyboardBridge {
     this.readProfile()
     if (this.state.session) return
     this.state.session = new KeyboardSession({
-      onConfirm: (text) => this.finishRequest(true, text),
-      onCancel: () => this.finishRequest(false, ''),
+      onConfirm: (text) => {
+        if (this.state.activeBackend !== 'global') return
+        this.markBackendSuccess('global', 'confirmed')
+        this.finishRequest(true, text)
+      },
+      onCancel: () => {
+        if (this.state.activeBackend !== 'global') return
+        this.markBackendSuccess('global', 'cancelled')
+        this.finishRequest(false, '')
+      },
     })
     this.state.session.mount()
   }
@@ -125,7 +136,7 @@ export class KeyboardBridge {
 
   markBackendSuccess(backend, evidence) {
     if (!backend || this.state.activeBackend !== backend) return
-    if (backend === 'textarea') this.clearProbeTimer()
+    this.clearProbeTimer()
     if (this.state.profileOverride === 'auto') {
       const shouldPersist = this.state.profileMode !== backend ||
         this.state.profileSource !== 'learned'
@@ -193,7 +204,8 @@ export class KeyboardBridge {
       console.warn(`parse keyboard completion failed id=${request.id} ${err}`)
       return
     }
-    if (!completion || `${completion.id || ''}` !== `${request.id}` || !completion.status) return
+    if (!completion || `${completion.id || ''}` !== `${request.id}` ||
+        !['confirmed', 'cancelled', 'expired', 'superseded', 'failed'].includes(completion.status)) return
     try {
       if (this.browserPlayer.ackKeyboardCompletion) {
         this.browserPlayer.ackKeyboardCompletion({
@@ -254,7 +266,10 @@ export class KeyboardBridge {
     this.state.textareaSeenInput = false
     this.state.phase = 'opening'
     console.warn(`keyboard textarea request id=${request.id} kind=${request.kind || ''} type=${options.inputType}`)
-    setTimeout(() => {
+    const generation = this.state.generation
+    this.state.focusTimer = setTimeout(() => {
+      this.state.focusTimer = null
+      if (generation !== this.state.generation) return
       if (!this.isCurrentRequest(request.id) || this.state.activeBackend !== 'textarea' ||
           this.state.phase !== 'opening') return
       this.state.textareaFocused = true
@@ -286,10 +301,9 @@ export class KeyboardBridge {
     this.closeTextarea()
     this.state.phase = 'opening'
     const uuid = this.state.session.open(this.optionsForRequest(request))
-    if (uuid) {
-      this.state.phase = 'active'
-      this.markBackendSuccess('global', 'uuid')
-    }
+    // Some legacy IMEs provide no visibility/input events. A UUID is only
+    // acceptance, but silence is not evidence of failure while the user types.
+    if (uuid) this.clearProbeTimer()
     console.warn(`keyboard global request id=${request.id} kind=${request.kind || ''} uuid=${uuid || ''}`)
     if (!uuid) this.failBackend('global', 'empty_uuid')
     return !!uuid
@@ -341,6 +355,10 @@ export class KeyboardBridge {
     this.clearProbeTimer()
     this.clearBackendSwitchTimer()
     this.clearReturnCancelTimer()
+    for (const key of ['focusTimer', 'inactiveTimer']) {
+      if (this.state[key] != null) clearTimeout(this.state[key])
+      this.state[key] = null
+    }
   }
 
   clearResponseRetryTimer() {
@@ -385,9 +403,7 @@ export class KeyboardBridge {
         this.state.phase === 'responding') return
     const normalized = normalizeKeyboardEvent(value)
     this.markBackendSuccess('textarea', 'confirm')
-    const text = this.state.textareaSeenInput
-      ? this.state.textareaValue
-      : (normalized.found ? normalized.text : this.state.textareaValue)
+    const text = normalized.found ? normalized.text : this.state.textareaValue
     this.finishRequest(true, text)
   }
 
@@ -404,9 +420,7 @@ export class KeyboardBridge {
       this.finishRequest(false, '')
       return
     }
-    const text = this.state.textareaSeenInput
-      ? this.state.textareaValue
-      : (result.found ? result.text : this.state.textareaValue)
+    const text = result.found ? result.text : this.state.textareaValue
     this.finishRequest(true, text)
   }
 
@@ -425,9 +439,9 @@ export class KeyboardBridge {
 
   onPageHide() {
     if (!this.isActive()) return false
-    if (this.state.activeBackend === 'textarea' &&
+    if (['textarea', 'global'].includes(this.state.activeBackend) &&
         (this.state.phase === 'opening' || this.state.phase === 'active')) {
-      this.markBackendSuccess('textarea', 'page_hide')
+      this.markBackendSuccess(this.state.activeBackend, 'page_hide')
       this.state.phase = 'active'
     }
     return true
@@ -485,6 +499,7 @@ export class KeyboardBridge {
     }
     if (!request || !request.id || this.state.completedRequestIds[request.id]) return
 
+    this.state.generation += 1
     this.state.activeRequest = request
     this.state.activeBackend = ''
     this.state.attemptedBackends = {}
@@ -560,6 +575,7 @@ export class KeyboardBridge {
   }
 
   resetActiveRequest(reason, notify = true) {
+    this.state.generation += 1
     const request = this.state.activeRequest
     if (request && request.id) {
       this.state.completedRequestIds[request.id] = Date.now() + COMPLETED_REQUEST_TTL_MS
@@ -593,7 +609,12 @@ export class KeyboardBridge {
 
   notifyInactive() {
     if (!this.component || !this.component.onKeyboardBridgeInactive) return
-    setTimeout(() => this.component.onKeyboardBridgeInactive(), 0)
+    const generation = this.state.generation
+    this.state.inactiveTimer = setTimeout(() => {
+      this.state.inactiveTimer = null
+      if (generation !== this.state.generation || this.state.activeRequest) return
+      this.component.onKeyboardBridgeInactive()
+    }, 0)
   }
 
   cancelActiveRequest(reason) {

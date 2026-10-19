@@ -1,9 +1,13 @@
 # Runtime Inventory
 
-Snapshot: 2026-07-31. Generate fresh values with:
+Snapshot: 2026-10-06, local cleanup build. Generate fresh values with separate
+commands (one combined `du` invocation can suppress nested totals):
 
 ```sh
-du -sh assets/wpe-runtime/{lib,assets/fonts,lib/gstreamer-1.0}
+du -sh assets/wpe-runtime
+du -sh assets/wpe-runtime/lib
+du -sh assets/wpe-runtime/assets/fonts
+du -sh assets/wpe-runtime/lib/gstreamer-1.0
 find assets/wpe-runtime/lib/gstreamer-1.0 -type f -name '*.so' | wc -l
 ```
 
@@ -11,12 +15,12 @@ find assets/wpe-runtime/lib/gstreamer-1.0 -type f -name '*.so' | wc -l
 
 | Area | Size | Notes |
 | --- | ---: | --- |
-| Complete runtime | 384 MiB | Installed inside the AMR; no external runtime fallback |
-| Runtime libraries | 247 MiB | Includes WebKit, ICU, Mesa, RGA, TLS and media dependencies |
-| Fonts | 88 MiB | 44 CJK/Latin font files |
-| GStreamer plugins | 16 MiB | 126 plugins; WebRTC/video/audio feature set retained |
+| Complete private runtime | 429 MiB | Includes 42 MiB optional GPU stack; public CPU package excludes private components |
+| Runtime libraries | 293 MiB | Includes WebKit, ICU, Mesa, RGA, TLS and media dependencies |
+| Fonts | 88.5 MiB | 47 font/resource files; no CJK font removal |
+| GStreamer plugins | 16 MiB | 128 plugins; WebRTC/video/audio feature set retained |
 
-Largest individual files are `libWPEWebKit-2.0.so.1` (about 103 MiB stripped; upstream file version 1.10.2),
+Largest individual files are `libWPEWebKit-2.0.so.1` (about 153 MiB; upstream file version 1.10.2),
 the proprietary Mali library (about 42 MiB), ICU data (about 30 MiB), and CJK
 fonts. `swrast_dri.so` and `kms_swrast_dri.so` intentionally share an inode in
 the packaged filesystem where hard links are preserved.
@@ -26,6 +30,12 @@ dereferences symlinks while creating an AMR, so aliases would become duplicate
 archive entries and separate files after installation. `librga.so.2` is also
 packaged as one regular file and is loaded only through its explicit package
 path.
+
+The cleanup removed 76 redundant SONAME/version aliases (49,604,000 logical
+bytes). Canonicalization checks hashes, `DT_NEEDED` and explicit library names
+before deletion; conflicting versions stop the build. Plugin directories and
+the two required software DRI names are exempt. Debug HTML and development
+headers are excluded from release AMRs, not removed from the source workspace.
 
 ## Retention Rules
 

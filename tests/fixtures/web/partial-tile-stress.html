@@ -1,0 +1,43 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Partial tile stress</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; background: white; }
+  .row { height: 40px; display: flex; align-items: center; border-bottom: 1px solid #697481; }
+  .cell { width: 110px; padding: 4px; }
+  .cell:nth-child(2n) { background: #d8e8f0; }
+  #glass { position: fixed; top: 12px; left: 12px; width: 130px; height: 32px;
+    background: rgba(230, 35, 80, .4); will-change: transform; animation: move 1s linear infinite alternate; }
+  @keyframes move { to { transform: translateX(320px); } }
+</style>
+<main id="rows"></main><div id="glass"></div>
+<script>
+  const cells = [];
+  for (let rowIndex = 0; rowIndex < 160; rowIndex++) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    for (let column = 0; column < 7; column++) {
+      const cell = document.createElement('span');
+      cell.className = 'cell';
+      cell.textContent = 'R' + rowIndex + ' C' + column + ' 000';
+      row.appendChild(cell);
+      if (column === 1) cells.push(cell);
+    }
+    rows.appendChild(row);
+  }
+  let frame = 0;
+  let start;
+  function tick(time) {
+    if (start === undefined) start = time;
+    frame++;
+    const extent = document.documentElement.scrollHeight - innerHeight;
+    scrollTo(0, Math.abs(((time - start) * 1.1 % (extent * 2)) - extent));
+    const firstRow = Math.floor(scrollY / 41);
+    for (let row = firstRow; row <= firstRow + Math.ceil(innerHeight / 41); row++) {
+      if (cells[row]) cells[row].textContent = 'R' + row + ' C1 ' + String(frame).padStart(3, '0');
+    }
+    if (!(frame % 30)) document.title = 'Partial tile frame ' + frame;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>

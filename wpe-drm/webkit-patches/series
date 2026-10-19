@@ -1,6 +1,4 @@
 0100-wpe-drm-platform.patch
-0150-drm-generation-order.patch
-0160-rga-inset-and-lazy-chrome-base.patch
 0200-skia-raster-compositor.patch
 0250-full-repaint-on-motion.patch
 0260-imagebitmap-complete-decode.patch
@@ -9,8 +7,16 @@
 0310-system-volume-control.patch
 0400-network-cloud-compat.patch
 0500-adaptive-memory-pressure.patch
-0600-drm-lifecycle-and-video-ack.patch
-0610-chrome-frame-inset-sync.patch
-0620-chrome-rotation-icon.patch
-0630-zero-rotation-chrome-and-panel-fit.patch
 0640-portrait-menu-and-gpu-frame-stability.patch
+0650-gpu-fence-and-scanout-coherence.patch
+0660-native-drag-and-skia-tile-readiness.patch
+0670-active-page-memory-relief-cadence.patch
+0680-drm-module-build.patch
+0690-bounded-gpu-swapchain.patch
+0700-native-chrome-redraw-api.patch
+0710-skia-tile-upload-lifetime.patch
+0720-scroll-phases-and-bounded-prefetch.patch
+0730-skia-borrowed-texture-ownership.patch
+0740-skia-partial-tile-copy-on-write.patch
+0750-isolate-native-touch-gesture-completions.patch
+0760-end-short-native-drags.patch

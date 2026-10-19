@@ -31,23 +31,32 @@ gboolean browser_memory_governor_update(BrowserMemoryGovernor *governor,
     int64_t now_us)
 {
     g_return_val_if_fail(governor, FALSE);
+    if (!snapshot || !snapshot->total_kb) {
+        governor->recovery_since_us = 0;
+        return FALSE;
+    }
     BrowserMemoryPressureLevel desired = browser_memory_pressure_classify(snapshot, policy);
     BrowserMemoryPressureLevel previous = governor->level;
     if (desired > governor->level) {
         governor->level = desired;
         governor->recovery_since_us = 0;
     } else if (desired < governor->level) {
-        gboolean safely_recovered = used_percent(snapshot) + 4 < policy->warning_percent
-            && snapshot->available_kb > (uint64_t)(policy->warning_available_mb + 64) * 1024
-            && (!snapshot->swap_total_kb
-                || snapshot->swap_free_kb * 10 > snapshot->swap_total_kb * 4);
+        gboolean critical = governor->level == BROWSER_MEMORY_PRESSURE_CRITICAL;
+        unsigned threshold = critical ? policy->critical_percent : policy->warning_percent;
+        unsigned available_mb = critical ? policy->critical_available_mb + 32
+                                         : policy->warning_available_mb + 64;
+        gboolean swap_recovered = !snapshot->swap_total_kb || (critical
+            ? snapshot->swap_free_kb > 128 * 1024
+            : snapshot->swap_free_kb * 10 > snapshot->swap_total_kb * 4);
+        gboolean safely_recovered = used_percent(snapshot) + 4 < threshold
+            && snapshot->available_kb > (uint64_t)available_mb * 1024 && swap_recovered;
         if (!safely_recovered)
             governor->recovery_since_us = 0;
         else if (!governor->recovery_since_us)
             governor->recovery_since_us = now_us;
         else if (now_us - governor->recovery_since_us
                  >= (int64_t)policy->recovery_seconds * G_USEC_PER_SEC) {
-            governor->level = desired;
+            governor->level = critical ? BROWSER_MEMORY_PRESSURE_WARNING : desired;
             governor->recovery_since_us = 0;
         }
     } else

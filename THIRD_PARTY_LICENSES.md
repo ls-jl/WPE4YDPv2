@@ -119,7 +119,7 @@ from https://github.com/airockchip/librga.
 Rockchip librga is licensed under the Apache License, Version 2.0. A copy of
 that license is available at https://www.apache.org/licenses/LICENSE-2.0.
 
-## 4. Other WebKit subsystem patches (not vendored in this repo)
+## 4. Other WebKit subsystem patches
 
 `wpe-drm/webkit-patches/README.md` documents additional source-level patches
 applied directly to the build-server WebKit tree (outside files mirrored
@@ -135,10 +135,23 @@ here), touching:
 
 These files are part of the upstream WebKit project and are licensed under
 WebKit's own mix of **LGPL-2.0-or-later** and **BSD-2-Clause** licenses
-depending on the file/subsystem. Since these patches only exist on the
-build server and are not currently checked into this repository, they are
-listed here for completeness and compliance tracking — the same "corresponding
-source" obligation described above applies to them.
+depending on the file/subsystem. The production series is checked into
+`wpe-drm/webkit-patches/` and replayed against its pinned upstream revision;
+the same corresponding-source obligation described above applies.
+
+## 5. Mali G52 userspace driver (proprietary, redistribution permitted)
+
+The optional GPU runtime uses the unmodified G52 g13p0 GBM driver pinned in
+[`licenses/mali/source.json`](licenses/mali/source.json), under the
+[ARM Mali Driver EULA](licenses/mali/END_USER_LICENCE_AGREEMENT.txt).
+Sections 1.1(ii) and 1.2 grant conditional redistribution rights, not an
+open-source license. Keep the full EULA and upstream notices with the binary.
+See [scope, attribution and build instructions](licenses/mali/README.md).
+
+Project-authored EGL/GLES/GBM ABI facades and the compatibility shim are MIT.
+The userspace EULA does not cover the separately sourced kernel modules;
+GPU AMRs containing those modules remain local-only. No change to the root
+MIT license or public CPU-only release policy is implied.
 
 ## Summary table
 
@@ -147,5 +160,9 @@ source" obligation described above applies to them.
 | `wpe-drm/WPEViewDRM.cpp` and other WPEPlatform DRM backend files | BSD-2-Clause | Mirror of upstream WPE WebKit file |
 | `wpe-drm/GStreamerHolePunchQuirkRockchip.{cpp,h}` | LGPL-2.0-or-later | Original quirk, using WebCore file header/license |
 | `assets/wpe-runtime/lib/librga.so.2` and minimal IM2D ABI declarations | Apache-2.0 | Rockchip RGA runtime and header-compatible ABI declarations |
-| `wpe-drm/webkit-patches/*` (patches, not vendored here) | LGPL-2.0-or-later / BSD-2-Clause (per upstream file) | Applied only on build server; see `wpe-drm/webkit-patches/README.md` |
-| Everything else (`src/`, `jsapi/`, `scripts/`, `tools/`, etc.) | MIT | See root `LICENSE` |
+| `wpe-drm/webkit-patches/*` | LGPL-2.0-or-later / BSD-2-Clause (per upstream file) | Replayed production series |
+| Optional `gpu/mali/lib/libmali.so.1` | ARM Mali Driver EULA | Pinned userspace binary only; not kernel modules |
+| Original project code (`src/`, `jsapi/`, `scripts/`, `tools/`, etc.) | MIT | See root `LICENSE`; excludes third-party material |
+
+Bundled third-party libraries, fonts and other assets retain their own
+licenses; this table is not a blanket MIT grant for runtime binaries.

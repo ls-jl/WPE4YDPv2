@@ -1,0 +1,8 @@
+[
+  {"name":"gstreamer-1.22.12","url":"https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.22.12.tar.xz"},
+  {"name":"gst-plugins-base-1.22.12","url":"https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.22.12.tar.xz"},
+  {"name":"gst-plugins-good-1.22.12","url":"https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.22.12.tar.xz"},
+  {"name":"gst-plugins-bad-1.22.12","url":"https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.22.12.tar.xz"},
+  {"name":"libnice-0.1.22","url":"https://libnice.freedesktop.org/releases/libnice-0.1.22.tar.gz"},
+  {"name":"libjpeg-turbo-2.1.5.1","url":"https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/2.1.5.1.tar.gz"}
+]

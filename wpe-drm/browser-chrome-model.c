@@ -1,5 +1,48 @@
 #include "browser-chrome-model.h"
 
+ChromeTabsGeometry browser_chrome_tabs_geometry(int width, int height,
+    int toolbar_height, int tab_count, int row_height)
+{
+    int panel_width = MAX(1, width / 2);
+    ChromeTabsGeometry geometry = {
+        .panel_x = width - panel_width, .panel_y = toolbar_height,
+        .panel_width = panel_width, .panel_height = MAX(0, height - toolbar_height),
+        .list_top = toolbar_height, .list_height = MAX(0, height - toolbar_height),
+        .footer_top = height, .row_height = row_height,
+        .max_scroll = MAX(0, tab_count * row_height - MAX(0, height - toolbar_height)),
+    };
+    return geometry;
+}
+
+ChromeMenuGeometry browser_chrome_menu_geometry(int width, int height,
+    int toolbar_height, int item_count)
+{
+    BrowserChromeMenuGridGeometry grid = browser_chrome_menu_grid_geometry(width, height, item_count);
+    ChromeMenuGeometry geometry = {
+        .panel_x = width / 3, .panel_y = toolbar_height,
+        .panel_width = width - width / 3, .panel_height = MAX(0, height - toolbar_height),
+        .columns = grid.columns, .rows = grid.rows, .items_per_page = grid.items_per_page,
+        .item_count = item_count, .page_count = grid.page_count,
+        .max_scroll = MAX(0, grid.page_count - 1) * (width - width / 3),
+    };
+    return geometry;
+}
+
+ChromeListGeometry browser_chrome_list_geometry(int width, int height,
+    int toolbar_height, int line_count, int row_height, int header_height)
+{
+    ChromeListGeometry geometry = {
+        .panel_x = 0, .panel_y = toolbar_height, .panel_width = width,
+        .panel_height = MAX(0, height - toolbar_height),
+        .header_height = header_height, .row_height = row_height,
+        .list_top = toolbar_height + header_height,
+        .list_height = MAX(0, height - toolbar_height - header_height),
+        .line_count = line_count,
+        .max_scroll = MAX(0, line_count * row_height - MAX(0, height - toolbar_height - header_height)),
+    };
+    return geometry;
+}
+
 static const ChromePanelDefinition panel_definitions[CHROME_PANEL_COUNT] = {
     [CHROME_PANEL_NONE] = { "none", CHROME_PANEL_NONE, 0, FALSE, FALSE },
     [CHROME_PANEL_TABS] = { "tabs", CHROME_PANEL_NONE, 0, FALSE, FALSE },
@@ -11,7 +54,7 @@ static const ChromePanelDefinition panel_definitions[CHROME_PANEL_COUNT] = {
     [CHROME_PANEL_WEB] = { "web", CHROME_PANEL_SETTINGS, 5, TRUE, TRUE },
     [CHROME_PANEL_STARTUP] = { "startup & search", CHROME_PANEL_SETTINGS, 4, TRUE, TRUE },
     [CHROME_PANEL_SETTINGS_PRIVACY] = { "privacy & data", CHROME_PANEL_SETTINGS, 4, TRUE, TRUE },
-    [CHROME_PANEL_ABOUT] = { "about", CHROME_PANEL_SETTINGS, 5, TRUE, TRUE },
+    [CHROME_PANEL_ABOUT] = { "about", CHROME_PANEL_SETTINGS, 6, TRUE, TRUE },
     [CHROME_PANEL_PRIVACY] = { "privacy & cookies", CHROME_PANEL_MENU, 2, TRUE, TRUE },
     [CHROME_PANEL_CLEAR_SITE_DATA] = { "clear site data?", CHROME_PANEL_PRIVACY, 2, TRUE, TRUE },
     [CHROME_PANEL_PROFILES] = { "profiles", CHROME_PANEL_MENU, 6, TRUE, TRUE },

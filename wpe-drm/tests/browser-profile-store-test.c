@@ -1,6 +1,7 @@
 #include "../browser-profile-store.h"
 
 #include <glib/gstdio.h>
+#include <sqlite3.h>
 
 static void remove_tree(const char *path)
 {
@@ -201,9 +202,100 @@ static void test_profile_store(void)
     g_free(root);
 }
 
+static void test_locked_database(void)
+{
+    GError *error = NULL;
+    char *root = g_dir_make_tmp("profile-lock-test-XXXXXX", &error);
+    g_assert_no_error(error);
+    char *path = g_build_filename(root, "browser.sqlite3", NULL);
+    char *profiles = g_build_filename(root, "profiles", NULL);
+    sqlite3 *writer = NULL;
+    g_assert_cmpint(sqlite3_open(path, &writer), ==, SQLITE_OK);
+    g_assert_cmpint(sqlite3_exec(writer, "CREATE TABLE sentinel(value); INSERT INTO sentinel VALUES(42); BEGIN EXCLUSIVE", NULL, NULL, NULL), ==, SQLITE_OK);
+    BrowserProfileStore *store = browser_profile_store_open(path, profiles, NULL, NULL, &error);
+    g_assert_null(store);
+    g_assert_nonnull(error);
+    g_assert_cmpint(error->code & 0xff, ==, SQLITE_BUSY);
+    g_clear_error(&error);
+    GDir *directory = g_dir_open(root, 0, &error);
+    g_assert_no_error(error);
+    const char *name;
+    while ((name = g_dir_read_name(directory)))
+        g_assert_null(strstr(name, ".corrupt"));
+    g_dir_close(directory);
+    sqlite3_exec(writer, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(writer);
+    remove_tree(root);
+    g_free(profiles);
+    g_free(path);
+    g_free(root);
+}
+
+static void test_corrupt_database_preserves_profiles(void)
+{
+    GError *error = NULL;
+    char *root = g_dir_make_tmp("profile-corrupt-test-XXXXXX", &error);
+    g_assert_no_error(error);
+    char *path = g_build_filename(root, "browser.sqlite3", NULL);
+    char *profiles = g_build_filename(root, "profiles", NULL);
+    char *old_profile = g_build_filename(profiles, "p1", NULL);
+    g_mkdir_with_parents(old_profile, 0700);
+    g_assert_true(g_file_set_contents(path, "not a sqlite database", -1, &error));
+    char *wal = g_strconcat(path, "-wal", NULL);
+    char *shm = g_strconcat(path, "-shm", NULL);
+    g_assert_true(g_file_set_contents(wal, "recoverable WAL evidence", -1, &error));
+    g_assert_true(g_file_set_contents(shm, "recoverable SHM evidence", -1, &error));
+    g_test_expect_message(NULL, G_LOG_LEVEL_WARNING, "*database was corrupt*preserved*");
+    BrowserProfileStore *store = browser_profile_store_open(path, profiles, NULL, NULL, &error);
+    g_test_assert_expected_messages();
+    g_assert_no_error(error);
+    g_assert_nonnull(store);
+    BrowserProfile active = { 0 };
+    g_assert_true(browser_profile_store_get_active_profile(store, &active, &error));
+    g_assert_no_error(error);
+    g_assert_cmpint(active.id, >, 1);
+    g_assert_true(g_file_test(old_profile, G_FILE_TEST_IS_DIR));
+    browser_profile_clear(&active);
+    browser_profile_store_close(store);
+    gboolean found_backup = FALSE;
+    GDir *directory = g_dir_open(root, 0, NULL);
+    const char *name;
+    while ((name = g_dir_read_name(directory))) {
+        if (!strstr(name, ".corrupt-")) continue;
+        char *backup = g_build_filename(root, name, "browser.sqlite3", NULL);
+        char *contents = NULL;
+        g_assert_true(g_file_get_contents(backup, &contents, NULL, &error));
+        g_assert_cmpstr(contents, ==, "not a sqlite database");
+        found_backup = TRUE;
+        g_free(contents);
+        g_free(backup);
+        backup = g_build_filename(root, name, "browser.sqlite3-wal", NULL);
+        g_assert_true(g_file_get_contents(backup, &contents, NULL, &error));
+        g_assert_cmpstr(contents, ==, "recoverable WAL evidence");
+        g_free(contents);
+        g_free(backup);
+        backup = g_build_filename(root, name, "browser.sqlite3-shm", NULL);
+        g_assert_true(g_file_get_contents(backup, &contents, NULL, &error));
+        g_assert_cmpstr(contents, ==, "recoverable SHM evidence");
+        g_free(contents);
+        g_free(backup);
+    }
+    g_dir_close(directory);
+    g_assert_true(found_backup);
+    remove_tree(root);
+    g_free(old_profile);
+    g_free(wal);
+    g_free(shm);
+    g_free(profiles);
+    g_free(path);
+    g_free(root);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/browser/profile-store", test_profile_store);
+    g_test_add_func("/browser/profile-locked", test_locked_database);
+    g_test_add_func("/browser/profile-corrupt", test_corrupt_database_preserves_profiles);
     return g_test_run();
 }

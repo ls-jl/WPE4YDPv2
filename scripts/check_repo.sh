@@ -31,10 +31,23 @@ dynamic_info() {
 
 echo '[1/8] JavaScript fixtures'
 node scripts/test_keyboard_event.mjs
+node scripts/test_keyboard_state.mjs
 node scripts/test_keyboard_trigger.mjs
 node scripts/test_display_resolver.mjs
 node scripts/test_browser_lifecycle.mjs
 node scripts/test_navigation.mjs
+node scripts/test_page_lifecycle.mjs
+node scripts/test_public_archive.mjs
+node scripts/test_build_environment.mjs
+node scripts/test_native_source_inputs.mjs
+node scripts/test_soname_normalization.mjs
+node scripts/test_elf_abi.mjs
+node scripts/test_frame_integrity.mjs
+node scripts/test_gpu_tile_protocol.mjs
+node scripts/test_evdev_protocol.mjs
+c++ -std=c++11 -Wall -Wextra -Werror -Iwpe-drm \
+    wpe-drm/tests/tile-prefetch-budget-test.cpp -o /tmp/wpe-tile-prefetch-budget-test
+/tmp/wpe-tile-prefetch-budget-test
 c++ -std=c++11 -Wall -Wextra -Werror \
     -Ijsapi/src/jsapi_browser \
     jsapi/src/jsapi_browser/BrowserFilesystem.cpp \
@@ -51,10 +64,24 @@ c++ -std=c++11 -Wall -Wextra -Werror \
     -Iwpe-drm wpe-drm/tests/video-release-queue-test.cpp \
     -o /tmp/wpe-video-release-queue-test
 /tmp/wpe-video-release-queue-test
+c++ -std=c++11 -Wall -Wextra -Werror -Iwpe-drm \
+    wpe-drm/tests/video-wire-test.cpp -o /tmp/wpe-video-wire-test
+/tmp/wpe-video-wire-test
 c++ -std=c++11 -Wall -Wextra -Werror \
     -Iwpe-drm wpe-drm/tests/gpu-frame-validity-test.cpp \
     -o /tmp/wpe-gpu-frame-validity-test
 /tmp/wpe-gpu-frame-validity-test
+c++ -std=c++11 -Wall -Wextra -Werror -Iwpe-drm \
+    $(pkg-config --cflags glib-2.0) wpe-drm/tests/rendering-fence-test.cpp \
+    $(pkg-config --libs glib-2.0) -o /tmp/wpe-rendering-fence-test
+/tmp/wpe-rendering-fence-test
+c++ -std=c++11 -Wall -Wextra -Werror -Iwpe-drm \
+    wpe-drm/tests/native-scroll-state-test.cpp -o /tmp/wpe-native-scroll-state-test
+/tmp/wpe-native-scroll-state-test
+c++ -std=c++11 -Wall -Wextra -Werror -Iwpe-drm \
+    $(pkg-config --cflags glib-2.0) wpe-drm/tests/drm-ownership-test.cpp \
+    $(pkg-config --libs glib-2.0) -o /tmp/wpe-drm-ownership-test
+/tmp/wpe-drm-ownership-test
 
 echo '[2/8] Shell syntax'
 for script in wpe-drm/run.sh wpe-drm/runtime/*.sh scripts/*.sh; do
@@ -64,6 +91,7 @@ for script in wpe-drm/run.sh wpe-drm/runtime/*.sh scripts/*.sh; do
     esac
 done
 sh scripts/test_memory_runtime.sh
+sh scripts/test_gpu_profile.sh
 while IFS= read -r patch; do
     case "$patch" in ''|'#'*) continue ;; esac
     require_file "wpe-drm/webkit-patches/$patch"
@@ -81,6 +109,11 @@ cc -std=c11 -Wall -Wextra -Werror \
     $(pkg-config --libs glib-2.0) \
     -o /tmp/wpe-browser-chrome-model-test
 /tmp/wpe-browser-chrome-model-test
+cc -std=c11 -Wall -Wextra -Werror -Iwpe-drm \
+    $(pkg-config --cflags glib-2.0 gobject-2.0) \
+    wpe-drm/browser-chrome-publisher.c wpe-drm/tests/browser-chrome-publisher-test.c \
+    $(pkg-config --libs glib-2.0 gobject-2.0) -o /tmp/wpe-browser-chrome-publisher-test
+/tmp/wpe-browser-chrome-publisher-test
 cc -std=c11 -Wall -Wextra -Werror \
     $(pkg-config --cflags glib-2.0) \
     wpe-drm/browser-i18n.c wpe-drm/tests/browser-i18n-test.c \
@@ -144,6 +177,9 @@ dynamic_info assets/wpe-runtime/lib/libavif.so.16 \
     | grep -q 'NEEDED.*libdav1d.so.7' \
     || fail 'packaged AVIF decoder is not linked to the bundled dav1d runtime'
 sh scripts/validate_gpu_runtime.sh optional
+if [ -f assets/wpe-runtime/gpu/mali/lib/libmali.so.1 ]; then
+    node scripts/test_mali_license.mjs
+fi
 webkit_entries=$(find assets/wpe-runtime/lib -maxdepth 1 \
     -name 'libWPEWebKit-2.0.so*' -print)
 [ "$webkit_entries" = "assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1" ] \
@@ -227,5 +263,19 @@ while IFS= read -r input; do
     case "$input" in ''|'#'*) continue ;; esac
     require_file "$input"
 done < wpe-drm/webkit-patches/inputs
+node - <<'NODE'
+const fs = require('fs')
+const mapping = JSON.parse(fs.readFileSync('wpe-drm/webkit-overlays.json'))
+const series = fs.readFileSync('wpe-drm/webkit-patches/series', 'utf8').trim().split('\n')
+for (const destination of Object.values(mapping).flat()) {
+  for (const name of series) {
+    const contents = fs.readFileSync(`wpe-drm/webkit-patches/${name}`, 'utf8')
+    if (contents.includes(`+++ b/${destination}\n`)) {
+      throw new Error(`Overlay has duplicate patch implementation: ${destination} in ${name}`)
+    }
+  }
+}
+console.log('single-source WebKit overlays: ok')
+NODE
 
 echo 'check_repo: all checks passed'

@@ -1,0 +1,22 @@
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -1014,5 +1014,7 @@ AcceleratedSurface::RenderTarget* AcceleratedSurface::SwapChain::nextTarget()
+ 
+     if (m_freeTargets.isEmpty()) {
++        if (m_lockedTargets.size() >= s_maximumBuffers)
++            return nullptr;
+         ASSERT(m_lockedTargets.size() < s_maximumBuffers);
+ 
+         unsigned targetsToCreate = 1;
+@@ -1314,8 +1316,10 @@ void AcceleratedSurface::didRenderFrame()
+     TraceScope traceScope(WaitForCompositionCompletionStart, WaitForCompositionCompletionEnd);
+ #endif
+ 
+-    if (!m_target)
++    if (!m_target) {
++        frameDone();
+         return;
++    }
+ 
+     if (usesGL())
+         m_target->sync(m_useExplicitSync);

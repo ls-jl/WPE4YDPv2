@@ -1,4 +1,5 @@
 #pragma once
+#define WPE_LAST_INPUT_DATA_KEY "wpe-input-monotonic-us"
 
 #include <stdint.h>
 
