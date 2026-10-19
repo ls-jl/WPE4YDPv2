@@ -1,0 +1,286 @@
+{
+  "build_artifacts": {
+    "kernel-out/.config": {
+      "bytes": 129203,
+      "sha256": "e0116b5fe136002fe30a57de2c31894f3778b77cc54846dea9c62b61af1bf1f5"
+    },
+    "kernel-out/Module.symvers": {
+      "bytes": 532682,
+      "sha256": "cd77b7755c0d118e8e7e0d8ddebc27e49e7037d15abbb05bfe830e12da0c453d"
+    },
+    "kernel-out/System.map": {
+      "bytes": 3306955,
+      "sha256": "defa922adaedf80d2985551e6a72a48a15629d9021db83a34f375ee6915ec30f"
+    },
+    "kernel-out/arch/arm64/boot/Image": {
+      "bytes": 11249672,
+      "sha256": "ace6738af537e4f0c97a38135e7d6eae386274c1942e5ed5f11105e24efb7ae9"
+    },
+    "kernel-out/drivers/gpu/arm/bifrost/bifrost_kbase.ko": {
+      "bytes": 681464,
+      "sha256": "bc945a2d0f6e714ec9f6e050b78c10b914191189b826abdb700d3c3b418e79f0"
+    },
+    "kernel-out/modules.order": {
+      "bytes": 41,
+      "sha256": "1c814d7d3152e2267dacfce8787d64e4655f9e0f51c99e9d568fba9009f909d5"
+    },
+    "kernel-out/vmlinux": {
+      "bytes": 15082920,
+      "sha256": "a2d3185f74bfb0e1310d0536453d2818b0036292c092eb66d0cc73c3fbc612b8"
+    }
+  },
+  "files": {
+    "LICENSE": {
+      "bytes": 1496,
+      "executable": false,
+      "sha256": "5923858cd30103ec6d5a1c8237c640d7bfdbed4f9df4c7274ccbc13b266a79dc"
+    },
+    "PUBLIC-UPSTREAM.json": {
+      "bytes": 1274,
+      "executable": false,
+      "sha256": "6e817f05faec39c958e67a6da8570da4cfee0703725d145d92fdd45ba69b7e07"
+    },
+    "README.md": {
+      "bytes": 4493,
+      "executable": false,
+      "sha256": "17b89179bf88d31780954e7c71adb5bc2652abcea1dff43ed6a0abfe5fe3386c"
+    },
+    "chromium/driver-patches/0001-g17-balance-opp-helper-reference.patch": {
+      "bytes": 2323,
+      "executable": false,
+      "sha256": "23adf65187c96cf5d6516b336ba6c2b197bc7c6f5b1d51d95aace1f7ccf4f5fd"
+    },
+    "chromium/driver-patches/0002-g17-unwind-platform-power-on-failures.patch": {
+      "bytes": 1886,
+      "executable": false,
+      "sha256": "6cb0f9771ac835b4b5a2242ec0eef4077cb6e1f27427576dcf3a95346d566931"
+    },
+    "chromium/driver-patches/0003-g17-own-opp-regulator-enables.patch": {
+      "bytes": 8092,
+      "executable": false,
+      "sha256": "44a0da58be71f64f067fd05363528fe293d46fe849f34e60c5c5619efb0f0950"
+    },
+    "chromium/driver-patches/0004-g17-unwind-prepared-clock-references.patch": {
+      "bytes": 1082,
+      "executable": false,
+      "sha256": "ea9e6a72f5cc9c9cd7fdeeafa145b20d44dd0a68b7be5da3130bd94681dfdfe0"
+    },
+    "chromium/driver-patches/0005-g17-drain-platform-power-before-detach.patch": {
+      "bytes": 2295,
+      "executable": false,
+      "sha256": "e2bf39f457470bd374abc2730a5d2aec680937149bc56d7efe39a917fad51dc1"
+    },
+    "chromium/driver-patches/0006-g17-track-runtime-pm-and-drain-suspend-work.patch": {
+      "bytes": 3455,
+      "executable": false,
+      "sha256": "813125c67f7fd8ea7359f7ad7aec67c228efa7fab5085a3ffb3d257f0a83bfdd"
+    },
+    "chromium/driver-patches/0007-g17-drain-and-unregister-per-device-monitor.patch": {
+      "bytes": 10232,
+      "executable": false,
+      "sha256": "bebe825b5705d869ddbabd94750819d62b6b88a4b80e8c60fdf0113cb6e70b34"
+    },
+    "chromium/driver-patches/0008-g17-account-platform-regulator-enables.patch": {
+      "bytes": 7031,
+      "executable": false,
+      "sha256": "84a521f0c2bf7b73e798e81b55160d74cdc03aa0bdefb89df6cc2f8fc622e435"
+    },
+    "chromium/driver-patches/0009-g17-retain-failed-platform-regulator-returns.patch": {
+      "bytes": 4829,
+      "executable": false,
+      "sha256": "fc9db78e8caa85c058c05c77d2add53ca7a725b2b6318778b16c61fd47ac1956"
+    },
+    "chromium/driver-patches/0010-g17-retain-opp-rollback-outside-kbdev.patch": {
+      "bytes": 5627,
+      "executable": false,
+      "sha256": "a41dd3f06a2181c92644cbffc94065340f715ef3e3f1da9d5c79559dea2f8fdd"
+    },
+    "chromium/driver-patches/0011-g17-use-core-owned-opp-registration.patch": {
+      "bytes": 16680,
+      "executable": false,
+      "sha256": "c4f1938c14e85d8809936d979540c4aea4abdb99e2f0e40b2b0ff3c17f4dc7a6"
+    },
+    "chromium/kernel-patches/0001-opp-quarantine-failed-exclusive-regulator-release.patch": {
+      "bytes": 12078,
+      "executable": false,
+      "sha256": "d98c75ad9b57aa1d244f8b0784f6e7e5a461ee83537dca5d3788f251880e7037"
+    },
+    "chromium/kernel-patches/0002-opp-manage-registration-ownership-before-io.patch": {
+      "bytes": 26726,
+      "executable": false,
+      "sha256": "430193d9d3f62d7745c02f00a2866402a10834e3f8b4437071d9a8d50850ebd3"
+    },
+    "chromium/kernel-patches/0003-rockchip-release-opp-initialization-references.patch": {
+      "bytes": 3447,
+      "executable": false,
+      "sha256": "962908816dd83bb45b56940070680a2903be1d623af64b071b7712197e41d35e"
+    },
+    "chromium/kernel-patches/0004-rockchip-bound-calibration-snapshots-and-error-lookups.patch": {
+      "bytes": 6832,
+      "executable": false,
+      "sha256": "38e3cb9c3e03b07c1fda5325913febf36a69e20ce3ad0474caaf0508be118c25"
+    },
+    "chromium/scripts/build_g17_kernel_candidate.py": {
+      "bytes": 10632,
+      "executable": false,
+      "sha256": "e5b9d569eceabd7e58dca49ac0ea011623b7068179b2618779b89f83f11cad4a"
+    },
+    "chromium/scripts/compile_g17_candidate.py": {
+      "bytes": 18386,
+      "executable": false,
+      "sha256": "0b8107861cda515dd80be1e0fd12697dc0e87ed4ab4b556f9838564e3c96a09d"
+    },
+    "chromium/scripts/export_g17_source_companion.py": {
+      "bytes": 14510,
+      "executable": false,
+      "sha256": "980c247b3237cc81d67097d135c822dabd6e7b9445d01d868b5c261d799dfe4f"
+    },
+    "chromium/scripts/package_g17_source_bundle.py": {
+      "bytes": 18637,
+      "executable": false,
+      "sha256": "412ebef77e9ef3dfab9688188f83a19bf010e5ec48a0acbd7d5856f40b84723d"
+    },
+    "chromium/source-delivery/G17_SOURCE_COMPANION.md": {
+      "bytes": 4493,
+      "executable": false,
+      "sha256": "17b89179bf88d31780954e7c71adb5bc2652abcea1dff43ed6a0abfe5fe3386c"
+    },
+    "config/built.config": {
+      "bytes": 129203,
+      "executable": false,
+      "sha256": "e0116b5fe136002fe30a57de2c31894f3778b77cc54846dea9c62b61af1bf1f5"
+    },
+    "config/original.config": {
+      "bytes": 129191,
+      "executable": false,
+      "sha256": "be1316e388224bbdb7c44005e7fcacbee34949d98909f337a9149b7cde777076"
+    },
+    "notices/COPYING": {
+      "bytes": 496,
+      "executable": false,
+      "sha256": "fb5a425bd3b3cd6071a3a9aff9909a859e7c1158d54d32e07658398cd67eb6a0"
+    },
+    "notices/LICENSES/exceptions/Linux-syscall-note": {
+      "bytes": 1258,
+      "executable": false,
+      "sha256": "8e378ab93586eb55135d3bc119cce787f7324f48394777d00c34fa3d0be3303f"
+    },
+    "notices/LICENSES/preferred/GPL-2.0": {
+      "bytes": 18729,
+      "executable": false,
+      "sha256": "f6b78c087c3ebdf0f3c13415070dd480a3f35d8fc76f3d02180a407c1c812f79"
+    }
+  },
+  "hardware_accepted": false,
+  "kernel_binary_release_accepted": false,
+  "kind": "g17-managed-source-companion-v1",
+  "notice_review": {
+    "drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0; no exception asserted",
+      "retained_prefix_sha256": "4fd4daf20d7284963b5c9431079d1fca50bbf6efc27622ffa0f493f153c55e4e",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note",
+        "SPDX-License-Identifier: GPL-2.0"
+      ]
+    },
+    "drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0 WITH Linux-syscall-note",
+      "retained_prefix_sha256": "6f1c7b7a37ee0959844b6c885090ecd4402396642e5ee20de16d824e93ca807a",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note"
+      ]
+    },
+    "drivers/gpu/arm/bifrost/mali_kbase_core_linux.c": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0 WITH Linux-syscall-note",
+      "retained_prefix_sha256": "eb70e90c233b37ccdae688d25d5abc6d04117494379385b0c1fe59078c6ac7b4",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note"
+      ]
+    },
+    "drivers/gpu/arm/bifrost/mali_kbase_defs.h": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0 WITH Linux-syscall-note",
+      "retained_prefix_sha256": "453141d76d3a0095d06d512580c51279df58c2341d5820d32a45c9c16024f53a",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note"
+      ]
+    },
+    "drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0-only",
+      "retained_prefix_sha256": "0d1eed5e9eccd080aabf7465d5781930dcdf5fd053c853f08fc6436e5b37f6e4",
+      "spdx_lines": []
+    },
+    "drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0-only",
+      "retained_prefix_sha256": "7b8dccdfb565c51d5292d6ddbd3fc8d8e4618e1cacb67831aa31d7c3cfbac613",
+      "spdx_lines": []
+    },
+    "drivers/opp/core.c": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0-only",
+      "retained_prefix_sha256": "fa72059f87c6a10fb6a247d290929d2c73cd9543c6c2f260b7175136e4c94de6",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0-only"
+      ]
+    },
+    "drivers/opp/opp.h": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0-only",
+      "retained_prefix_sha256": "34649d7efc1c1a6b44c69efe3bdc5f254be3be75a3c4c9b6ba0a3dd9e5432b74",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0-only"
+      ]
+    },
+    "drivers/soc/rockchip/rockchip_opp_select.c": {
+      "new_file": false,
+      "redistribution_basis": "GPL-2.0-or-later",
+      "retained_prefix_sha256": "428c9e77646e223575279e828c7750c443f3e200b731014fcd68b51e0d6ee2ff",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0+"
+      ]
+    },
+    "include/linux/pm_opp_safe.h": {
+      "new_file": true,
+      "redistribution_basis": "GPL-2.0-only",
+      "retained_prefix_sha256": "9f0f7fc0a8752c836657ced6839b0b070a9be48d11062fcf85ccfd261f37881e",
+      "spdx_lines": [
+        "SPDX-License-Identifier: GPL-2.0-only"
+      ]
+    }
+  },
+  "observed_at": "2026-10-19T23:29:32.278089+00:00",
+  "original_build_receipt_sha256": "2d197c0da0aadcc522119c90077443bd0ffe43024832d729f97f23b73cff5861",
+  "patch_series": [
+    "chromium/kernel-patches/0001-opp-quarantine-failed-exclusive-regulator-release.patch",
+    "chromium/kernel-patches/0002-opp-manage-registration-ownership-before-io.patch",
+    "chromium/kernel-patches/0003-rockchip-release-opp-initialization-references.patch",
+    "chromium/kernel-patches/0004-rockchip-bound-calibration-snapshots-and-error-lookups.patch",
+    "chromium/driver-patches/0001-g17-balance-opp-helper-reference.patch",
+    "chromium/driver-patches/0002-g17-unwind-platform-power-on-failures.patch",
+    "chromium/driver-patches/0003-g17-own-opp-regulator-enables.patch",
+    "chromium/driver-patches/0004-g17-unwind-prepared-clock-references.patch",
+    "chromium/driver-patches/0005-g17-drain-platform-power-before-detach.patch",
+    "chromium/driver-patches/0006-g17-track-runtime-pm-and-drain-suspend-work.patch",
+    "chromium/driver-patches/0007-g17-drain-and-unregister-per-device-monitor.patch",
+    "chromium/driver-patches/0008-g17-account-platform-regulator-enables.patch",
+    "chromium/driver-patches/0009-g17-retain-failed-platform-regulator-returns.patch",
+    "chromium/driver-patches/0010-g17-retain-opp-rollback-outside-kbdev.patch",
+    "chromium/driver-patches/0011-g17-use-core-owned-opp-registration.patch"
+  ],
+  "preferred_source_entries": 86551,
+  "preferred_source_inventory_sha256": "d40de1e8e946603c24f0351c8f8486e0436eb749c07ac97f7029153609f8a917",
+  "source_archive_sha256": "f406b0050f50572a0f326f433a387f83ada2727c43a8543ec46bbf172502be90",
+  "source_companion_only": true,
+  "upstream": {
+    "api": "https://api.github.com/repos/rockchip-linux/kernel/git/commits/acdf68dc443a7c9a68be769abc6cf4d85617f283",
+    "repository": "https://github.com/rockchip-linux/kernel",
+    "revision": "acdf68dc443a7c9a68be769abc6cf4d85617f283",
+    "signature_verified": false,
+    "tree": "b43acf827e54177453b8097668356a9ae4fa2c03"
+  }
+}

@@ -1,0 +1,282 @@
+--- a/drivers/gpu/arm/bifrost/mali_kbase_defs.h
++++ b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+@@ -673,6 +673,28 @@
+ #endif
+ };
+ 
++#if defined(CONFIG_MALI_BIFROST_DEVFREQ) && defined(CONFIG_PM_OPP) && \
++	defined(CONFIG_REGULATOR) && (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE) && \
++	(LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0))
++#define MALI_OPP_REFERENCE_TRACKING 1
++struct kbase_opp_transition;
++struct kbase_opp_ref_state {
++	struct mutex lock;
++	struct kbase_opp_transition *transition;
++	struct task_struct *owner;
++	struct regulator *retained[BASE_MAX_NR_CLOCKS_REGULATORS];
++	unsigned int retained_count;
++	bool regulators_committed;
++	bool closing;
++	bool module_pinned;
++	bool device_pinned;
++	bool helper_unregistered;
++	bool initialized;
++};
++#else
++#define MALI_OPP_REFERENCE_TRACKING 0
++#endif
++
+ /**
+  * struct kbase_device   - Object representing an instance of GPU platform device,
+  *                         allocated from the probe method of mali driver.
+@@ -1001,6 +1023,7 @@
+  *                          KCPU queue. These structures may outlive kbase module
+  *                          itself. Therefore, in such a case, a warning should be
+  *                          be produced.
++ * @opp_ref_state:         Private reference ownership for pre-6.0 custom OPPs.
+  */
+ struct kbase_device {
+ 	u32 hw_quirks_sc;
+@@ -1308,6 +1331,10 @@
+ #if MALI_USE_CSF && IS_ENABLED(CONFIG_SYNC_FILE)
+ 	atomic_t live_fence_metadata;
+ #endif
++#if MALI_OPP_REFERENCE_TRACKING
++	/* Appended so existing private-field offsets do not move. */
++	struct kbase_opp_ref_state opp_ref_state;
++#endif
+ };
+ 
+ /**
+--- a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+@@ -4520,6 +4520,11 @@
+ 
+ 	pdev = to_platform_device(kbdev->dev);
+ 
++#if MALI_OPP_REFERENCE_TRACKING
++	mutex_init(&kbdev->opp_ref_state.lock);
++	smp_store_release(&kbdev->opp_ref_state.initialized, true);
++#endif
++
+ #if defined(CONFIG_REGULATOR)
+ 	/* Since the error code EPROBE_DEFER causes the entire probing
+ 	 * procedure to be restarted from scratch at a later time,
+@@ -4662,6 +4667,27 @@
+ void power_control_term(struct kbase_device *kbdev)
+ {
+ 	unsigned int i;
++#if MALI_OPP_REFERENCE_TRACKING
++	struct kbase_opp_ref_state *state = kbdev->opp_ref_state.initialized ?
++		&kbdev->opp_ref_state : NULL;
++	struct device *dev = kbdev->dev;
++	bool release_device = false;
++	bool release_module = false;
++
++	if (state) {
++		mutex_lock(&state->lock);
++		state->closing = true;
++		for (i = state->retained_count; i > 0; --i) {
++			unsigned int at = i - 1;
++
++			if (!regulator_disable(state->retained[at])) {
++				--state->retained_count;
++				state->retained[at] = state->retained[state->retained_count];
++				state->retained[state->retained_count] = NULL;
++			}
++		}
++	}
++#endif
+ 
+ #if defined(CONFIG_PM_OPP)
+ 	dev_pm_opp_of_remove_table(kbdev->dev);
+@@ -4675,9 +4701,27 @@
+ 	if (!IS_ERR_OR_NULL(kbdev->opp_table)) {
+ 		struct opp_table *table = kbdev->opp_table;
+ 
+-		kbdev->opp_table = NULL;
++#if MALI_OPP_REFERENCE_TRACKING
++		if (!state || !state->helper_unregistered) {
++			dev_pm_opp_unregister_set_opp_helper(table);
++			if (state)
++				state->helper_unregistered = true;
++		}
++		if (state && state->retained_count) {
++			/* Leave no callback into a freed kbdev; retain failed resources. */
++			if (!state->device_pinned) {
++				get_device(kbdev->dev);
++				state->device_pinned = true;
++			}
++			dev_err(kbdev->dev, "OPP regulator rollback remains quarantined\n");
++		} else
++#else
+ 		dev_pm_opp_unregister_set_opp_helper(table);
+-		dev_pm_opp_put_regulators(table);
++#endif
++		{
++			kbdev->opp_table = NULL;
++			dev_pm_opp_put_regulators(table);
++		}
+ 	}
+ #endif /* (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE) */
+ #endif /* CONFIG_REGULATOR */
+@@ -4700,6 +4744,26 @@
+ 		}
+ 	}
+ #endif
++#if MALI_OPP_REFERENCE_TRACKING
++	if (state) {
++		state->regulators_committed = false;
++		if (!state->retained_count) {
++			if (state->device_pinned) {
++				state->device_pinned = false;
++				release_device = true;
++			}
++			if (state->module_pinned) {
++				state->module_pinned = false;
++				release_module = true;
++			}
++		}
++		mutex_unlock(&state->lock);
++	}
++	if (release_device)
++		put_device(dev);
++	if (release_module)
++		module_put(THIS_MODULE);
++#endif
+ }
+ 
+ #if IS_ENABLED(CONFIG_DEBUG_FS)
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+@@ -127,6 +127,71 @@
+ 	}
+ }
+ 
++#if MALI_OPP_REFERENCE_TRACKING
++struct kbase_opp_transition {
++	struct regulator *regulators[BASE_MAX_NR_CLOCKS_REGULATORS];
++	unsigned int count;
++	bool helper_entered;
++};
++
++static int kbase_devfreq_set_opp_rate(struct kbase_device *kbdev,
++				     unsigned long rate)
++{
++	struct kbase_opp_ref_state *state;
++	struct kbase_opp_transition transition = { { NULL }, 0, false };
++	bool release_module = false;
++	int ret;
++
++	/* This private DVFS entry accepts only recommended, nonzero OPPs. */
++	if (!kbdev || !rate)
++		return -EINVAL;
++	state = &kbdev->opp_ref_state;
++	if (!smp_load_acquire(&state->initialized))
++		return -EINVAL;
++	mutex_lock(&state->lock);
++	if (state->closing || state->retained_count || !try_module_get(THIS_MODULE)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	release_module = true;
++	state->transition = &transition;
++	WRITE_ONCE(state->owner, current);
++	ret = dev_pm_opp_set_rate(kbdev->dev, rate);
++	WRITE_ONCE(state->owner, NULL);
++	state->transition = NULL;
++	if (!ret)
++		WRITE_ONCE(kbdev->current_nominal_freq, rate);
++	if (!ret && transition.count) {
++		/* Only the OPP core may now return these enables at table teardown. */
++		state->regulators_committed = true;
++		transition.count = 0;
++	}
++	while (transition.count) {
++		struct regulator *regulator = transition.regulators[--transition.count];
++
++		if (regulator_disable(regulator)) {
++			state->retained[state->retained_count++] = regulator;
++			if (!state->module_pinned) {
++				state->module_pinned = true;
++				release_module = false;
++			}
++			dev_err(kbdev->dev, "OPP rollback failed; module retained\n");
++		}
++	}
++unlock:
++	mutex_unlock(&state->lock);
++	if (release_module)
++		module_put(THIS_MODULE);
++	return ret;
++}
++#else
++static int kbase_devfreq_set_opp_rate(struct kbase_device *kbdev,
++				     unsigned long rate)
++{
++	return dev_pm_opp_set_rate(kbdev->dev, rate);
++}
++#endif
++
+ int kbase_devfreq_opp_helper(struct dev_pm_set_opp_data *data)
+ {
+ 	struct device *dev = data->dev;
+@@ -147,6 +212,22 @@
+ 	u32 target_rm = UINT_MAX;
+ 	int ret = 0;
+ 
++#if MALI_OPP_REFERENCE_TRACKING
++	struct kbase_opp_ref_state *state = &kbdev->opp_ref_state;
++	struct kbase_opp_transition *transition;
++	unsigned int i;
++
++	if (!smp_load_acquire(&state->initialized) || READ_ONCE(state->owner) != current)
++		return -EINVAL;
++	transition = state->transition;
++	if (!transition || state->closing || !reg_count ||
++	    reg_count > BASE_MAX_NR_CLOCKS_REGULATORS)
++		return -EINVAL;
++	if (transition->helper_entered)
++		return -EBUSY;
++	transition->helper_entered = true;
++#endif
++
+ 	if (reg_count > 1) {
+ 		old_supply_mem = &data->old_opp.supplies[1];
+ 		new_supply_mem = &data->new_opp.supplies[1];
+@@ -225,6 +306,17 @@
+ 		}
+ 	}
+ 
++#if MALI_OPP_REFERENCE_TRACKING
++	if (!state->regulators_committed) {
++		for (i = 0; i < reg_count; ++i) {
++			ret = regulator_enable(data->regulators[i]);
++			if (ret)
++				goto restore_freq;
++			transition->regulators[transition->count++] = data->regulators[i];
++		}
++	}
++#endif
++
+ 	clk_bulk_disable_unprepare(opp_info->num_clks, opp_info->clks);
+ 
+ 	return 0;
+@@ -260,12 +352,16 @@
+ 		return PTR_ERR(opp);
+ 	dev_pm_opp_put(opp);
+ 
++#if !MALI_OPP_REFERENCE_TRACKING
+ 	if (*freq == kbdev->current_nominal_freq)
+ 		return 0;
++#endif
+ 	rockchip_monitor_volt_adjust_lock(kbdev->mdev_info);
+-	ret = dev_pm_opp_set_rate(dev, *freq);
++	ret = kbase_devfreq_set_opp_rate(kbdev, *freq);
+ 	if (!ret) {
++#if !MALI_OPP_REFERENCE_TRACKING
+ 		kbdev->current_nominal_freq = *freq;
++#endif
+ 		KBASE_TLSTREAM_AUX_DEVFREQ_TARGET(kbdev, (u64)*freq);
+ 	}
+ 	rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);

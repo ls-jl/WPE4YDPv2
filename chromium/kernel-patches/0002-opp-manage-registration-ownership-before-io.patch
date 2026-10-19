@@ -1,0 +1,807 @@
+diff --git a/drivers/opp/core.c b/drivers/opp/core.c
+index bd76925..b806bcc 100644
+--- a/drivers/opp/core.c
++++ b/drivers/opp/core.c
+@@ -34,6 +34,7 @@ DEFINE_MUTEX(opp_table_lock);
+ /* PM_OPP is built-in; these inert resources never depend on a GPU module. */
+ static LIST_HEAD(opp_regulator_quarantined);
+ static DEFINE_MUTEX(opp_regulator_quarantine_lock);
++static u64 opp_regulator_release_cookie;
+ 
+ static bool _opp_regulator_release_matches(struct opp_table *table,
+ 					  struct device *dev)
+@@ -63,7 +64,10 @@ static bool _opp_regulator_release_blocked(struct device *dev)
+ 	mutex_lock(&opp_regulator_quarantine_lock);
+ 	list_for_each_entry(table, &opp_regulator_quarantined,
+ 			    regulator_release_node) {
+-		if (_opp_regulator_release_matches(table, dev)) {
++		if (_opp_regulator_release_matches(table, dev) &&
++		    (!READ_ONCE(table->regulator_release_managed) ||
++		     READ_ONCE(table->regulator_release_pending) ||
++		     table->regulator_release_dev != dev)) {
+ 			blocked = true;
+ 			break;
+ 		}
+@@ -92,6 +96,12 @@ static struct opp_table *_find_opp_table_unlocked(struct device *dev)
+ 	list_for_each_entry(opp_table, &opp_tables, node) {
+ 		mutex_lock(&opp_table->lock);
+ 		found = !!_find_opp_dev(dev, opp_table);
++		if (found && (opp_table->regulator_release_pending ||
++			      (opp_table->regulator_release_managed &&
++			       !opp_table->regulator_release_ready))) {
++			mutex_unlock(&opp_table->lock);
++			return ERR_PTR(-EBUSY);
++		}
+ 		mutex_unlock(&opp_table->lock);
+ 
+ 		if (found) {
+@@ -897,6 +907,7 @@ int dev_pm_opp_set_bw(struct device *dev, struct dev_pm_opp *opp)
+ {
+ 	struct opp_table *opp_table;
+ 	int ret;
++	bool serialized;
+ 
+ 	if (_opp_regulator_release_blocked(dev))
+ 		return -EBUSY;
+@@ -906,6 +917,9 @@ int dev_pm_opp_set_bw(struct device *dev, struct dev_pm_opp *opp)
+ 		return PTR_ERR(opp_table);
+ 	}
+ 
++	serialized = READ_ONCE(opp_table->regulator_release_managed);
++	if (serialized)
++		mutex_lock(&opp_table->regulator_release_io_lock);
+ 	if (READ_ONCE(opp_table->regulator_release_pending))
+ 		ret = -EBUSY;
+ 	else if (opp)
+@@ -913,6 +927,8 @@ int dev_pm_opp_set_bw(struct device *dev, struct dev_pm_opp *opp)
+ 	else
+ 		ret = _set_opp_bw(opp_table, NULL, dev, true);
+ 
++	if (serialized)
++		mutex_unlock(&opp_table->regulator_release_io_lock);
+ 	dev_pm_opp_put_opp_table(opp_table);
+ 	return ret;
+ }
+@@ -964,6 +980,7 @@ int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq)
+ 	struct dev_pm_opp *old_opp, *opp;
+ 	struct clk *clk;
+ 	int ret;
++	bool serialized;
+ 
+ 	if (_opp_regulator_release_blocked(dev))
+ 		return -EBUSY;
+@@ -973,12 +990,23 @@ int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq)
+ 		return PTR_ERR(opp_table);
+ 	}
+ 
++	serialized = READ_ONCE(opp_table->regulator_release_managed);
++	if (serialized)
++		mutex_lock(&opp_table->regulator_release_io_lock);
+ 	if (READ_ONCE(opp_table->regulator_release_pending)) {
+ 		ret = -EBUSY;
+ 		goto put_opp_table;
+ 	}
+ 
+ 	if (unlikely(!target_freq)) {
++		/*
++		 * The stock zero-rate helper ignores disable errors and assumes one rail.
++		 * Managed groups must retire through finish(), with their complete ledger.
++		 */
++		if (serialized) {
++			ret = -EOPNOTSUPP;
++			goto put_opp_table;
++		}
+ 		ret = _opp_set_rate_zero(dev, opp_table);
+ 		goto put_opp_table;
+ 	}
+@@ -1075,6 +1103,8 @@ put_old_opp:
+ 	if (!IS_ERR(old_opp))
+ 		dev_pm_opp_put(old_opp);
+ put_opp_table:
++	if (serialized)
++		mutex_unlock(&opp_table->regulator_release_io_lock);
+ 	dev_pm_opp_put_opp_table(opp_table);
+ 	return ret;
+ }
+@@ -1136,6 +1166,7 @@ static struct opp_table *_allocate_opp_table(struct device *dev, int index)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	mutex_init(&opp_table->lock);
++	mutex_init(&opp_table->regulator_release_io_lock);
+ 	mutex_init(&opp_table->genpd_virt_dev_lock);
+ 	INIT_LIST_HEAD(&opp_table->dev_list);
+ 	INIT_LIST_HEAD(&opp_table->regulator_release_node);
+@@ -1202,7 +1233,7 @@ static struct opp_table *_opp_get_opp_table(struct device *dev, int index)
+ 	mutex_lock(&opp_table_lock);
+ 
+ 	opp_table = _find_opp_table_unlocked(dev);
+-	if (!IS_ERR(opp_table))
++	if (!IS_ERR(opp_table) || PTR_ERR(opp_table) != -ENODEV)
+ 		goto unlock;
+ 
+ 	opp_table = _managed_opp(dev, index);
+@@ -1237,6 +1268,7 @@ struct opp_table *dev_pm_opp_get_opp_table_indexed(struct device *dev,
+ static void _opp_table_kref_release(struct kref *kref)
+ {
+ 	struct opp_table *opp_table = container_of(kref, struct opp_table, kref);
++	struct device *release_dev = opp_table->regulator_release_dev;
+ 	struct opp_device *opp_dev, *temp;
+ 	int i;
+ 
+@@ -1271,7 +1303,11 @@ static void _opp_table_kref_release(struct kref *kref)
+ 
+ 	mutex_destroy(&opp_table->genpd_virt_dev_lock);
+ 	mutex_destroy(&opp_table->lock);
++	mutex_destroy(&opp_table->regulator_release_io_lock);
++	kfree(opp_table->regulator_release_active);
+ 	kfree(opp_table);
++	if (release_dev)
++		put_device(release_dev);
+ }
+ 
+ void dev_pm_opp_put_opp_table(struct opp_table *opp_table)
+@@ -1800,6 +1836,39 @@ static void _free_set_opp_data(struct opp_table *opp_table)
+ 	opp_table->set_opp_data = NULL;
+ }
+ 
++static int _opp_setup_regulators(struct device *dev, struct opp_table *table,
++				 const char * const names[], unsigned int count)
++{
++	struct regulator *reg;
++	unsigned int i;
++	int ret;
++
++	table->regulators = kmalloc_array(count, sizeof(*table->regulators), GFP_KERNEL);
++	if (!table->regulators)
++		return -ENOMEM;
++	for (i = 0; i < count; ++i) {
++		reg = regulator_get_optional(dev, names[i]);
++		if (IS_ERR(reg)) {
++			ret = PTR_ERR(reg);
++			if (ret != -EPROBE_DEFER)
++				dev_err(dev, "%s: no regulator (%s) found: %d\n", __func__, names[i], ret);
++			goto failed;
++		}
++		table->regulators[i] = reg;
++	}
++	table->regulator_count = count;
++	ret = _allocate_set_opp_data(table);
++	if (!ret)
++		return 0;
++failed:
++	while (i)
++		regulator_put(table->regulators[--i]);
++	kfree(table->regulators);
++	table->regulators = NULL;
++	table->regulator_count = -1;
++	return ret;
++}
++
+ /**
+  * dev_pm_opp_set_regulators() - Set regulator names for the device
+  * @dev: Device for which regulator name is being set.
+@@ -1817,8 +1886,7 @@ struct opp_table *dev_pm_opp_set_regulators(struct device *dev,
+ 					    unsigned int count)
+ {
+ 	struct opp_table *opp_table;
+-	struct regulator *reg;
+-	int ret, i;
++	int ret;
+ 
+ 	if (_opp_regulator_release_blocked(dev))
+ 		return ERR_PTR(-EBUSY);
+@@ -1826,7 +1894,8 @@ struct opp_table *dev_pm_opp_set_regulators(struct device *dev,
+ 	if (IS_ERR(opp_table))
+ 		return opp_table;
+ 
+-	if (READ_ONCE(opp_table->regulator_release_pending)) {
++	if (READ_ONCE(opp_table->regulator_release_pending) ||
++	    READ_ONCE(opp_table->regulator_release_managed)) {
+ 		ret = -EBUSY;
+ 		goto err;
+ 	}
+@@ -1841,43 +1910,12 @@ struct opp_table *dev_pm_opp_set_regulators(struct device *dev,
+ 	if (opp_table->regulators)
+ 		return opp_table;
+ 
+-	opp_table->regulators = kmalloc_array(count,
+-					      sizeof(*opp_table->regulators),
+-					      GFP_KERNEL);
+-	if (!opp_table->regulators) {
+-		ret = -ENOMEM;
+-		goto err;
+-	}
+-
+-	for (i = 0; i < count; i++) {
+-		reg = regulator_get_optional(dev, names[i]);
+-		if (IS_ERR(reg)) {
+-			ret = PTR_ERR(reg);
+-			if (ret != -EPROBE_DEFER)
+-				dev_err(dev, "%s: no regulator (%s) found: %d\n",
+-					__func__, names[i], ret);
+-			goto free_regulators;
+-		}
+-
+-		opp_table->regulators[i] = reg;
+-	}
+-
+-	opp_table->regulator_count = count;
+-
+-	/* Allocate block only once to pass to set_opp() routines */
+-	ret = _allocate_set_opp_data(opp_table);
++	ret = _opp_setup_regulators(dev, opp_table, names, count);
+ 	if (ret)
+-		goto free_regulators;
++		goto err;
+ 
+ 	return opp_table;
+ 
+-free_regulators:
+-	while (i != 0)
+-		regulator_put(opp_table->regulators[--i]);
+-
+-	kfree(opp_table->regulators);
+-	opp_table->regulators = NULL;
+-	opp_table->regulator_count = -1;
+ err:
+ 	dev_pm_opp_put_opp_table(opp_table);
+ 
+@@ -1894,7 +1932,8 @@ void dev_pm_opp_put_regulators(struct opp_table *opp_table)
+ 	int i;
+ 
+ 	/* A safe-release caller has already transferred its reference. */
+-	if (WARN_ON_ONCE(READ_ONCE(opp_table->regulator_release_pending)))
++	if (WARN_ON_ONCE(READ_ONCE(opp_table->regulator_release_pending) ||
++			 READ_ONCE(opp_table->regulator_release_managed)))
+ 		return;
+ 
+ 	if (!opp_table->regulators)
+@@ -1945,6 +1984,89 @@ int dev_pm_opp_check_regulator_release(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(dev_pm_opp_check_regulator_release);
+ 
++/* Caller holds table->lock and has already selected ownership mode. */
++static int _opp_publish_regulator_release(struct device *dev,
++					  struct opp_table *table)
++{
++	struct opp_table *other;
++	bool conflict = false;
++
++	if (dev->of_node && strscpy(table->regulator_release_path,
++				   of_node_full_name(dev->of_node),
++				   sizeof(table->regulator_release_path)) < 0) {
++		table->regulator_release_path[0] = '\0';
++		return -ENAMETOOLONG;
++	}
++	table->regulator_release_dev = get_device(dev);
++	mutex_lock(&opp_regulator_quarantine_lock);
++	if (table->regulator_release_managed) {
++		list_for_each_entry(other, &opp_regulator_quarantined,
++				    regulator_release_node) {
++			if (_opp_regulator_release_matches(other, dev)) {
++				conflict = true;
++				break;
++			}
++		}
++	}
++	if (!conflict)
++		list_add_tail(&table->regulator_release_node, &opp_regulator_quarantined);
++	mutex_unlock(&opp_regulator_quarantine_lock);
++	if (conflict) {
++		table->regulator_release_dev = NULL;
++		table->regulator_release_path[0] = '\0';
++		put_device(dev);
++		return -EBUSY;
++	}
++	return 0;
++}
++
++/* Returns resources only; the caller still owns/protects the table reference. */
++static int _opp_return_regulator_handles(struct opp_table *table)
++{
++	int ret = 0;
++	int i;
++
++	if (table->regulators) {
++		for (i = table->regulator_count - 1; i >= 0; --i) {
++			struct regulator *regulator = table->regulators[i];
++			bool active;
++			int err;
++
++			if (!regulator)
++				continue;
++			active = table->enabled || (table->regulator_release_active &&
++						  table->regulator_release_active[i]);
++			err = active ? regulator_disable(regulator) : 0;
++			if (err) {
++				if (!ret)
++					ret = err;
++				continue;
++			}
++			regulator_put(regulator);
++			table->regulators[i] = NULL;
++		}
++	}
++	if (ret)
++		return ret;
++	mutex_lock(&table->lock);
++	_free_set_opp_data(table);
++	kfree(table->regulators);
++	table->regulators = NULL;
++	table->regulator_count = -1;
++	table->enabled = false;
++	kfree(table->regulator_release_active);
++	table->regulator_release_active = NULL;
++	mutex_lock(&opp_regulator_quarantine_lock);
++	list_del_init(&table->regulator_release_node);
++	table->regulator_release_path[0] = '\0';
++	mutex_unlock(&opp_regulator_quarantine_lock);
++	/* Managed waiters must never reopen a closed, still-borrowed table. */
++	if (!table->regulator_release_managed)
++		WRITE_ONCE(table->regulator_release_pending, false);
++	mutex_unlock(&table->lock);
++	return 0;
++}
++
+ /**
+  * dev_pm_opp_put_regulators_safe() - Consume or quarantine an exclusive table
+  * @dev: sole consumer, kept alive if regulator_disable fails
+@@ -1972,7 +2094,6 @@ int dev_pm_opp_put_regulators_safe(struct device *dev,
+ 				 struct opp_table *table, bool *consumed)
+ {
+ 	int ret = 0;
+-	int i;
+ 
+ 	if (!consumed)
+ 		return -EINVAL;
+@@ -1980,7 +2101,7 @@ int dev_pm_opp_put_regulators_safe(struct device *dev,
+ 	if (IS_ERR_OR_NULL(dev) || IS_ERR_OR_NULL(table))
+ 		return -EINVAL;
+ 	mutex_lock(&table->lock);
+-	if (table->regulator_release_pending) {
++	if (table->regulator_release_pending || table->regulator_release_managed) {
+ 		ret = -EALREADY;
+ 		goto rejected;
+ 	}
+@@ -1993,65 +2114,236 @@ int dev_pm_opp_put_regulators_safe(struct device *dev,
+ 		ret = -EBUSY;
+ 		goto rejected;
+ 	}
+-	if (dev->of_node && strscpy(table->regulator_release_path,
+-				   of_node_full_name(dev->of_node),
+-				   sizeof(table->regulator_release_path)) < 0) {
+-		table->regulator_release_path[0] = '\0';
+-		ret = -ENAMETOOLONG;
++	WRITE_ONCE(table->regulator_release_pending, true);
++	ret = _opp_publish_regulator_release(dev, table);
++	if (ret) {
++		WRITE_ONCE(table->regulator_release_pending, false);
+ 		goto rejected;
+ 	}
+-	WRITE_ONCE(table->regulator_release_pending, true);
+-	table->regulator_release_dev = get_device(dev);
+-	mutex_lock(&opp_regulator_quarantine_lock);
+-	list_add_tail(&table->regulator_release_node, &opp_regulator_quarantined);
+-	mutex_unlock(&opp_regulator_quarantine_lock);
+ 	mutex_unlock(&table->lock);
+-
+-	if (table->regulators) {
+-		for (i = table->regulator_count - 1; i >= 0; --i) {
+-			struct regulator *regulator = table->regulators[i];
+-			int err;
+-
+-			if (!regulator)
+-				continue;
+-			err = table->enabled ? regulator_disable(regulator) : 0;
+-			if (err) {
+-				if (!ret)
+-					ret = err;
+-				continue;
+-			}
+-			regulator_put(regulator);
+-			table->regulators[i] = NULL;
+-		}
+-	}
++	ret = _opp_return_regulator_handles(table);
+ 	*consumed = true;
+ 	if (ret) {
+ 		dev_err(dev, "OPP supplies retained after failed disable: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	mutex_lock(&table->lock);
+-	_free_set_opp_data(table);
+-	kfree(table->regulators);
+-	table->regulators = NULL;
+-	table->regulator_count = -1;
+-	table->enabled = false;
++	dev_pm_opp_put_opp_table(table);
++	return 0;
++
++rejected:
++	mutex_unlock(&table->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dev_pm_opp_put_regulators_safe);
++
++/* The fresh constructor reference is retained before any supply setup. */
++static int _opp_claim_regulators_locked(struct device *dev,
++					struct opp_table *table)
++{
++	int ret;
++
++	if (_opp_regulator_release_blocked(dev))
++		return -EBUSY;
++	if (table->regulator_release_managed || table->regulator_release_pending) {
++		ret = -EALREADY;
++		goto out;
++	}
++	if (table->shared_opp == OPP_TABLE_ACCESS_SHARED ||
++	    !list_is_singular(&table->dev_list) || !_find_opp_dev(dev, table) ||
++	    table->regulators || table->set_opp || table->set_opp_data ||
++	    table->enabled || !list_empty(&table->opp_list)) {
++		ret = -EINVAL;
++		goto out;
++	}
+ 	mutex_lock(&opp_regulator_quarantine_lock);
+-	list_del_init(&table->regulator_release_node);
+-	table->regulator_release_path[0] = '\0';
+-	table->regulator_release_dev = NULL;
++	if (opp_regulator_release_cookie == U64_MAX) {
++		mutex_unlock(&opp_regulator_quarantine_lock);
++		ret = -EOVERFLOW;
++		goto out;
++	}
++	table->regulator_release_cookie = ++opp_regulator_release_cookie;
+ 	mutex_unlock(&opp_regulator_quarantine_lock);
++	WRITE_ONCE(table->regulator_release_managed, true);
++	WRITE_ONCE(table->regulator_release_pending, true);
++	ret = _opp_publish_regulator_release(dev, table);
++	if (ret) {
++		WRITE_ONCE(table->regulator_release_managed, false);
++		WRITE_ONCE(table->regulator_release_pending, false);
++		table->regulator_release_cookie = 0;
++	}
++out:
++	return ret;
++}
++
++/**
++ * dev_pm_opp_manage_regulators() - Create an exclusively core-owned supply group
++ * @dev: fresh consumer, before OPP setup or rate/voltage IO
++ * @names: supply names, as for dev_pm_opp_set_regulators
++ * @count: positive number of supplies
++ * @helper: callback which the managed core will unregister after draining IO
++ * @cookie: mandatory non-reused identity; zero on every failed initialization
++ *
++ * Existing tables are refused, never adopted by guessing generic reference
++ * counts or overwriting someone else's callback. All setup failure unwinds
++ * happen here before any enable/rate IO. Success returns only a borrowed table;
++ * the core owns both registration references until finish(cookie).
++ */
++struct opp_table *dev_pm_opp_manage_regulators(struct device *dev,
++		const char * const names[], unsigned int count,
++		int (*helper)(struct dev_pm_set_opp_data *), u64 *cookie)
++{
++	struct opp_table *table;
++	int ret;
++
++	if (!cookie)
++		return ERR_PTR(-EINVAL);
++	*cookie = 0;
++	if (IS_ERR_OR_NULL(dev) || !names || !helper || !count ||
++	    count > (INT_MAX - sizeof(struct dev_pm_set_opp_data)) /
++		    (2 * sizeof(struct dev_pm_opp_supply)))
++		return ERR_PTR(-EINVAL);
++	if (_opp_regulator_release_blocked(dev))
++		return ERR_PTR(-EBUSY);
++	mutex_lock(&opp_table_lock);
++	table = _find_opp_table_unlocked(dev);
++	if (!IS_ERR(table)) {
++		mutex_unlock(&opp_table_lock);
++		dev_pm_opp_put_opp_table(table);
++		return ERR_PTR(-EBUSY);
++	}
++	if (PTR_ERR(table) != -ENODEV) {
++		mutex_unlock(&opp_table_lock);
++		return table;
++	}
++	table = _allocate_opp_table(dev, 0);
++	if (IS_ERR(table)) {
++		mutex_unlock(&opp_table_lock);
++		return table;
++	}
++	/* Publish no incomplete setup to metadata lookups. */
++	mutex_lock(&table->lock);
++	mutex_unlock(&opp_table_lock);
++	ret = _opp_claim_regulators_locked(dev, table);
++	mutex_unlock(&table->lock);
++	if (ret)
++		goto put_constructor;
++	/* Lookups reject CLAIMING tables. Provider lookup must not hold table->lock. */
++	ret = _opp_setup_regulators(dev, table, names, count);
++	if (ret)
++		goto failed;
++	table->regulator_release_active = kcalloc(count, sizeof(u8), GFP_KERNEL);
++	if (!table->regulator_release_active) {
++		ret = -ENOMEM;
++		goto failed;
++	}
++	table->set_opp = helper;
++	_get_opp_table_kref(table);
++	table->regulator_release_helper_owned = true;
++	mutex_lock(&table->lock);
++	mutex_lock(&opp_regulator_quarantine_lock);
++	*cookie = table->regulator_release_cookie;
++	WRITE_ONCE(table->regulator_release_ready, true);
+ 	WRITE_ONCE(table->regulator_release_pending, false);
++	mutex_unlock(&opp_regulator_quarantine_lock);
+ 	mutex_unlock(&table->lock);
++	return table;
++failed:
++	/* This fresh group has never been allowed to run its helper or enable. */
++	WARN_ON_ONCE(_opp_return_regulator_handles(table));
++put_constructor:
+ 	dev_pm_opp_put_opp_table(table);
+-	put_device(dev);
+-	return 0;
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL_GPL(dev_pm_opp_manage_regulators);
+ 
+-rejected:
++/**
++ * dev_pm_opp_finish_managed_regulators() - Close a kernel-owned registration
++ * @cookie: identity returned by manage; no caller-owned pointer is consumed here
++ * @unreturned: exact private-helper enables not returned on first-transition error
++ * @count: number of entries in @unreturned, zero for committed/inactive groups
++ *
++ * Drain rate/bandwidth calls, freeze future IO and clear/drop the owned helper.
++ * Residual OPPs or an invalid ledger retain the complete group without guessing
++ * enables. Successful or failed close is terminal; repeated calls never retry
++ * hardware. A missing cookie returns -ESTALE and cannot close a reused address.
++ */
++int dev_pm_opp_finish_managed_regulators(u64 cookie,
++				       struct regulator * const *unreturned,
++				       unsigned int count)
++{
++	struct opp_table *table;
++	struct opp_table *found = NULL;
++	bool drop_helper;
++	bool drop_regulator = false;
++	unsigned int i, j;
++	int ret = 0;
++
++	if (!cookie)
++		return -ESTALE;
++	mutex_lock(&opp_regulator_quarantine_lock);
++	list_for_each_entry(table, &opp_regulator_quarantined,
++			    regulator_release_node) {
++		if (table->regulator_release_managed && table->regulator_release_ready &&
++		    table->regulator_release_cookie == cookie) {
++			_get_opp_table_kref(table);
++			found = table;
++			break;
++		}
++	}
++	mutex_unlock(&opp_regulator_quarantine_lock);
++	if (!found)
++		return -ESTALE;
++	table = found;
++	mutex_lock(&table->regulator_release_io_lock);
++	if (table->regulator_release_finished) {
++		ret = table->regulator_release_error;
++		goto unlock;
++	}
++	mutex_lock(&table->lock);
++	WRITE_ONCE(table->regulator_release_pending, true);
++	drop_helper = table->regulator_release_helper_owned;
++	table->regulator_release_helper_owned = false;
++	table->set_opp = NULL;
++	if (table->regulator_count <= 0 || !table->regulators ||
++	    !table->regulator_release_active || !list_empty(&table->opp_list) ||
++	    count > (unsigned int)table->regulator_count ||
++	    (count && (!unreturned || table->enabled)))
++		ret = -EINVAL;
++	for (i = 0; !ret && i < count; ++i) {
++		bool matched = false;
++
++		for (j = 0; j < (unsigned int)table->regulator_count; ++j) {
++			if (unreturned[i] && table->regulators[j] == unreturned[i]) {
++				if (table->regulator_release_active[j])
++					ret = -EINVAL;
++				table->regulator_release_active[j] = 1;
++				matched = true;
++				break;
++			}
++		}
++		if (!matched)
++			ret = -EINVAL;
++	}
+ 	mutex_unlock(&table->lock);
++	if (drop_helper)
++		dev_pm_opp_put_opp_table(table);
++	if (!ret)
++		ret = _opp_return_regulator_handles(table);
++	drop_regulator = !ret;
++	table->regulator_release_error = ret;
++	table->regulator_release_finished = true;
++	if (ret)
++		dev_err(table->regulator_release_dev,
++			"Managed OPP supplies retained after close: %d\n", ret);
++unlock:
++	mutex_unlock(&table->regulator_release_io_lock);
++	if (drop_regulator)
++		dev_pm_opp_put_opp_table(table); /* owned regulator reference */
++	dev_pm_opp_put_opp_table(table); /* temporary close lookup */
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(dev_pm_opp_put_regulators_safe);
++EXPORT_SYMBOL_GPL(dev_pm_opp_finish_managed_regulators);
+ 
+ /**
+  * dev_pm_opp_set_clkname() - Set clk name for the device
+@@ -2144,7 +2436,8 @@ struct opp_table *dev_pm_opp_register_set_opp_helper(struct device *dev,
+ 	if (IS_ERR(opp_table))
+ 		return opp_table;
+ 
+-	if (READ_ONCE(opp_table->regulator_release_pending)) {
++	if (READ_ONCE(opp_table->regulator_release_pending) ||
++	    READ_ONCE(opp_table->regulator_release_managed)) {
+ 		dev_pm_opp_put_opp_table(opp_table);
+ 		return ERR_PTR(-EBUSY);
+ 	}
+@@ -2172,6 +2465,8 @@ EXPORT_SYMBOL_GPL(dev_pm_opp_register_set_opp_helper);
+  */
+ void dev_pm_opp_unregister_set_opp_helper(struct opp_table *opp_table)
+ {
++	if (WARN_ON_ONCE(READ_ONCE(opp_table->regulator_release_managed)))
++		return;
+ 	/* Make sure there are no concurrent readers while updating opp_table */
+ 	WARN_ON(!list_empty(&opp_table->opp_list));
+ 
+@@ -2394,10 +2689,18 @@ int dev_pm_opp_add(struct device *dev, unsigned long freq, unsigned long u_volt)
+ 	struct opp_table *opp_table;
+ 	int ret;
+ 
++	if (_opp_regulator_release_blocked(dev))
++		return -ESHUTDOWN;
+ 	opp_table = dev_pm_opp_get_opp_table(dev);
+ 	if (IS_ERR(opp_table))
+ 		return PTR_ERR(opp_table);
+ 
++	if (READ_ONCE(opp_table->regulator_release_pending) ||
++	    READ_ONCE(opp_table->regulator_release_managed)) {
++		dev_pm_opp_put_opp_table(opp_table);
++		return -ESHUTDOWN;
++	}
++
+ 	/* Fix regulator count for dynamic OPPs */
+ 	opp_table->regulator_count = 1;
+ 
+@@ -2429,6 +2732,8 @@ static int _opp_set_availability(struct device *dev, unsigned long freq,
+ 	struct dev_pm_opp *tmp_opp, *opp = ERR_PTR(-ENODEV);
+ 	int r = 0;
+ 
++	if (_opp_regulator_release_blocked(dev))
++		return -ESHUTDOWN;
+ 	/* Find the opp_table */
+ 	opp_table = _find_opp_table(dev);
+ 	if (IS_ERR(opp_table)) {
+@@ -2438,6 +2743,10 @@ static int _opp_set_availability(struct device *dev, unsigned long freq,
+ 	}
+ 
+ 	mutex_lock(&opp_table->lock);
++	if (opp_table->regulator_release_pending) {
++		r = -ESHUTDOWN;
++		goto unlock;
++	}
+ 
+ 	/* Do we have the frequency? */
+ 	list_for_each_entry(tmp_opp, &opp_table->opp_list, node) {
+@@ -2500,6 +2809,8 @@ int dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
+ 	struct dev_pm_opp *tmp_opp, *opp = ERR_PTR(-ENODEV);
+ 	int r = 0;
+ 
++	if (_opp_regulator_release_blocked(dev))
++		return -ESHUTDOWN;
+ 	/* Find the opp_table */
+ 	opp_table = _find_opp_table(dev);
+ 	if (IS_ERR(opp_table)) {
+@@ -2509,6 +2820,10 @@ int dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
+ 	}
+ 
+ 	mutex_lock(&opp_table->lock);
++	if (opp_table->regulator_release_pending) {
++		r = -ESHUTDOWN;
++		goto adjust_unlock;
++	}
+ 
+ 	/* Do we have the frequency? */
+ 	list_for_each_entry(tmp_opp, &opp_table->opp_list, node) {
+diff --git a/drivers/opp/opp.h b/drivers/opp/opp.h
+index b89d023..61c187f 100644
+--- a/drivers/opp/opp.h
++++ b/drivers/opp/opp.h
+@@ -163,6 +163,14 @@ enum opp_table_access {
+  * @regulator_release_dev: Owned device reference for failed supply returns.
+  * @regulator_release_path: Copied OF identity; no dependency on dynamic OF refs.
+  * @regulator_release_node: Built-in OPP quarantine list, never a driver callback.
++ * @regulator_release_io_lock: Serializes managed rate/bandwidth and close.
++ * @regulator_release_managed: Both registration references belong to the core.
++ * @regulator_release_ready: Fresh setup is complete and its cookie is published.
++ * @regulator_release_helper_owned: The core still owns the helper reference.
++ * @regulator_release_finished: Managed close is terminal, including failures.
++ * @regulator_release_active: Preallocated custom-helper rollback ownership map.
++ * @regulator_release_error: Cached terminal result; close never retries hardware.
++ * @regulator_release_cookie: Non-reused borrowed-client identity.
+  *
+  * @voltage_tolerance_v1: In percentage, for v1 bindings only.
+  *
+@@ -217,6 +225,14 @@ struct opp_table {
+ 	struct device *regulator_release_dev;
+ 	char regulator_release_path[DEV_PM_OPP_RELEASE_PATH_MAX];
+ 	struct list_head regulator_release_node;
++	struct mutex regulator_release_io_lock;
++	bool regulator_release_managed;
++	bool regulator_release_ready;
++	bool regulator_release_helper_owned;
++	bool regulator_release_finished;
++	u8 *regulator_release_active;
++	int regulator_release_error;
++	u64 regulator_release_cookie;
+ };
+ 
+ /* Routines internal to opp core */
+diff --git a/include/linux/pm_opp_safe.h b/include/linux/pm_opp_safe.h
+index 97e458c..ed62de1 100644
+--- a/include/linux/pm_opp_safe.h
++++ b/include/linux/pm_opp_safe.h
+@@ -6,11 +6,18 @@
+ 
+ #define DEV_PM_OPP_SAFE_REGULATOR_RELEASE 1
+ #define DEV_PM_OPP_RELEASE_PATH_MAX 256
++#define DEV_PM_OPP_MANAGED_REGULATOR_RELEASE 2
+ 
+ #if defined(CONFIG_PM_OPP)
+ int dev_pm_opp_check_regulator_release(struct device *dev);
+ int dev_pm_opp_put_regulators_safe(struct device *dev,
+ 				 struct opp_table *table, bool *consumed);
++struct opp_table *dev_pm_opp_manage_regulators(struct device *dev,
++		const char * const names[], unsigned int count,
++		int (*helper)(struct dev_pm_set_opp_data *), u64 *cookie);
++int dev_pm_opp_finish_managed_regulators(u64 cookie,
++				       struct regulator * const *unreturned,
++				       unsigned int count);
+ #else
+ static inline int dev_pm_opp_check_regulator_release(struct device *dev)
+ {
+@@ -27,5 +34,28 @@ static inline int dev_pm_opp_put_regulators_safe(struct device *dev,
+ 		*consumed = false;
+ 	return -EOPNOTSUPP;
+ }
++
++static inline struct opp_table *dev_pm_opp_manage_regulators(struct device *dev,
++		const char * const names[], unsigned int count,
++		int (*helper)(struct dev_pm_set_opp_data *), u64 *cookie)
++{
++	(void)dev;
++	(void)names;
++	(void)count;
++	(void)helper;
++	if (cookie)
++		*cookie = 0;
++	return ERR_PTR(-EOPNOTSUPP);
++}
++
++static inline int dev_pm_opp_finish_managed_regulators(u64 cookie,
++					struct regulator * const *unreturned,
++					unsigned int count)
++{
++	(void)cookie;
++	(void)unreturned;
++	(void)count;
++	return -EOPNOTSUPP;
++}
+ #endif
+ #endif

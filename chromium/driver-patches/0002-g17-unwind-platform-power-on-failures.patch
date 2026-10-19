@@ -1,0 +1,81 @@
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
+@@ -241,6 +241,7 @@
+ {
+ 	int ret = 1; /* Assume GPU has been powered off */
+ 	int err = 0;
++	bool enabled_regulator = false;
+ 	struct rk_context *platform = get_rk_context(kbdev);
+ 
+ 	cancel_delayed_work_sync(&platform->work);
+@@ -262,13 +263,14 @@
+ 			goto out;
+ 		}
+ 		platform->is_regulator_on = true;
++		enabled_regulator = true;
+ 	}
+ 
+ 	err = rk_pm_enable_clk(kbdev);
+ 	if (err) {
+ 		E("failed to enable clk: %d", err);
+ 		ret = err;
+-		goto out;
++		goto err_regulator;
+ 	}
+ 
+ 	rockchip_monitor_volt_adjust_lock(kbdev->mdev_info);
+@@ -282,7 +284,9 @@
+ 		if (err < 0) {
+ 			E("failed to runtime resume device: %d.", err);
+ 			ret = err;
+-			goto out;
++			pm_runtime_put_noidle(kbdev->dev);
++			rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
++			goto err_clk;
+ 		} else if (err == 1) { /* runtime_pm_status is still active */
+ 			D("chip has NOT been powered off, no need to re-init.");
+ 			ret = 0;
+@@ -296,6 +300,15 @@
+ out:
+ 	mutex_unlock(&platform->lock);
+ 	return ret;
++
++err_clk:
++	rk_pm_disable_clk(kbdev);
++err_regulator:
++	if (enabled_regulator) {
++		rk_pm_disable_regulator(kbdev);
++		platform->is_regulator_on = false;
++	}
++	goto out;
+ }
+ 
+ static void rk_pm_callback_power_off(struct kbase_device *kbdev)
+@@ -352,7 +365,9 @@
+ 		ret = regulator_enable(regulator);
+ 		if (ret) {
+ 			E("fail to enable regulator, ret : %d.", ret);
+-			goto EXIT;
++			while (i > 0)
++				regulator_disable(kbdev->regulators[--i]);
++			return ret;
+ 		}
+ 	}
+ 
+@@ -391,8 +406,15 @@
+ 		} else {
+ 			D("to enable clk.");
+ 			err = clk_enable(clock);
+-			if (err)
++			if (err) {
+ 				E("failed to enable clk: %d.", err);
++				while (i > 0) {
++					clock = kbdev->clocks[--i];
++					if (clock)
++						clk_disable(clock);
++				}
++				return err;
++			}
+ 		}
+ 	}
+ 

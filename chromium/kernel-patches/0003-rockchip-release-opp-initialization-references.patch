@@ -1,0 +1,104 @@
+diff --git a/drivers/opp/core.c b/drivers/opp/core.c
+index b806bcc..6e6838f 100644
+--- a/drivers/opp/core.c
++++ b/drivers/opp/core.c
+@@ -1305,6 +1305,8 @@ static void _opp_table_kref_release(struct kref *kref)
+ 	mutex_destroy(&opp_table->lock);
+ 	mutex_destroy(&opp_table->regulator_release_io_lock);
+ 	kfree(opp_table->regulator_release_active);
++	/* A table-owned property suffix may outlive its setup reference. */
++	kfree(opp_table->prop_name);
+ 	kfree(opp_table);
+ 	if (release_dev)
+ 		put_device(release_dev);
+diff --git a/drivers/soc/rockchip/rockchip_opp_select.c b/drivers/soc/rockchip/rockchip_opp_select.c
+index 82559da..ec8af60 100644
+--- a/drivers/soc/rockchip/rockchip_opp_select.c
++++ b/drivers/soc/rockchip/rockchip_opp_select.c
+@@ -1440,7 +1440,7 @@ static void rockchip_adjust_opp_by_mbist_vmin(struct device *dev,
+ 		return;
+ 
+ 	opp_table = dev_pm_opp_get_opp_table(dev);
+-	if (!opp_table)
++	if (IS_ERR(opp_table))
+ 		return;
+ 
+ 	mutex_lock(&opp_table->lock);
+@@ -1453,6 +1453,8 @@ static void rockchip_adjust_opp_by_mbist_vmin(struct device *dev,
+ 		}
+ 	}
+ 	mutex_unlock(&opp_table->lock);
++
++	dev_pm_opp_put_opp_table(opp_table);
+ }
+ 
+ static void rockchip_adjust_opp_by_otp(struct device *dev,
+@@ -1749,10 +1751,16 @@ int rockchip_set_intermediate_rate(struct device *dev,
+ }
+ EXPORT_SYMBOL(rockchip_set_intermediate_rate);
+ 
++static void rockchip_opp_put_clk(void *data)
++{
++	clk_put(data);
++}
++
+ int rockchip_init_opp_table(struct device *dev, struct rockchip_opp_info *info,
+ 			    char *lkg_name, char *reg_name)
+ {
+ 	struct device_node *np;
++	struct opp_table *prop_table = NULL;
+ 	int bin = -EINVAL, process = -EINVAL;
+ 	int scale = 0, volt_sel = -EINVAL;
+ 	int ret = 0, num_clks = 0, i;
+@@ -1767,6 +1775,8 @@ int rockchip_init_opp_table(struct device *dev, struct rockchip_opp_info *info,
+ 	if (!info)
+ 		goto next;
+ 	info->dev = dev;
++	info->num_clks = 0;
++	info->clks = NULL;
+ 
+ 	num_clks = of_clk_get_parent_count(np);
+ 	if (num_clks > 0) {
+@@ -1780,10 +1790,18 @@ int rockchip_init_opp_table(struct device *dev, struct rockchip_opp_info *info,
+ 			info->clks[i].clk = of_clk_get(np, i);
+ 			if (IS_ERR(info->clks[i].clk)) {
+ 				ret = PTR_ERR(info->clks[i].clk);
++				info->clks[i].clk = NULL;
+ 				dev_err(dev, "%s: failed to get clk %d\n",
+ 					np->name, i);
+ 				goto out;
+ 			}
++			/* No action retains info/kbdev; release precedes the devm array. */
++			ret = devm_add_action_or_reset(dev, rockchip_opp_put_clk,
++						   info->clks[i].clk);
++			if (ret) {
++				info->clks[i].clk = NULL;
++				goto out;
++			}
+ 		}
+ 		info->num_clks = num_clks;
+ 		ret = clk_bulk_prepare_enable(info->num_clks, info->clks);
+@@ -1814,7 +1832,12 @@ next:
+ 				    &scale, &volt_sel);
+ 	if (info && info->data && info->data->set_soc_info)
+ 		info->data->set_soc_info(dev, np, bin, process, volt_sel);
+-	rockchip_set_opp_prop_name(dev, process, volt_sel);
++	prop_table = rockchip_set_opp_prop_name(dev, process, volt_sel);
++	if (IS_ERR(prop_table)) {
++		ret = PTR_ERR(prop_table);
++		prop_table = NULL;
++		goto dis_opp_clk;
++	}
+ 	ret = dev_pm_opp_of_add_table(dev);
+ 	if (ret) {
+ 		dev_err(dev, "Invalid operating-points in device tree.\n");
+@@ -1827,6 +1850,9 @@ next:
+ dis_opp_clk:
+ 	if (info && info->clks)
+ 		clk_bulk_disable_unprepare(info->num_clks, info->clks);
++	/* Preserve the suffix for parsed OPPs; the last table put frees it. */
++	if (prop_table)
++		dev_pm_opp_put_opp_table(prop_table);
+ out:
+ 	of_node_put(np);
+ 

@@ -1,0 +1,137 @@
+diff --git a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
+index 3861f0a..98d5a51 100755
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
+@@ -99,6 +99,46 @@ static int kbase_platform_rk_create_sysfs_files(struct device *dev);
+ 
+ static void kbase_platform_rk_remove_sysfs_files(struct device *dev);
+ 
++/* No retry callback may refer to a kbdev after platform teardown. */
++static LIST_HEAD(rk_pm_quarantined);
++static DEFINE_MUTEX(rk_pm_quarantine_lock);
++
++static bool rk_pm_quarantine_active(void)
++{
++	bool active;
++
++	mutex_lock(&rk_pm_quarantine_lock);
++	active = !list_empty(&rk_pm_quarantined);
++	mutex_unlock(&rk_pm_quarantine_lock);
++	return active;
++}
++
++#ifdef CONFIG_REGULATOR
++static bool rk_pm_quarantine_regulators(struct kbase_device *kbdev,
++					struct rk_context *platform)
++{
++	unsigned int i;
++
++	if (!platform->regulator_owned_mask)
++		return false;
++	/* The pin was acquired before enable, never resurrected during remove. */
++	WARN_ON_ONCE(!platform->regulator_module_pinned);
++	platform->quarantine_dev = get_device(kbdev->dev);
++	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; ++i) {
++		if (!(platform->regulator_owned_mask & BIT(i)))
++			continue;
++		platform->quarantine_regulators[i] = kbdev->regulators[i];
++		kbdev->regulators[i] = NULL;
++	}
++	mutex_lock(&rk_pm_quarantine_lock);
++	list_add_tail(&platform->quarantine_node, &rk_pm_quarantined);
++	mutex_unlock(&rk_pm_quarantine_lock);
++	dev_err(kbdev->dev,
++		"GPU regulator return failed; resources retained until reboot\n");
++	return true;
++}
++#endif
++
+ /*---------------------------------------------------------------------------*/
+ 
+ void kbase_platform_rk_monitor_lock(struct kbase_device *kbdev,
+@@ -233,6 +273,9 @@ static int kbase_platform_rk_init(struct kbase_device *kbdev)
+ 	int ret = 0;
+ 	struct rk_context *platform;
+ 
++	/* Bound retention: no reprobe may accumulate another failed context. */
++	if (rk_pm_quarantine_active())
++		return -EBUSY;
+ 	platform = kzalloc(sizeof(*platform), GFP_KERNEL);
+ 	if (!platform) {
+ 		E("err.");
+@@ -288,6 +331,7 @@ static void kbase_platform_rk_term(struct kbase_device *kbdev)
+ {
+ 	struct rk_context *platform =
+ 		(struct rk_context *)kbdev->platform_context;
++	bool retained = false;
+ 
+ 	if (!platform)
+ 		return;
+@@ -298,11 +342,16 @@ static void kbase_platform_rk_term(struct kbase_device *kbdev)
+ 	/* Cancellation removes the job, not its outstanding power references. */
+ 	rk_pm_power_off_delay_work(&platform->work.work);
+ 	pm_runtime_disable(kbdev->dev);
+-	kbdev->platform_context = NULL;
+ 	wake_lock_destroy(&platform->wake_lock);
+ 	destroy_workqueue(platform->power_off_wq);
++	platform->power_off_wq = NULL;
+ 	platform->kbdev = NULL;
+-	kfree(platform);
++#ifdef CONFIG_REGULATOR
++	retained = rk_pm_quarantine_regulators(kbdev, platform);
++#endif
++	kbdev->platform_context = NULL;
++	if (!retained)
++		kfree(platform);
+ }
+ 
+ struct kbase_platform_funcs_conf platform_funcs = {
+@@ -487,6 +536,10 @@ static int rk_pm_disable_regulator_mask(struct kbase_device *kbdev,
+ 		platform->regulator_error = ret;
+ 	else if (!platform->regulator_owned_mask)
+ 		platform->regulator_error = 0;
++	if (!platform->regulator_owned_mask && platform->regulator_module_pinned) {
++		platform->regulator_module_pinned = false;
++		module_put(THIS_MODULE);
++	}
+ 	return ret;
+ }
+ 
+@@ -511,6 +564,13 @@ static int rk_pm_enable_regulator(struct kbase_device *kbdev,
+ 		if (ret)
+ 			return ret;
+ 	}
++	if (rk_pm_quarantine_active())
++		return -EBUSY;
++	if (kbdev->nr_regulators && !platform->regulator_module_pinned) {
++		if (!try_module_get(THIS_MODULE))
++			return -ENODEV;
++		platform->regulator_module_pinned = true;
++	}
+ 	for (i = 0; i < kbdev->nr_regulators; i++) {
+ 		struct regulator *regulator = kbdev->regulators[i];
+ 
+diff --git a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
+index 29dd305..eab3977 100755
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
+@@ -19,6 +19,7 @@
+ #include <linux/atomic.h>
+ #include <linux/mutex.h>
+ #include <linux/wait.h>
++#include <linux/list.h>
+ 
+ /*---------------------------------------------------------------------------*/
+ 
+@@ -74,6 +75,11 @@ struct rk_context {
+ 	/* Per-consumer enables; failed returns remain owned until retried. */
+ 	unsigned long regulator_owned_mask;
+ 	int regulator_error;
++	bool regulator_module_pinned;
++	/* Failed returns outlive kbdev without callbacks into the detached GPU. */
++	struct list_head quarantine_node;
++	struct device *quarantine_dev;
++	struct regulator *quarantine_regulators[BASE_MAX_NR_CLOCKS_REGULATORS];
+ };
+ 
+ struct kbase_rk_monitor_guard {

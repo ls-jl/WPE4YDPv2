@@ -1,0 +1,292 @@
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+@@ -42,10 +42,11 @@
+ #include <soc/rockchip/rockchip_ipa.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+ #include <soc/rockchip/rockchip_system_monitor.h>
++#include "platform/rk/mali_kbase_rk.h"
+ 
+ static struct devfreq_simple_ondemand_data ondemand_data;
+ 
+-static struct monitor_dev_profile mali_mdevp = {
++static const struct monitor_dev_profile mali_mdevp = {
+ 	.type = MONITOR_TPYE_DEV,
+ 	.low_temp_adjust = rockchip_monitor_dev_low_temp_adjust,
+ 	.high_temp_adjust = rockchip_monitor_dev_high_temp_adjust,
+@@ -340,11 +341,12 @@ restore_voltage:
+ static int
+ kbase_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
+ {
++	struct kbase_rk_monitor_guard monitor;
+ 	struct kbase_device *kbdev = dev_get_drvdata(dev);
+ 	struct dev_pm_opp *opp;
+ 	int ret = 0;
+ 
+-	if (!mali_mdevp.is_checked)
++	if (!kbase_platform_rk_monitor_checked(kbdev))
+ 		return -EINVAL;
+ 
+ 	opp = devfreq_recommended_opp(dev, freq, flags);
+@@ -356,7 +358,7 @@ kbase_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
+ 	if (*freq == kbdev->current_nominal_freq)
+ 		return 0;
+ #endif
+-	rockchip_monitor_volt_adjust_lock(kbdev->mdev_info);
++	kbase_platform_rk_monitor_lock(kbdev, &monitor);
+ 	ret = kbase_devfreq_set_opp_rate(kbdev, *freq);
+ 	if (!ret) {
+ #if !MALI_OPP_REFERENCE_TRACKING
+@@ -364,7 +366,7 @@ kbase_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
+ #endif
+ 		KBASE_TLSTREAM_AUX_DEVFREQ_TARGET(kbdev, (u64)*freq);
+ 	}
+-	rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
++	kbase_platform_rk_monitor_unlock(&monitor);
+ 
+ 	return ret;
+ }
+@@ -864,15 +866,7 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
+ 		goto opp_notifier_failed;
+ 	}
+ 
+-	mali_mdevp.data = kbdev->devfreq;
+-	mali_mdevp.opp_info = &kbdev->opp_info;
+-	kbdev->mdev_info = rockchip_system_monitor_register(kbdev->dev,
+-			&mali_mdevp);
+-	if (IS_ERR(kbdev->mdev_info)) {
+-		dev_dbg(kbdev->dev, "without system monitor\n");
+-               kbdev->mdev_info = NULL;
+-	       mali_mdevp.is_checked = true;
+-	}
++	kbase_platform_rk_monitor_register(kbdev, &mali_mdevp);
+ #if IS_ENABLED(CONFIG_DEVFREQ_THERMAL)
+ 	of_property_read_u32(kbdev->dev->of_node, "dynamic-power-coefficient",
+ 			     (u32 *)&kbase_dcp->dyn_power_coeff);
+@@ -937,6 +931,7 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
+ cooling_reg_failed:
+ 	kbase_ipa_term(kbdev);
+ ipa_init_failed:
++	kbase_platform_rk_monitor_unregister(kbdev);
+ 	devfreq_unregister_opp_notifier(kbdev->dev, kbdev->devfreq);
+ #endif /* CONFIG_DEVFREQ_THERMAL */
+ 
+@@ -964,6 +959,7 @@ void kbase_devfreq_term(struct kbase_device *kbdev)
+ 	int err;
+ 
+ 	dev_dbg(kbdev->dev, "Term Mali devfreq\n");
++	kbase_platform_rk_monitor_unregister(kbdev);
+ 
+ #if IS_ENABLED(CONFIG_DEVFREQ_THERMAL)
+ 	if (kbdev->devfreq_cooling)
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
+@@ -89,9 +89,95 @@ static void kbase_platform_rk_remove_sysfs_files(struct device *dev);
+ 
+ /*---------------------------------------------------------------------------*/
+ 
++void kbase_platform_rk_monitor_lock(struct kbase_device *kbdev,
++				  struct kbase_rk_monitor_guard *guard)
++{
++	struct rk_context *platform = get_rk_context(kbdev);
++
++	guard->platform = platform;
++	mutex_lock(&platform->monitor_refs_lock);
++	guard->info = kbdev->mdev_info;
++	if (guard->info)
++		atomic_inc(&platform->monitor_users);
++	mutex_unlock(&platform->monitor_refs_lock);
++	rockchip_monitor_volt_adjust_lock(guard->info);
++}
++
++void kbase_platform_rk_monitor_unlock(struct kbase_rk_monitor_guard *guard)
++{
++	struct rk_context *platform = guard->platform;
++
++	if (!guard->info)
++		return;
++	rockchip_monitor_volt_adjust_unlock(guard->info);
++	if (atomic_dec_and_test(&platform->monitor_users))
++		wake_up_all(&platform->monitor_idle);
++	guard->info = NULL;
++}
++
++bool kbase_platform_rk_monitor_checked(struct kbase_device *kbdev)
++{
++	return READ_ONCE(get_rk_context(kbdev)->monitor_checked);
++}
++
++void kbase_platform_rk_monitor_register(struct kbase_device *kbdev,
++				      const struct monitor_dev_profile *profile)
++{
++	struct rk_context *platform = get_rk_context(kbdev);
++	struct monitor_dev_profile *copy;
++	struct monitor_dev_info *info = NULL;
++
++	mutex_lock(&platform->monitor_publish_lock);
++	if (platform->monitor_checked)
++		goto out;
++	copy = kzalloc(sizeof(*copy), GFP_KERNEL);
++	if (copy) {
++		*copy = *profile;
++		copy->data = kbdev->devfreq;
++		copy->opp_info = &kbdev->opp_info;
++		info = rockchip_system_monitor_register(kbdev->dev, copy);
++		if (IS_ERR_OR_NULL(info)) {
++			kfree(copy);
++			copy = NULL;
++			info = NULL;
++		}
++	}
++	if (!info)
++		dev_dbg(kbdev->dev, "without system monitor\n");
++	platform->monitor_profile = copy;
++	mutex_lock(&platform->monitor_refs_lock);
++	kbdev->mdev_info = info;
++	mutex_unlock(&platform->monitor_refs_lock);
++	WRITE_ONCE(platform->monitor_checked, true);
++out:
++	mutex_unlock(&platform->monitor_publish_lock);
++}
++
++void kbase_platform_rk_monitor_unregister(struct kbase_device *kbdev)
++{
++	struct rk_context *platform = get_rk_context(kbdev);
++	struct monitor_dev_info *info;
++
++	mutex_lock(&platform->monitor_publish_lock);
++	WRITE_ONCE(platform->monitor_checked, false);
++	mutex_lock(&platform->monitor_refs_lock);
++	info = kbdev->mdev_info;
++	kbdev->mdev_info = NULL;
++	mutex_unlock(&platform->monitor_refs_lock);
++	/* No platform/devfreq or monitor-voltage lock is held across this wait. */
++	wait_event(platform->monitor_idle, !atomic_read(&platform->monitor_users));
++	if (info)
++		rockchip_system_monitor_unregister(info);
++	kfree(platform->monitor_profile);
++	platform->monitor_profile = NULL;
++	mutex_unlock(&platform->monitor_publish_lock);
++}
++
+ static void rk_pm_power_off_locked(struct kbase_device *kbdev,
+ 				   struct rk_context *platform)
+ {
++	struct kbase_rk_monitor_guard monitor;
++
+ 	if (!platform->is_powered) {
+ 		if (platform->is_regulator_on && pm_runtime_suspended(kbdev->dev)) {
+ 			rk_pm_disable_regulator(kbdev);
+@@ -101,7 +187,7 @@ static void rk_pm_power_off_locked(struct kbase_device *kbdev,
+ 		return;
+ 	}
+ 
+-	rockchip_monitor_volt_adjust_lock(kbdev->mdev_info);
++	kbase_platform_rk_monitor_lock(kbdev, &monitor);
+ 	if (platform->pm_ref_held) {
+ 		platform->pm_ref_held = false;
+ 		if (pm_runtime_enabled(kbdev->dev))
+@@ -109,7 +195,7 @@ static void rk_pm_power_off_locked(struct kbase_device *kbdev,
+ 		else
+ 			pm_runtime_put_noidle(kbdev->dev);
+ 	}
+-	rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
++	kbase_platform_rk_monitor_unlock(&monitor);
+ 
+ 	rk_pm_disable_clk(kbdev);
+ 
+@@ -146,6 +232,10 @@ static int kbase_platform_rk_init(struct kbase_device *kbdev)
+ 	platform->is_powered = false;
+ 	platform->kbdev = kbdev;
+ 	mutex_init(&platform->lock);
++	mutex_init(&platform->monitor_publish_lock);
++	mutex_init(&platform->monitor_refs_lock);
++	init_waitqueue_head(&platform->monitor_idle);
++	atomic_set(&platform->monitor_users, 0);
+ 
+ 	platform->delay_ms = 200;
+ 	if (of_property_read_u32(kbdev->dev->of_node, "power-off-delay-ms",
+@@ -251,6 +341,7 @@ static void rk_pm_callback_runtime_off(struct kbase_device *kbdev)
+ 
+ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ {
++	struct kbase_rk_monitor_guard monitor;
+ 	int ret = 1; /* Assume GPU has been powered off */
+ 	int err = 0;
+ 	bool enabled_regulator = false;
+@@ -285,7 +376,7 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ 		goto err_regulator;
+ 	}
+ 
+-	rockchip_monitor_volt_adjust_lock(kbdev->mdev_info);
++	kbase_platform_rk_monitor_lock(kbdev, &monitor);
+ 	/* 若 mali_dev 的 runtime_pm 是 enabled 的, 则... */
+ 	if (pm_runtime_enabled(kbdev->dev)) {
+ 		D("to resume mali_dev syncly.");
+@@ -297,7 +388,7 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ 			E("failed to runtime resume device: %d.", err);
+ 			ret = err;
+ 			pm_runtime_put_noidle(kbdev->dev);
+-			rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
++			kbase_platform_rk_monitor_unlock(&monitor);
+ 			goto err_clk;
+ 		} else if (err == 1) { /* runtime_pm_status is still active */
+ 			D("chip has NOT been powered off, no need to re-init.");
+@@ -308,7 +399,7 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ 		pm_runtime_get_noresume(kbdev->dev);
+ 	}
+ 	platform->pm_ref_held = true;
+-	rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
++	kbase_platform_rk_monitor_unlock(&monitor);
+ 
+ 	platform->is_powered = true;
+ 	wake_lock(&platform->wake_lock);
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
+@@ -16,11 +16,17 @@
+ #define _MALI_KBASE_RK_H_
+ 
+ #include <linux/wakelock.h>
++#include <linux/atomic.h>
++#include <linux/mutex.h>
++#include <linux/wait.h>
+ 
+ /*---------------------------------------------------------------------------*/
+ 
+ #define DEFAULT_UTILISATION_PERIOD_IN_MS (100)
+ 
++struct monitor_dev_profile;
++struct monitor_dev_info;
++
+ /*---------------------------------------------------------------------------*/
+ 
+ /*
+@@ -56,8 +62,29 @@ struct rk_context {
+ 
+ 	/* Owned usage reference, independent of runtime PM's enable state. */
+ 	bool pm_ref_held;
++
++	/* Readers never take the publication lock held during unregister. */
++	struct mutex monitor_publish_lock;
++	struct mutex monitor_refs_lock;
++	wait_queue_head_t monitor_idle;
++	atomic_t monitor_users;
++	struct monitor_dev_profile *monitor_profile;
++	bool monitor_checked;
++};
++
++struct kbase_rk_monitor_guard {
++	struct rk_context *platform;
++	struct monitor_dev_info *info;
+ };
+ 
++void kbase_platform_rk_monitor_lock(struct kbase_device *kbdev,
++				  struct kbase_rk_monitor_guard *guard);
++void kbase_platform_rk_monitor_unlock(struct kbase_rk_monitor_guard *guard);
++void kbase_platform_rk_monitor_register(struct kbase_device *kbdev,
++				      const struct monitor_dev_profile *profile);
++void kbase_platform_rk_monitor_unregister(struct kbase_device *kbdev);
++bool kbase_platform_rk_monitor_checked(struct kbase_device *kbdev);
++
+ /*---------------------------------------------------------------------------*/
+ 
+ static inline struct rk_context *get_rk_context(

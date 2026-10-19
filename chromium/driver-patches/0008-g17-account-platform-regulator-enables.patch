@@ -1,0 +1,236 @@
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
+@@ -66,16 +66,28 @@ static inline void kbase_pm_get_dvfs_metrics(struct kbase_device *kbdev,
+ #endif
+ 
+ #ifdef CONFIG_REGULATOR
+-static int rk_pm_enable_regulator(struct kbase_device *kbdev);
+-static void rk_pm_disable_regulator(struct kbase_device *kbdev);
++static int rk_pm_enable_regulator(struct kbase_device *kbdev,
++				  unsigned long *acquired);
++static int rk_pm_disable_regulator_mask(struct kbase_device *kbdev,
++				       unsigned long mask);
++static int rk_pm_disable_regulator(struct kbase_device *kbdev);
+ #else
+-static inline int rk_pm_enable_regulator(struct kbase_device *kbdev)
++static inline int rk_pm_enable_regulator(struct kbase_device *kbdev,
++					unsigned long *acquired)
+ {
++	*acquired = 0;
+ 	return 0;
+ }
+ 
+-static inline void rk_pm_disable_regulator(struct kbase_device *kbdev)
++static inline int rk_pm_disable_regulator_mask(struct kbase_device *kbdev,
++					     unsigned long mask)
+ {
++	return 0;
++}
++
++static inline int rk_pm_disable_regulator(struct kbase_device *kbdev)
++{
++	return 0;
+ }
+ #endif
+ 
+@@ -179,9 +191,8 @@ static void rk_pm_power_off_locked(struct kbase_device *kbdev,
+ 	struct kbase_rk_monitor_guard monitor;
+ 
+ 	if (!platform->is_powered) {
+-		if (platform->is_regulator_on && pm_runtime_suspended(kbdev->dev)) {
++		if (platform->regulator_owned_mask && pm_runtime_suspended(kbdev->dev)) {
+ 			rk_pm_disable_regulator(kbdev);
+-			platform->is_regulator_on = false;
+ 		}
+ 		D("mali_dev is already powered off.");
+ 		return;
+@@ -201,7 +212,6 @@ static void rk_pm_power_off_locked(struct kbase_device *kbdev,
+ 
+ 	if (pm_runtime_suspended(kbdev->dev)) {
+ 		rk_pm_disable_regulator(kbdev);
+-		platform->is_regulator_on = false;
+ 	}
+ 
+ 	platform->is_powered = false;
+@@ -344,7 +354,7 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ 	struct kbase_rk_monitor_guard monitor;
+ 	int ret = 1; /* Assume GPU has been powered off */
+ 	int err = 0;
+-	bool enabled_regulator = false;
++	unsigned long acquired_regulators = 0;
+ 	struct rk_context *platform = get_rk_context(kbdev);
+ 
+ 	cancel_delayed_work_sync(&platform->work);
+@@ -358,15 +368,11 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ 	}
+ 
+ 	/* we must enable vdd_gpu before pd_gpu_in_chip. */
+-	if (!platform->is_regulator_on) {
+-		err = rk_pm_enable_regulator(kbdev);
+-		if (err) {
+-			E("fail to enable regulator, err : %d.", err);
+-			ret = err;
+-			goto out;
+-		}
+-		platform->is_regulator_on = true;
+-		enabled_regulator = true;
++	err = rk_pm_enable_regulator(kbdev, &acquired_regulators);
++	if (err) {
++		E("fail to enable regulator, err : %d.", err);
++		ret = err;
++		goto out;
+ 	}
+ 
+ 	err = rk_pm_enable_clk(kbdev);
+@@ -411,10 +417,7 @@ out:
+ err_clk:
+ 	rk_pm_disable_clk(kbdev);
+ err_regulator:
+-	if (enabled_regulator) {
+-		rk_pm_disable_regulator(kbdev);
+-		platform->is_regulator_on = false;
+-	}
++	rk_pm_disable_regulator_mask(kbdev, acquired_regulators);
+ 	goto out;
+ }
+ 
+@@ -456,47 +459,74 @@ struct kbase_pm_callback_conf pm_callbacks = {
+ /*---------------------------------------------------------------------------*/
+ 
+ #ifdef CONFIG_REGULATOR
+-static int rk_pm_enable_regulator(struct kbase_device *kbdev)
++static int rk_pm_disable_regulator_mask(struct kbase_device *kbdev,
++				       unsigned long mask)
+ {
++	struct rk_context *platform = get_rk_context(kbdev);
+ 	int ret = 0;
+ 	unsigned int i;
+ 
+-	for (i = 0; i < kbdev->nr_regulators; i++) {
+-		struct regulator *regulator = kbdev->regulators[i];
+-		if (!regulator) {
+-			W("no mali regulator control, no need to enable.");
+-			goto EXIT;
+-		}
+-
+-		D("to enable regulator.");
+-		ret = regulator_enable(regulator);
+-		if (ret) {
+-			E("fail to enable regulator, ret : %d.", ret);
+-			while (i > 0)
+-				regulator_disable(kbdev->regulators[--i]);
+-			return ret;
+-		}
++	if (kbdev->nr_regulators > BASE_MAX_NR_CLOCKS_REGULATORS)
++		return -EINVAL;
++	for (i = kbdev->nr_regulators; i > 0; --i) {
++		unsigned int at = i - 1;
++		unsigned long bit = BIT(at);
++		int err;
++
++		if (!(platform->regulator_owned_mask & mask & bit))
++			continue;
++		err = kbdev->regulators[at] ?
++			regulator_disable(kbdev->regulators[at]) : -ENODEV;
++		if (!err)
++			platform->regulator_owned_mask &= ~bit;
++		else if (!ret)
++			ret = err;
+ 	}
+-
+-EXIT:
++	platform->is_regulator_on = !!platform->regulator_owned_mask;
++	if (ret)
++		platform->regulator_error = ret;
++	else if (!platform->regulator_owned_mask)
++		platform->regulator_error = 0;
+ 	return ret;
+ }
+ 
+-static void rk_pm_disable_regulator(struct kbase_device *kbdev)
++static int rk_pm_disable_regulator(struct kbase_device *kbdev)
+ {
+-	unsigned int i;
++	return rk_pm_disable_regulator_mask(kbdev,
++		get_rk_context(kbdev)->regulator_owned_mask);
++}
+ 
++static int rk_pm_enable_regulator(struct kbase_device *kbdev,
++				  unsigned long *acquired)
++{
++	struct rk_context *platform = get_rk_context(kbdev);
++	unsigned int i;
++	int ret;
++
++	*acquired = 0;
++	if (kbdev->nr_regulators > BASE_MAX_NR_CLOCKS_REGULATORS)
++		return -EINVAL;
++	if (platform->regulator_error) {
++		ret = rk_pm_disable_regulator(kbdev);
++		if (ret)
++			return ret;
++	}
+ 	for (i = 0; i < kbdev->nr_regulators; i++) {
+ 		struct regulator *regulator = kbdev->regulators[i];
+ 
+-		if (!regulator) {
+-			W("no mali regulator control, no need to disable.");
+-			return;
++		if (platform->regulator_owned_mask & BIT(i))
++			continue;
++		ret = regulator ? regulator_enable(regulator) : -ENODEV;
++		if (ret) {
++			rk_pm_disable_regulator_mask(kbdev, *acquired);
++			*acquired = 0;
++			return ret;
+ 		}
+-
+-		D("to disable regulator.");
+-		regulator_disable(regulator);
++		platform->regulator_owned_mask |= BIT(i);
++		*acquired |= BIT(i);
+ 	}
++	platform->is_regulator_on = !!platform->regulator_owned_mask;
++	return 0;
+ }
+ #endif
+ 
+@@ -762,6 +792,7 @@ int kbase_platform_rk_init_opp_table(struct kbase_device *kbdev)
+ int kbase_platform_rk_enable_regulator(struct kbase_device *kbdev)
+ {
+ 	struct rk_context *platform = get_rk_context(kbdev);
++	unsigned long acquired = 0;
+ 	int err = 0;
+ 
+ 	if (!platform)
+@@ -772,16 +803,7 @@ int kbase_platform_rk_enable_regulator(struct kbase_device *kbdev)
+ 	if (platform->is_powered)
+ 		rk_pm_power_off_locked(kbdev, platform);
+ 
+-	if (!platform->is_regulator_on) {
+-		err = rk_pm_enable_regulator(kbdev);
+-		if (err) {
+-			E("fail to enable regulator, err : %d.", err);
+-			goto out;
+-		}
+-		platform->is_regulator_on = true;
+-	}
+-
+-out:
++	err = rk_pm_enable_regulator(kbdev, &acquired);
+ 	mutex_unlock(&platform->lock);
+ 	return err;
+ }
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
+@@ -70,6 +70,10 @@ struct rk_context {
+ 	atomic_t monitor_users;
+ 	struct monitor_dev_profile *monitor_profile;
+ 	bool monitor_checked;
++
++	/* Per-consumer enables; failed returns remain owned until retried. */
++	unsigned long regulator_owned_mask;
++	int regulator_error;
+ };
+ 
+ struct kbase_rk_monitor_guard {

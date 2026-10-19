@@ -1,0 +1,45 @@
+--- a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+@@ -4545,7 +4545,10 @@
+ 	}
+ 	if (err == -EPROBE_DEFER) {
+-		while (i > 0)
++		while (i > 0) {
+ 			regulator_put(kbdev->regulators[--i]);
++			kbdev->regulators[i] = NULL;
++		}
++		kbdev->nr_regulators = 0;
+ 		return err;
+ 	}
+ 
+@@ -4586,13 +4589,15 @@
+ 				"Failed to prepare and enable clock (%d)\n",
+ 				err);
+ 			clk_put(kbdev->clocks[i]);
++			kbdev->clocks[i] = NULL;
+ 			break;
+ 		}
+ 	}
+ 	if (err == -EPROBE_DEFER) {
+ 		while (i > 0) {
+-			clk_disable_unprepare(kbdev->clocks[--i]);
++			clk_unprepare(kbdev->clocks[--i]);
+ 			clk_put(kbdev->clocks[i]);
++			kbdev->clocks[i] = NULL;
+ 		}
+ 		goto clocks_probe_defer;
+ 	}
+@@ -4657,8 +4662,12 @@
+ clocks_probe_defer:
++	kbdev->nr_clocks = 0;
+ #if defined(CONFIG_REGULATOR)
+-	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++)
++	for (i = 0; i < kbdev->nr_regulators; i++) {
+ 		regulator_put(kbdev->regulators[i]);
++		kbdev->regulators[i] = NULL;
++	}
++	kbdev->nr_regulators = 0;
+ #endif
+ 	return err;
+ #endif /* CONFIG_OF */
+ }

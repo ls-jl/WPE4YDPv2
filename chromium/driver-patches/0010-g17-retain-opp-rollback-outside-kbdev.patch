@@ -1,0 +1,161 @@
+diff --git a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+index 98c85b2..01a9752 100644
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+@@ -150,11 +150,19 @@ static int kbase_devfreq_set_opp_rate(struct kbase_device *kbdev,
+ 	if (!smp_load_acquire(&state->initialized))
+ 		return -EINVAL;
+ 	mutex_lock(&state->lock);
+-	if (state->closing || state->retained_count || !try_module_get(THIS_MODULE)) {
++	if (state->closing || state->retained_count || kbase_opp_quarantine_active() ||
++	    !try_module_get(THIS_MODULE)) {
+ 		ret = -ENODEV;
+ 		goto unlock;
+ 	}
+ 	release_module = true;
++	if (!state->quarantine) {
++		state->quarantine = kzalloc(sizeof(*state->quarantine), GFP_KERNEL);
++		if (!state->quarantine) {
++			ret = -ENOMEM;
++			goto unlock;
++		}
++	}
+ 	state->transition = &transition;
+ 	WRITE_ONCE(state->owner, current);
+ 	ret = dev_pm_opp_set_rate(kbdev->dev, rate);
+diff --git a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h
+index 123c58c..d3e8d8d 100644
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h
+@@ -27,6 +27,10 @@ int kbase_devfreq_init(struct kbase_device *kbdev);
+ void kbase_devfreq_term(struct kbase_device *kbdev);
+ int kbase_devfreq_opp_helper(struct dev_pm_set_opp_data *data);
+ 
++#if MALI_OPP_REFERENCE_TRACKING
++bool kbase_opp_quarantine_active(void);
++#endif
++
+ /**
+  * kbase_devfreq_force_freq - Set GPU frequency on L2 power on/off.
+  * @kbdev:      Device pointer
+diff --git a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+index 1958180..fcb2972 100644
+--- a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+@@ -4494,6 +4494,48 @@ void kbase_device_pm_term(struct kbase_device *kbdev)
+ #endif
+ }
+ 
++#if MALI_OPP_REFERENCE_TRACKING
++static LIST_HEAD(kbase_opp_quarantined);
++static DEFINE_MUTEX(kbase_opp_quarantine_lock);
++
++bool kbase_opp_quarantine_active(void)
++{
++	bool active;
++
++	mutex_lock(&kbase_opp_quarantine_lock);
++	active = !list_empty(&kbase_opp_quarantined);
++	mutex_unlock(&kbase_opp_quarantine_lock);
++	return active;
++}
++
++static void kbase_opp_quarantine_failed(struct kbase_device *kbdev,
++				      struct kbase_opp_ref_state *state,
++				      struct opp_table *table)
++{
++	struct kbase_opp_quarantine *hold = state->quarantine;
++	unsigned int i;
++
++	/* Storage and the checked module guard precede every enable attempt. */
++	WARN_ON_ONCE(!hold || !state->module_pinned);
++	hold->dev = get_device(kbdev->dev);
++	hold->table = table;
++	hold->count = state->retained_count;
++	hold->module_pinned = state->module_pinned;
++	for (i = 0; i < state->retained_count; ++i) {
++		hold->retained[i] = state->retained[i];
++		state->retained[i] = NULL;
++	}
++	state->retained_count = 0;
++	state->module_pinned = false;
++	state->quarantine = NULL;
++	kbdev->opp_table = NULL;
++	mutex_lock(&kbase_opp_quarantine_lock);
++	list_add_tail(&hold->node, &kbase_opp_quarantined);
++	mutex_unlock(&kbase_opp_quarantine_lock);
++	dev_err(kbdev->dev, "OPP rollback retained independently until reboot\n");
++}
++#endif
++
+ int power_control_init(struct kbase_device *kbdev)
+ {
+ #ifndef CONFIG_OF
+@@ -4521,6 +4563,8 @@ int power_control_init(struct kbase_device *kbdev)
+ 	pdev = to_platform_device(kbdev->dev);
+ 
+ #if MALI_OPP_REFERENCE_TRACKING
++	if (kbase_opp_quarantine_active())
++		return -EBUSY;
+ 	mutex_init(&kbdev->opp_ref_state.lock);
+ 	smp_store_release(&kbdev->opp_ref_state.initialized, true);
+ #endif
+@@ -4717,12 +4761,7 @@ void power_control_term(struct kbase_device *kbdev)
+ 				state->helper_unregistered = true;
+ 		}
+ 		if (state && state->retained_count) {
+-			/* Leave no callback into a freed kbdev; retain failed resources. */
+-			if (!state->device_pinned) {
+-				get_device(kbdev->dev);
+-				state->device_pinned = true;
+-			}
+-			dev_err(kbdev->dev, "OPP regulator rollback remains quarantined\n");
++			kbase_opp_quarantine_failed(kbdev, state, table);
+ 		} else
+ #else
+ 		dev_pm_opp_unregister_set_opp_helper(table);
+@@ -4766,6 +4805,8 @@ void power_control_term(struct kbase_device *kbdev)
+ 				release_module = true;
+ 			}
+ 		}
++		kfree(state->quarantine);
++		state->quarantine = NULL;
+ 		mutex_unlock(&state->lock);
+ 	}
+ 	if (release_device)
+diff --git a/drivers/gpu/arm/bifrost/mali_kbase_defs.h b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+index bea240a..219846d 100755
+--- a/drivers/gpu/arm/bifrost/mali_kbase_defs.h
++++ b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+@@ -50,6 +50,7 @@
+ #include <linux/mempool.h>
+ #include <linux/slab.h>
+ #include <linux/file.h>
++#include <linux/list.h>
+ #include <linux/sizes.h>
+ 
+ 
+@@ -678,6 +679,14 @@ struct kbase_mem_migrate {
+ 	(LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0))
+ #define MALI_OPP_REFERENCE_TRACKING 1
+ struct kbase_opp_transition;
++struct kbase_opp_quarantine {
++	struct list_head node;
++	struct device *dev;
++	struct opp_table *table;
++	struct regulator *retained[BASE_MAX_NR_CLOCKS_REGULATORS];
++	unsigned int count;
++	bool module_pinned;
++};
+ struct kbase_opp_ref_state {
+ 	struct mutex lock;
+ 	struct kbase_opp_transition *transition;
+@@ -690,6 +699,8 @@ struct kbase_opp_ref_state {
+ 	bool device_pinned;
+ 	bool helper_unregistered;
+ 	bool initialized;
++	/* Reserved before the first IO; persistent rollback can outlive kbdev. */
++	struct kbase_opp_quarantine *quarantine;
+ };
+ #else
+ #define MALI_OPP_REFERENCE_TRACKING 0

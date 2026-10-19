@@ -1,0 +1,217 @@
+diff --git a/drivers/soc/rockchip/rockchip_opp_select.c b/drivers/soc/rockchip/rockchip_opp_select.c
+index ec8af60..5020155 100644
+--- a/drivers/soc/rockchip/rockchip_opp_select.c
++++ b/drivers/soc/rockchip/rockchip_opp_select.c
+@@ -766,51 +766,65 @@ out:
+ 	return ret;
+ }
+ 
+-static int rockchip_init_pvtpll_info(struct rockchip_opp_info *info)
++static int rockchip_init_pvtpll_info(struct rockchip_opp_info *info,
++				   struct opp_table **snapshot_table)
+ {
+ 	struct opp_table *opp_table;
+ 	struct dev_pm_opp *opp;
+-	int i = 0, max_count, ret;
++	struct pvtpll_opp_table *snapshot;
++	int i = 0, max_count = 0, ret;
+ 
++	*snapshot_table = NULL;
+ 	ret = rockchip_pvtpll_parse_dt(info);
+ 	if (ret)
+ 		return ret;
+ 
+-	max_count = dev_pm_opp_get_opp_count(info->dev);
+-	if (max_count <= 0)
+-		return max_count ? max_count : -ENODATA;
+-
+-	info->opp_table = kcalloc(max_count, sizeof(*info->opp_table), GFP_KERNEL);
+-	if (!info->opp_table)
+-		return -ENOMEM;
+-
+ 	opp_table = dev_pm_opp_get_opp_table(info->dev);
+-	if (!opp_table) {
+-		kfree(info->opp_table);
+-		info->opp_table = NULL;
+-		return -ENOMEM;
+-	}
++	if (IS_ERR(opp_table))
++		return PTR_ERR(opp_table);
+ 
+ 	mutex_lock(&opp_table->lock);
++	list_for_each_entry(opp, &opp_table->opp_list, node)
++		if (opp->available)
++			++max_count;
++	if (!max_count) {
++		ret = -ENODATA;
++		goto unlock_put;
++	}
++	snapshot = devm_kcalloc(info->dev, max_count, sizeof(*snapshot), GFP_KERNEL);
++	if (!snapshot) {
++		ret = -ENOMEM;
++		goto unlock_put;
++	}
+ 	list_for_each_entry(opp, &opp_table->opp_list, node) {
+ 		if (!opp->available)
+ 			continue;
+-
+-		info->opp_table[i].u_volt = opp->supplies[0].u_volt;
+-		info->opp_table[i].u_volt_min = opp->supplies[0].u_volt_min;
+-		info->opp_table[i].u_volt_max = opp->supplies[0].u_volt_max;
++		if (!opp->supplies) {
++			devm_kfree(info->dev, snapshot);
++			ret = -EINVAL;
++			goto unlock_put;
++		}
++		snapshot[i].u_volt = opp->supplies[0].u_volt;
++		snapshot[i].u_volt_min = opp->supplies[0].u_volt_min;
++		snapshot[i].u_volt_max = opp->supplies[0].u_volt_max;
+ 		if (opp_table->regulator_count > 1) {
+-			info->opp_table[i].u_volt_mem = opp->supplies[1].u_volt;
+-			info->opp_table[i].u_volt_mem_min = opp->supplies[1].u_volt_min;
+-			info->opp_table[i].u_volt_mem_max = opp->supplies[1].u_volt_max;
++			snapshot[i].u_volt_mem = opp->supplies[1].u_volt;
++			snapshot[i].u_volt_mem_min = opp->supplies[1].u_volt_min;
++			snapshot[i].u_volt_mem_max = opp->supplies[1].u_volt_max;
+ 		}
+-		info->opp_table[i++].rate = opp->rate;
++		snapshot[i++].rate = opp->rate;
+ 	}
++	/* Callers serialize calibration; retain at most one device-owned snapshot. */
++	devm_kfree(info->dev, info->opp_table);
++	info->opp_table = snapshot;
+ 	mutex_unlock(&opp_table->lock);
++	*snapshot_table = opp_table;
++	return max_count;
+ 
++unlock_put:
++	mutex_unlock(&opp_table->lock);
+ 	dev_pm_opp_put_opp_table(opp_table);
+-
+-	return 0;
++	return ret;
+ }
+ 
+ static int rockchip_pvtpll_set_volt(struct device *dev, struct regulator *reg,
+@@ -848,24 +862,16 @@ void rockchip_pvtpll_calibrate_opp(struct rockchip_opp_info *info)
+ 	unsigned long volt = 0, volt_mem = 0;
+ 	unsigned long volt_min, volt_max, volt_mem_min, volt_mem_max;
+ 	unsigned long rate, pvtpll_rate, old_rate, cur_rate, delta0, delta1;
+-	int i = 0, max_count, step, cur_step, ret;
++	int i = 0, max_count, step, cur_step;
+ 
+ 	if (!info || !info->grf)
+ 		return;
+ 
+ 	dev_dbg(info->dev, "calibrating opp ...\n");
+-	ret = rockchip_init_pvtpll_info(info);
+-	if (ret)
+-		return;
+-
+-	max_count = dev_pm_opp_get_opp_count(info->dev);
++	max_count = rockchip_init_pvtpll_info(info, &opp_table);
+ 	if (max_count <= 0)
+ 		return;
+ 
+-	opp_table = dev_pm_opp_get_opp_table(info->dev);
+-	if (!opp_table)
+-		return;
+-
+ 	if ((!opp_table->regulators) || IS_ERR(opp_table->clk))
+ 		goto out_put;
+ 
+@@ -883,7 +889,7 @@ void rockchip_pvtpll_calibrate_opp(struct rockchip_opp_info *info)
+ 	cur_rate = old_rate;
+ 
+ 	step = regulator_get_linear_step(reg);
+-	if (!step || info->pvtpll_volt_step > step)
++	if (!step || info->pvtpll_volt_step > (unsigned int)step)
+ 		step = info->pvtpll_volt_step;
+ 
+ 	if (old_rate > info->pvtpll_min_rate * 1000) {
+@@ -957,16 +963,19 @@ void rockchip_pvtpll_calibrate_opp(struct rockchip_opp_info *info)
+ 		}
+ 	}
+ 
+-	i = 0;
+ 	mutex_lock(&opp_table->lock);
+ 	list_for_each_entry(opp, &opp_table->opp_list, node) {
+-		if (!opp->available)
++		if (!opp->available || !opp->supplies)
+ 			continue;
+-
+-		opp->supplies[0].u_volt = info->opp_table[i].u_volt;
+-		if (opp_table->regulator_count > 1)
+-			opp->supplies[1].u_volt = info->opp_table[i].u_volt_mem;
+-		i++;
++		/* New/reordered entries are not indexes into the captured snapshot. */
++		for (i = 0; i < max_count; ++i) {
++			if (opp->rate != info->opp_table[i].rate)
++				continue;
++			opp->supplies[0].u_volt = info->opp_table[i].u_volt;
++			if (opp_table->regulator_count > 1)
++				opp->supplies[1].u_volt = info->opp_table[i].u_volt_mem;
++			break;
++		}
+ 	}
+ 	mutex_unlock(&opp_table->lock);
+ 	dev_info(info->dev, "opp calibration done\n");
+@@ -1004,15 +1013,17 @@ void rockchip_pvtpll_add_length(struct rockchip_opp_info *info)
+ 	}
+ 
+ 	if (of_property_read_u32(np, "rockchip,pvtpll-len-min-rate", &min_rate))
+-		return;
++		goto put_node;
+ 	if (of_property_read_u32(np, "rockchip,pvtpll-len-max-rate", &max_rate))
+-		return;
++		goto put_node;
+ 	if (of_property_read_u32(np, "rockchip,pvtpll-len-margin", &margin))
+-		return;
++		goto put_node;
+ 
+ 	opp_table = dev_pm_opp_get_opp_table(info->dev);
+-	if (!opp_table)
+-		return;
++	if (IS_ERR(opp_table))
++		goto put_node;
++	if (IS_ERR_OR_NULL(opp_table->clk))
++		goto put_table;
+ 	old_rate = clk_get_rate(opp_table->clk);
+ 	opp_flag = OPP_ADD_LENGTH | ((margin & OPP_LENGTH_MASK) << OPP_LENGTH_SHIFT);
+ 
+@@ -1032,7 +1043,10 @@ void rockchip_pvtpll_add_length(struct rockchip_opp_info *info)
+ 
+ 	clk_set_rate(opp_table->clk, old_rate);
+ 
++put_table:
+ 	dev_pm_opp_put_opp_table(opp_table);
++put_node:
++	of_node_put(np);
+ }
+ EXPORT_SYMBOL(rockchip_pvtpll_add_length);
+ 
+@@ -1364,12 +1378,12 @@ static int rockchip_adjust_opp_by_irdrop(struct device *dev,
+ 	bool reach_max_volt = false;
+ 
+ 	of_property_read_u32_index(np, "rockchip,max-volt", 0, &max_volt);
+-	of_property_read_u32_index(np, "rockchip,evb-irdrop", 0, &evb_irdrop);
++	of_property_read_u32_index(np, "rockchip,evb-irdrop", 0, (u32 *)&evb_irdrop);
+ 	rockchip_get_sel_table(np, "rockchip,board-irdrop", &irdrop_table);
+ 
+ 	opp_table = dev_pm_opp_get_opp_table(dev);
+-	if (!opp_table) {
+-		ret =  -ENOMEM;
++	if (IS_ERR(opp_table)) {
++		ret = PTR_ERR(opp_table);
+ 		goto out;
+ 	}
+ 
+@@ -1474,7 +1488,7 @@ static void rockchip_adjust_opp_by_otp(struct device *dev,
+ 		 opp_info.min_freq, opp_info.max_freq, opp_info.volt);
+ 
+ 	opp_table = dev_pm_opp_get_opp_table(dev);
+-	if (!opp_table)
++	if (IS_ERR(opp_table))
+ 		return;
+ 
+ 	mutex_lock(&opp_table->lock);

@@ -1,0 +1,533 @@
+diff --git a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+index 01a9752..f25c3ec 100644
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+@@ -150,19 +150,12 @@ static int kbase_devfreq_set_opp_rate(struct kbase_device *kbdev,
+ 	if (!smp_load_acquire(&state->initialized))
+ 		return -EINVAL;
+ 	mutex_lock(&state->lock);
+-	if (state->closing || state->retained_count || kbase_opp_quarantine_active() ||
++	if (state->closing || state->retained_count ||
+ 	    !try_module_get(THIS_MODULE)) {
+ 		ret = -ENODEV;
+ 		goto unlock;
+ 	}
+ 	release_module = true;
+-	if (!state->quarantine) {
+-		state->quarantine = kzalloc(sizeof(*state->quarantine), GFP_KERNEL);
+-		if (!state->quarantine) {
+-			ret = -ENOMEM;
+-			goto unlock;
+-		}
+-	}
+ 	state->transition = &transition;
+ 	WRITE_ONCE(state->owner, current);
+ 	ret = dev_pm_opp_set_rate(kbdev->dev, rate);
+@@ -180,11 +173,8 @@ static int kbase_devfreq_set_opp_rate(struct kbase_device *kbdev,
+ 
+ 		if (regulator_disable(regulator)) {
+ 			state->retained[state->retained_count++] = regulator;
+-			if (!state->module_pinned) {
+-				state->module_pinned = true;
+-				release_module = false;
+-			}
+-			dev_err(kbdev->dev, "OPP rollback failed; module retained\n");
++			/* The core already owns the group; finish receives this ledger. */
++			dev_err(kbdev->dev, "OPP rollback retained for managed close\n");
+ 		}
+ 	}
+ unlock:
+diff --git a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h
+index d3e8d8d..123c58c 100644
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.h
+@@ -27,10 +27,6 @@ int kbase_devfreq_init(struct kbase_device *kbdev);
+ void kbase_devfreq_term(struct kbase_device *kbdev);
+ int kbase_devfreq_opp_helper(struct dev_pm_set_opp_data *data);
+ 
+-#if MALI_OPP_REFERENCE_TRACKING
+-bool kbase_opp_quarantine_active(void);
+-#endif
+-
+ /**
+  * kbase_devfreq_force_freq - Set GPU frequency on L2 power on/off.
+  * @kbdev:      Device pointer
+diff --git a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+index fcb2972..3eb6096 100644
+--- a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+@@ -4494,326 +4494,143 @@ void kbase_device_pm_term(struct kbase_device *kbdev)
+ #endif
+ }
+ 
+-#if MALI_OPP_REFERENCE_TRACKING
+-static LIST_HEAD(kbase_opp_quarantined);
+-static DEFINE_MUTEX(kbase_opp_quarantine_lock);
+-
+-bool kbase_opp_quarantine_active(void)
+-{
+-	bool active;
+-
+-	mutex_lock(&kbase_opp_quarantine_lock);
+-	active = !list_empty(&kbase_opp_quarantined);
+-	mutex_unlock(&kbase_opp_quarantine_lock);
+-	return active;
+-}
+-
+-static void kbase_opp_quarantine_failed(struct kbase_device *kbdev,
+-				      struct kbase_opp_ref_state *state,
+-				      struct opp_table *table)
+-{
+-	struct kbase_opp_quarantine *hold = state->quarantine;
+-	unsigned int i;
+-
+-	/* Storage and the checked module guard precede every enable attempt. */
+-	WARN_ON_ONCE(!hold || !state->module_pinned);
+-	hold->dev = get_device(kbdev->dev);
+-	hold->table = table;
+-	hold->count = state->retained_count;
+-	hold->module_pinned = state->module_pinned;
+-	for (i = 0; i < state->retained_count; ++i) {
+-		hold->retained[i] = state->retained[i];
+-		state->retained[i] = NULL;
+-	}
+-	state->retained_count = 0;
+-	state->module_pinned = false;
+-	state->quarantine = NULL;
+-	kbdev->opp_table = NULL;
+-	mutex_lock(&kbase_opp_quarantine_lock);
+-	list_add_tail(&hold->node, &kbase_opp_quarantined);
+-	mutex_unlock(&kbase_opp_quarantine_lock);
+-	dev_err(kbdev->dev, "OPP rollback retained independently until reboot\n");
+-}
+-#endif
+-
+ int power_control_init(struct kbase_device *kbdev)
+ {
+-#ifndef CONFIG_OF
+-	/* Power control initialization requires at least the capability to get
+-	 * regulators and clocks from the device tree, as well as parsing
+-	 * arrays of unsigned integer values.
+-	 *
+-	 * The whole initialization process shall simply be skipped if the
+-	 * minimum capability is not available.
+-	 */
+-	return 0;
+-#else
+-	struct platform_device *pdev;
+-	int err = 0;
++	static const char * const regulator_names[] = { "mali", "mem" };
++	struct kbase_opp_ref_state *state;
+ 	unsigned int i;
+-#if defined(CONFIG_REGULATOR)
+-	static const char * const regulator_names[] = {
+-		"mali", "mem"
+-	};
+-#endif /* CONFIG_REGULATOR */
++	int err;
+ 
+-	if (!kbdev)
++	if (!kbdev || IS_ERR_OR_NULL(kbdev->dev))
+ 		return -ENODEV;
+-
+-	pdev = to_platform_device(kbdev->dev);
+-
+-#if MALI_OPP_REFERENCE_TRACKING
+-	if (kbase_opp_quarantine_active())
+-		return -EBUSY;
+-	mutex_init(&kbdev->opp_ref_state.lock);
+-	smp_store_release(&kbdev->opp_ref_state.initialized, true);
+-#endif
+-
+-#if defined(CONFIG_REGULATOR)
+-	/* Since the error code EPROBE_DEFER causes the entire probing
+-	 * procedure to be restarted from scratch at a later time,
+-	 * all regulators will be released before returning.
+-	 *
+-	 * Any other error is ignored and the driver will continue
+-	 * operating with a partial initialization of regulators.
+-	 */
+-	for (i = 0; i < ARRAY_SIZE(regulator_names); i++) {
+-		kbdev->regulators[i] = regulator_get_optional(kbdev->dev,
+-			regulator_names[i]);
+-		if (IS_ERR(kbdev->regulators[i])) {
+-			err = PTR_ERR(kbdev->regulators[i]);
+-			kbdev->regulators[i] = NULL;
+-			break;
+-		}
+-	}
+-	if (err == -EPROBE_DEFER) {
+-		while (i > 0) {
+-			regulator_put(kbdev->regulators[--i]);
+-			kbdev->regulators[i] = NULL;
+-		}
+-		kbdev->nr_regulators = 0;
++	state = &kbdev->opp_ref_state;
++	if (smp_load_acquire(&state->initialized))
++		return -EALREADY;
++	err = dev_pm_opp_check_regulator_release(kbdev->dev);
++	if (err)
+ 		return err;
++	mutex_init(&state->lock);
++	mutex_init(&state->close_lock);
++	smp_store_release(&state->initialized, true);
++
++	for (i = 0; i < ARRAY_SIZE(regulator_names); ++i) {
++		struct regulator *reg = regulator_get_optional(kbdev->dev, regulator_names[i]);
++
++		if (IS_ERR(reg)) {
++			err = PTR_ERR(reg);
++			if (err == -ENODEV || err == -ENOENT)
++				break;
++			goto failed;
++		}
++		kbdev->regulators[i] = reg;
++		++kbdev->nr_regulators;
+ 	}
+-
+-	kbdev->nr_regulators = i;
+-	dev_dbg(&pdev->dev, "Regulators probed: %u\n", kbdev->nr_regulators);
+-#endif
+-
+-	/* Having more clocks than regulators is acceptable, while the
+-	 * opposite shall not happen.
+-	 *
+-	 * Since the error code EPROBE_DEFER causes the entire probing
+-	 * procedure to be restarted from scratch at a later time,
+-	 * all clocks and regulators will be released before returning.
+-	 *
+-	 * Any other error is ignored and the driver will continue
+-	 * operating with a partial initialization of clocks.
+-	 */
+-	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++) {
+-		kbdev->clocks[i] = of_clk_get(kbdev->dev->of_node, i);
+-		if (IS_ERR(kbdev->clocks[i])) {
+-			err = PTR_ERR(kbdev->clocks[i]);
+-			kbdev->clocks[i] = NULL;
+-			break;
++	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; ++i) {
++		struct clk *clk = of_clk_get(kbdev->dev->of_node, i);
++
++		if (IS_ERR(clk)) {
++			err = PTR_ERR(clk);
++			if (err == -ENODEV || err == -ENOENT)
++				break;
++			goto failed;
+ 		}
+-
+-		err = clk_prepare(kbdev->clocks[i]);
++		err = clk_prepare(clk);
+ 		if (err) {
+-			dev_err(kbdev->dev,
+-				"Failed to prepare and enable clock (%d)\n",
+-				err);
+-			clk_put(kbdev->clocks[i]);
+-			kbdev->clocks[i] = NULL;
+-			break;
++			clk_put(clk);
++			goto failed;
+ 		}
++		kbdev->clocks[i] = clk;
++		++kbdev->nr_clocks;
+ 	}
+-	if (err == -EPROBE_DEFER) {
+-		while (i > 0) {
+-			clk_unprepare(kbdev->clocks[--i]);
+-			clk_put(kbdev->clocks[i]);
+-			kbdev->clocks[i] = NULL;
+-		}
+-		goto clocks_probe_defer;
+-	}
+-
+-	kbdev->nr_clocks = i;
+-	dev_dbg(&pdev->dev, "Clocks probed: %u\n", kbdev->nr_clocks);
+-
+-	/* Any error in parsing the OPP table from the device file
+-	 * shall be ignored. The fact that the table may be absent or wrong
+-	 * on the device tree of the platform shouldn't prevent the driver
+-	 * from completing its initialization.
+-	 */
+-#if defined(CONFIG_PM_OPP)
+-#if defined(CONFIG_REGULATOR)
+-#if (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE)
+-	if (kbdev->nr_regulators > 0) {
+-		kbdev->token = dev_pm_opp_set_regulators(kbdev->dev, regulator_names);
+-
+-		if (kbdev->token < 0) {
+-			err = kbdev->token;
+-			goto regulators_probe_defer;
+-		}
+-
++	if (kbdev->nr_regulators) {
++		/* The core owns both references. This pointer is only borrowed. */
++		kbdev->opp_table = dev_pm_opp_manage_regulators(kbdev->dev,
++				regulator_names, kbdev->nr_regulators,
++				kbase_devfreq_opp_helper, &state->cookie);
++	} else {
++		/* No custom supply helper: retain only our ordinary table reference. */
++		kbdev->opp_table = dev_pm_opp_get_opp_table(kbdev->dev);
++		if (!IS_ERR(kbdev->opp_table))
++			state->clock_table_owned = true;
+ 	}
+-#elif (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE)
+-	if (kbdev->nr_regulators > 0) {
+-		struct opp_table *helper;
+-
+-		kbdev->opp_table =
+-			dev_pm_opp_set_regulators(kbdev->dev, regulator_names,
+-						  kbdev->nr_regulators);
+-		if (IS_ERR(kbdev->opp_table)) {
+-			dev_err(kbdev->dev, "Failed to set regulators\n");
+-			return 0;
+-		}
+-		helper =
+-			dev_pm_opp_register_set_opp_helper(kbdev->dev,
+-							   kbase_devfreq_opp_helper);
+-		if (IS_ERR(helper)) {
+-			dev_pm_opp_put_regulators(kbdev->opp_table);
+-			kbdev->opp_table = NULL;
+-			dev_err(kbdev->dev, "Failed to set opp helper\n");
+-			return 0;
+-		}
++	if (IS_ERR(kbdev->opp_table)) {
++		err = PTR_ERR(kbdev->opp_table);
++		kbdev->opp_table = NULL;
++		goto failed;
+ 	}
+-#endif /* (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE) */
+-#endif /* CONFIG_REGULATOR */
+-
+ #ifdef CONFIG_ARCH_ROCKCHIP
+-       err = kbase_platform_rk_init_opp_table(kbdev);
+-       if (err)
+-               dev_err(kbdev->dev, "Failed to init_opp_table (%d)\n", err);
++	err = kbase_platform_rk_init_opp_table(kbdev);
+ #else
+ 	err = dev_pm_opp_of_add_table(kbdev->dev);
+-	CSTD_UNUSED(err);
+ #endif
+-#endif /* CONFIG_PM_OPP */
++	if (err)
++		goto failed;
++	state->static_table_added = true;
+ 	return 0;
+ 
+-#if defined(CONFIG_PM_OPP) &&                                                                      \
+-	((KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE) && defined(CONFIG_REGULATOR))
+-	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++) {
+-		if (kbdev->clocks[i]) {
+-			if (__clk_is_enabled(kbdev->clocks[i]))
+-				clk_disable_unprepare(kbdev->clocks[i]);
+-			clk_put(kbdev->clocks[i]);
+-			kbdev->clocks[i] = NULL;
+-		} else
+-			break;
+-	}
+-#endif
+-
+-clocks_probe_defer:
+-	kbdev->nr_clocks = 0;
+-#if defined(CONFIG_REGULATOR)
+-	for (i = 0; i < kbdev->nr_regulators; i++) {
+-		regulator_put(kbdev->regulators[i]);
+-		kbdev->regulators[i] = NULL;
+-	}
+-	kbdev->nr_regulators = 0;
+-#endif
++failed:
++	/* A failed initializer is not followed by this stage's normal term. */
++	power_control_term(kbdev);
+ 	return err;
+-#endif /* CONFIG_OF */
+ }
+ 
+ void power_control_term(struct kbase_device *kbdev)
+ {
++	struct kbase_opp_ref_state *state;
+ 	unsigned int i;
+-#if MALI_OPP_REFERENCE_TRACKING
+-	struct kbase_opp_ref_state *state = kbdev->opp_ref_state.initialized ?
+-		&kbdev->opp_ref_state : NULL;
+-	struct device *dev = kbdev->dev;
+-	bool release_device = false;
+-	bool release_module = false;
+-
+-	if (state) {
+-		mutex_lock(&state->lock);
+-		state->closing = true;
+-		for (i = state->retained_count; i > 0; --i) {
+-			unsigned int at = i - 1;
+-
+-			if (!regulator_disable(state->retained[at])) {
+-				--state->retained_count;
+-				state->retained[at] = state->retained[state->retained_count];
+-				state->retained[state->retained_count] = NULL;
+-			}
+-		}
++
++	if (!kbdev)
++		return;
++	state = &kbdev->opp_ref_state;
++	if (!smp_load_acquire(&state->initialized))
++		return;
++	mutex_lock(&state->close_lock);
++	mutex_lock(&state->lock);
++	if (state->closed) {
++		mutex_unlock(&state->lock);
++		mutex_unlock(&state->close_lock);
++		return;
+ 	}
+-#endif
++	state->closing = true;
++	mutex_unlock(&state->lock);
+ 
+-#if defined(CONFIG_PM_OPP)
+-	dev_pm_opp_of_remove_table(kbdev->dev);
+-#if defined(CONFIG_REGULATOR)
+-#if (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE)
+-	if (kbdev->token > -EPERM) {
+-		dev_pm_opp_unregister_set_opp_helper(kbdev->opp_table);
+-		dev_pm_opp_put_regulators(kbdev->token);
++	/* Remove notifiers may enter the broker: reject them without deadlocking. */
++	if (state->static_table_added) {
++		state->static_table_added = false;
++		dev_pm_opp_of_remove_table(kbdev->dev);
+ 	}
+-#elif (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE)
+-	if (!IS_ERR_OR_NULL(kbdev->opp_table)) {
+-		struct opp_table *table = kbdev->opp_table;
+-
+-#if MALI_OPP_REFERENCE_TRACKING
+-		if (!state || !state->helper_unregistered) {
+-			dev_pm_opp_unregister_set_opp_helper(table);
+-			if (state)
+-				state->helper_unregistered = true;
+-		}
+-		if (state && state->retained_count) {
+-			kbase_opp_quarantine_failed(kbdev, state, table);
+-		} else
+-#else
+-		dev_pm_opp_unregister_set_opp_helper(table);
+-#endif
+-		{
+-			kbdev->opp_table = NULL;
+-			dev_pm_opp_put_regulators(table);
+-		}
++	if (state->cookie) {
++		state->close_error = dev_pm_opp_finish_managed_regulators(state->cookie,
++				state->retained, state->retained_count);
++		state->cookie = 0;
++		if (state->close_error)
++			dev_err(kbdev->dev, "Managed OPP close retained resources: %d\n",
++				state->close_error);
++	} else if (state->clock_table_owned) {
++		dev_pm_opp_put_opp_table(kbdev->opp_table);
++		state->clock_table_owned = false;
+ 	}
+-#endif /* (KERNEL_VERSION(6, 0, 0) <= LINUX_VERSION_CODE) */
+-#endif /* CONFIG_REGULATOR */
+-#endif /* CONFIG_PM_OPP */
+-
+-	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++) {
++	kbdev->opp_table = NULL;
++	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; ++i) {
+ 		if (kbdev->clocks[i]) {
+ 			clk_unprepare(kbdev->clocks[i]);
+ 			clk_put(kbdev->clocks[i]);
+ 			kbdev->clocks[i] = NULL;
+-		} else
+-			break;
+-	}
+-
+-#if defined(CONFIG_OF) && defined(CONFIG_REGULATOR)
+-	for (i = 0; i < BASE_MAX_NR_CLOCKS_REGULATORS; i++) {
++		}
+ 		if (kbdev->regulators[i]) {
+ 			regulator_put(kbdev->regulators[i]);
+ 			kbdev->regulators[i] = NULL;
+ 		}
++		state->retained[i] = NULL;
+ 	}
+-#endif
+-#if MALI_OPP_REFERENCE_TRACKING
+-	if (state) {
+-		state->regulators_committed = false;
+-		if (!state->retained_count) {
+-			if (state->device_pinned) {
+-				state->device_pinned = false;
+-				release_device = true;
+-			}
+-			if (state->module_pinned) {
+-				state->module_pinned = false;
+-				release_module = true;
+-			}
+-		}
+-		kfree(state->quarantine);
+-		state->quarantine = NULL;
+-		mutex_unlock(&state->lock);
+-	}
+-	if (release_device)
+-		put_device(dev);
+-	if (release_module)
+-		module_put(THIS_MODULE);
+-#endif
++	kbdev->nr_clocks = 0;
++	kbdev->nr_regulators = 0;
++	mutex_lock(&state->lock);
++	state->retained_count = 0;
++	state->regulators_committed = false;
++	state->closed = true;
++	mutex_unlock(&state->lock);
++	mutex_unlock(&state->close_lock);
+ }
+ 
+ #if IS_ENABLED(CONFIG_DEBUG_FS)
+diff --git a/drivers/gpu/arm/bifrost/mali_kbase_defs.h b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+index 219846d..7bc65aa 100755
+--- a/drivers/gpu/arm/bifrost/mali_kbase_defs.h
++++ b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+@@ -678,32 +678,31 @@ struct kbase_mem_migrate {
+ 	defined(CONFIG_REGULATOR) && (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE) && \
+ 	(LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0))
+ #define MALI_OPP_REFERENCE_TRACKING 1
++#include <linux/pm_opp_safe.h>
++#if !defined(CONFIG_OF) || !defined(DEV_PM_OPP_MANAGED_REGULATOR_RELEASE) || \
++	DEV_PM_OPP_MANAGED_REGULATOR_RELEASE < 2
++#error "Managed G17 requires the matched OPP ownership API revision 2"
++#endif
+ struct kbase_opp_transition;
+-struct kbase_opp_quarantine {
+-	struct list_head node;
+-	struct device *dev;
+-	struct opp_table *table;
+-	struct regulator *retained[BASE_MAX_NR_CLOCKS_REGULATORS];
+-	unsigned int count;
+-	bool module_pinned;
+-};
+ struct kbase_opp_ref_state {
+ 	struct mutex lock;
++	struct mutex close_lock;
+ 	struct kbase_opp_transition *transition;
+ 	struct task_struct *owner;
+ 	struct regulator *retained[BASE_MAX_NR_CLOCKS_REGULATORS];
+ 	unsigned int retained_count;
+ 	bool regulators_committed;
+ 	bool closing;
+-	bool module_pinned;
+-	bool device_pinned;
+-	bool helper_unregistered;
++	bool closed;
+ 	bool initialized;
+-	/* Reserved before the first IO; persistent rollback can outlive kbdev. */
+-	struct kbase_opp_quarantine *quarantine;
++	bool static_table_added;
++	bool clock_table_owned;
++	u64 cookie;
++	int close_error;
+ };
+ #else
+ #define MALI_OPP_REFERENCE_TRACKING 0
++#error "Managed G17 requires OF, REGULATOR, PM_OPP and pre-6.0 DEVFREQ"
+ #endif
+ 
+ /**

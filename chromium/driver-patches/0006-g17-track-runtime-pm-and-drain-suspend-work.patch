@@ -1,0 +1,108 @@
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_config_rk.c
+@@ -89,28 +89,25 @@ static void kbase_platform_rk_remove_sysfs_files(struct device *dev);
+ 
+ /*---------------------------------------------------------------------------*/
+ 
+-static void rk_pm_power_off_delay_work(struct work_struct *work)
++static void rk_pm_power_off_locked(struct kbase_device *kbdev,
++				   struct rk_context *platform)
+ {
+-	struct rk_context *platform =
+-		container_of(to_delayed_work(work), struct rk_context, work);
+-	struct kbase_device *kbdev = platform->kbdev;
+-
+-	mutex_lock(&platform->lock);
+-
+ 	if (!platform->is_powered) {
+ 		if (platform->is_regulator_on && pm_runtime_suspended(kbdev->dev)) {
+ 			rk_pm_disable_regulator(kbdev);
+ 			platform->is_regulator_on = false;
+ 		}
+ 		D("mali_dev is already powered off.");
+-		mutex_unlock(&platform->lock);
+ 		return;
+ 	}
+ 
+ 	rockchip_monitor_volt_adjust_lock(kbdev->mdev_info);
+-	if (pm_runtime_enabled(kbdev->dev)) {
+-		D("to put_sync_suspend mali_dev.");
+-		pm_runtime_put_sync_suspend(kbdev->dev);
++	if (platform->pm_ref_held) {
++		platform->pm_ref_held = false;
++		if (pm_runtime_enabled(kbdev->dev))
++			pm_runtime_put_sync_suspend(kbdev->dev);
++		else
++			pm_runtime_put_noidle(kbdev->dev);
+ 	}
+ 	rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
+ 
+@@ -123,7 +120,15 @@ static void rk_pm_power_off_delay_work(struct work_struct *work)
+ 
+ 	platform->is_powered = false;
+ 	wake_unlock(&platform->wake_lock);
++}
++
++static void rk_pm_power_off_delay_work(struct work_struct *work)
++{
++	struct rk_context *platform =
++		container_of(to_delayed_work(work), struct rk_context, work);
+ 
++	mutex_lock(&platform->lock);
++	rk_pm_power_off_locked(platform->kbdev, platform);
+ 	mutex_unlock(&platform->lock);
+ }
+ 
+@@ -298,7 +303,11 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ 			D("chip has NOT been powered off, no need to re-init.");
+ 			ret = 0;
+ 		}
++	} else {
++		/* System sleep may disable runtime PM while power callbacks run. */
++		pm_runtime_get_noresume(kbdev->dev);
+ 	}
++	platform->pm_ref_held = true;
+ 	rockchip_monitor_volt_adjust_unlock(kbdev->mdev_info);
+ 
+ 	platform->is_powered = true;
+@@ -664,16 +673,26 @@ int kbase_platform_rk_enable_regulator(struct kbase_device *kbdev)
+ 	struct rk_context *platform = get_rk_context(kbdev);
+ 	int err = 0;
+ 
++	if (!platform)
++		return -ENODEV;
++	/* The system-suspend caller has already quiesced the common GPU core. */
++	cancel_delayed_work_sync(&platform->work);
++	mutex_lock(&platform->lock);
++	if (platform->is_powered)
++		rk_pm_power_off_locked(kbdev, platform);
++
+ 	if (!platform->is_regulator_on) {
+ 		err = rk_pm_enable_regulator(kbdev);
+ 		if (err) {
+ 			E("fail to enable regulator, err : %d.", err);
+-			return err;
++			goto out;
+ 		}
+ 		platform->is_regulator_on = true;
+ 	}
+ 
+-	return 0;
++out:
++	mutex_unlock(&platform->lock);
++	return err;
+ }
+ 
+ /*---------------------------------------------------------------------------*/
+--- a/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
++++ b/drivers/gpu/arm/bifrost/platform/rk/mali_kbase_rk.h
+@@ -53,6 +53,9 @@ struct rk_context {
+ 
+ 	/* to protect operations on 'is_powered' and clks, pd, vd of gpu. */
+ 	struct mutex lock;
++
++	/* Owned usage reference, independent of runtime PM's enable state. */
++	bool pm_ref_held;
+ };
+ 
+ /*---------------------------------------------------------------------------*/
