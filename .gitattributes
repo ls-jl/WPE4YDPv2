@@ -4,3 +4,6 @@
 *.amr filter=lfs diff=lfs merge=lfs -text
 assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1 filter=lfs diff=lfs merge=lfs -text
 assets/wpe-drm2-runtime.tar.gz filter=lfs diff=lfs merge=lfs -text
+# Preserve upstream license bytes used by pinned SHA256 checks.
+licenses/mali/END_USER_LICENCE_AGREEMENT.txt -text whitespace=cr-at-eol
+assets/wpe-runtime/share/licenses/mali/END_USER_LICENCE_AGREEMENT.txt -text whitespace=cr-at-eol

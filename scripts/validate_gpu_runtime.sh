@@ -21,7 +21,6 @@ gpu/mali/lib/libEGL.so.1
 gpu/mali/lib/libGLESv2.so.2
 gpu/mali/lib/libgbm.so.1
 gpu/mali/lib/libmali.so.1
-gpu/mali/lib/libmali_hook.so.1
 gpu/mali/lib/libwpe-mali-gbm-compat.so
 gpu/modules/5.10.160/x7_gpu_dt_enable.ko
 gpu/modules/5.10.160/bifrost_kbase.ko
@@ -51,7 +50,6 @@ for relative in \
     gpu/mali/lib/libGLESv2.so.2 \
     gpu/mali/lib/libgbm.so.1 \
     gpu/mali/lib/libmali.so.1 \
-    gpu/mali/lib/libmali_hook.so.1 \
     gpu/mali/lib/libwpe-mali-gbm-compat.so \
     libexec/wpe-gpu-probe; do
     description=$(file -b "$RUNTIME/$relative")
@@ -75,5 +73,6 @@ done
 
 [ -x "$RUNTIME/libexec/wpe-gpu-probe" ] \
     || fail "libexec/wpe-gpu-probe is not executable"
+node "$ROOT/scripts/verify_mali_runtime.mjs" "$RUNTIME"
 
 echo "GPU runtime validation: complete ($present files)"

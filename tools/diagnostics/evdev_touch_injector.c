@@ -35,9 +35,13 @@ static int touch_down(int fd, int x, int y)
     static int tracking_id = 20000;
 
     return emit_event(fd, EV_ABS, ABS_MT_SLOT, 0)
+        || emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, tracking_id++)
+        /* Force coordinates after opening a fresh reader; evdev suppresses
+         * values identical to the device's last contact, even across restarts. */
+        || emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x > 0 ? x - 1 : x + 1)
+        || emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y > 0 ? y - 1 : y + 1)
         || emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x)
         || emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y)
-        || emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, tracking_id++)
         || emit_event(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 20)
         || emit_event(fd, EV_KEY, BTN_TOUCH, 1)
         || emit_event(fd, EV_KEY, BTN_TOOL_FINGER, 1)

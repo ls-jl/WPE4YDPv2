@@ -70,10 +70,10 @@ for runtime_file in \
   lib/libcrypto.so.3 \
   lib/libssl.so.3 \
   lib/libsrtp2.so.2.8.0 \
-  lib/libnice.so.10.14.0 \
-  lib/libgstsctp-1.0.so.0.2212.0 \
-  lib/libgstwebrtc-1.0.so.0.2212.0 \
-  lib/libgstwebrtcnice-1.0.so.0.2212.0 \
+  lib/libnice.so.10 \
+  lib/libgstsctp-1.0.so.0 \
+  lib/libgstwebrtc-1.0.so.0 \
+  lib/libgstwebrtcnice-1.0.so.0 \
   lib/libavif.so.16 \
   lib/libdav1d.so.7 \
   lib/librga.so.2 \

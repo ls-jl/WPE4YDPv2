@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Keyboard custom focus fixture</title>
+<style>
+  body { margin: 20px; font: 18px sans-serif; }
+  .otp { width: 280px; padding: 18px; border: 2px solid #1687ff; }
+  .hidden-input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+</style>
+<div id="otp" class="otp" tabindex="0">点击输入短信验证码</div>
+<input id="otp-input" class="hidden-input" inputmode="numeric"
+       autocomplete="one-time-code" placeholder="请输入验证码">
+<script>
+  const wrapper = document.querySelector('#otp')
+  const input = document.querySelector('#otp-input')
+  wrapper.addEventListener('pointerdown', () => input.focus())
+  wrapper.addEventListener('click', () => input.focus())
+</script>
+</html>

@@ -42,6 +42,10 @@ export function createBrowserLifecycleState() {
     leaving: false,
     startToken: 0,
     watchdogTimer: null,
+    startTimer: null,
+    rotationTimer: null,
+    navigationTimer: null,
+    exitMessage: '',
     browserModeOverride: '',
     rotationRestartCount: 0,
   }
@@ -82,7 +86,7 @@ export class BrowserLifecycle {
   }
 
   start() {
-    if (this.state.starting || this.state.leaving) return
+    if (this.state.starting || this.state.leaving || this.component.pageVisible === false) return
     try {
       this.requireWorkdir()
     } catch (err) {
@@ -103,10 +107,11 @@ export class BrowserLifecycle {
     this.state.starting = true
     const token = this.state.startToken + 1
     this.state.startToken = token
-    setTimeout(() => {
-      if (token !== this.state.startToken || this.state.leaving) return
+    this.state.startTimer = setTimeout(() => {
+      this.state.startTimer = null
+      if (!this.isCurrentStart(token)) return
       this.resolveOptions().then((launchOptions) => {
-        if (token !== this.state.startToken || this.state.leaving) return
+        if (!this.isCurrentStart(token)) return
         const pid = this.browserPlayer.startBrowser(launchOptions)
         this.state.running = Number(pid) > 0
         console.warn(`wpe browser pid ${pid}`)
@@ -117,13 +122,28 @@ export class BrowserLifecycle {
           this.leaveFrame('start failed')
         }
       }).catch((err) => {
+        if (!this.isCurrentStart(token)) return
         console.warn(`start browser failed ${err}`)
         this.state.running = false
         this.leaveFrame(err && err.message ? err.message : 'start exception')
       }).then(() => {
-        this.state.starting = false
+        if (token === this.state.startToken) this.state.starting = false
       })
     }, 0)
+  }
+
+  isCurrentStart(token) {
+    return token === this.state.startToken && !this.state.leaving &&
+      this.component.pageVisible !== false
+  }
+
+  cancelPendingStart() {
+    this.state.startToken += 1
+    for (const timer of ['startTimer', 'rotationTimer', 'navigationTimer']) {
+      if (this.state[timer] != null) clearTimeout(this.state[timer])
+      this.state[timer] = null
+    }
+    this.state.starting = false
   }
 
   startWatchdog() {
@@ -173,8 +193,8 @@ export class BrowserLifecycle {
   restartForRotation(browserMode) {
     const mode = normalizeBrowserMode(browserMode)
     this.stopWatchdog()
-    this.state.startToken += 1
-    this.state.starting = false
+    this.cancelPendingStart()
+    const token = this.state.startToken
     this.state.running = false
     this.state.browserModeOverride = mode
     this.state.rotationRestartCount += 1
@@ -183,15 +203,15 @@ export class BrowserLifecycle {
       this.keyboardBridge.cancelActiveRequest('rotation change')
     }
     console.warn(`wpe rotation restart mode=${mode} count=${this.state.rotationRestartCount}`)
-    setTimeout(() => {
-      if (!this.state.leaving && this.state.browserModeOverride === mode) this.start()
+    this.state.rotationTimer = setTimeout(() => {
+      this.state.rotationTimer = null
+      if (this.isCurrentStart(token) && this.state.browserModeOverride === mode) this.start()
     }, 100)
   }
 
   stop() {
     this.stopWatchdog()
-    this.state.startToken += 1
-    this.state.starting = false
+    this.cancelPendingStart()
     this.state.running = false
     if (this.keyboardBridge) {
       this.keyboardBridge.stopPolling()
@@ -209,13 +229,23 @@ export class BrowserLifecycle {
   leaveFrame(reason) {
     if (this.state.leaving) return
     this.state.leaving = true
+    this.state.exitMessage = reason || 'stopped'
     console.warn(`wpe leave frame: ${reason}`)
-    const options = this.pageOptions()
     this.stop()
-    setTimeout(() => {
+    this.scheduleReturn()
+  }
+
+  scheduleReturn() {
+    if (!this.state.leaving || this.component.pageVisible === false ||
+        this.state.navigationTimer != null) return
+    const options = this.pageOptions()
+    const token = this.state.startToken
+    this.state.navigationTimer = setTimeout(() => {
+      this.state.navigationTimer = null
+      if (token !== this.state.startToken || this.component.pageVisible === false) return
       try {
         $falcon.navTo(options.returnPage || 'index', {
-          browserStatus: reason || 'stopped',
+          browserStatus: this.state.exitMessage,
           browserMode: LAST_BROWSER_MODE,
         })
       } catch (err) {

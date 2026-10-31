@@ -1,0 +1,42 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebRTC data starting</title>
+<pre id="status">Connecting two local PeerConnections</pre>
+<script>
+  const status = document.getElementById('status');
+  const sender = new RTCPeerConnection({ iceServers: [] });
+  const receiver = new RTCPeerConnection({ iceServers: [] });
+  let received = 0;
+  let replied = 0;
+  const channel = sender.createDataChannel('regression');
+  const failures = [];
+  function publish() {
+    const text = 'WebRTC data rx=' + received + ' reply=' + replied
+      + ' ice=' + sender.iceConnectionState + '/' + receiver.iceConnectionState;
+    status.textContent = document.title = text;
+    console.log(text);
+  }
+  sender.onicecandidate = event => event.candidate && receiver.addIceCandidate(event.candidate).catch(fail);
+  receiver.onicecandidate = event => event.candidate && sender.addIceCandidate(event.candidate).catch(fail);
+  sender.oniceconnectionstatechange = receiver.oniceconnectionstatechange = publish;
+  receiver.ondatachannel = event => {
+    event.channel.onmessage = message => {
+      received++;
+      event.channel.send(message.data);
+      publish();
+    };
+  };
+  channel.onopen = () => { for (let i = 0; i < 10; i++) channel.send('fixture-' + i); };
+  channel.onmessage = () => { replied++; publish(); };
+  function fail(error) {
+    failures.push(error.name);
+    status.textContent = document.title = 'WebRTC FAIL ' + failures.join(',');
+    console.error(status.textContent);
+  }
+  (async () => {
+    await sender.setLocalDescription(await sender.createOffer());
+    await receiver.setRemoteDescription(sender.localDescription);
+    await receiver.setLocalDescription(await receiver.createAnswer());
+    await sender.setRemoteDescription(receiver.localDescription);
+  })().catch(fail);
+</script>

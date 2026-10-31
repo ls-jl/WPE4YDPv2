@@ -48,10 +48,25 @@ static void test_hysteresis(void)
     g_assert_cmpint(governor.level, ==, BROWSER_MEMORY_PRESSURE_NORMAL);
 }
 
+static void test_staged_recovery(void)
+{
+    BrowserMemoryGovernor governor = { 0 };
+    BrowserMemorySnapshot critical = snapshot(90 * 1024, 200 * 1024);
+    BrowserMemorySnapshot warning = snapshot(180 * 1024, 300 * 1024);
+    g_assert_true(browser_memory_governor_update(&governor, &critical, &policy, 1));
+    g_assert_false(browser_memory_governor_update(&governor, &warning, &policy, G_USEC_PER_SEC));
+    g_assert_true(browser_memory_governor_update(&governor, &warning, &policy, 11 * G_USEC_PER_SEC));
+    g_assert_cmpint(governor.level, ==, BROWSER_MEMORY_PRESSURE_WARNING);
+    BrowserMemorySnapshot unavailable = { 0 };
+    g_assert_false(browser_memory_governor_update(&governor, &unavailable, &policy, 12 * G_USEC_PER_SEC));
+    g_assert_cmpint(governor.level, ==, BROWSER_MEMORY_PRESSURE_WARNING);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/browser/memory/classification", test_classification);
     g_test_add_func("/browser/memory/hysteresis", test_hysteresis);
+    g_test_add_func("/browser/memory/staged-recovery", test_staged_recovery);
     return g_test_run();
 }

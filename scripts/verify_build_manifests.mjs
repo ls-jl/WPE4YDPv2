@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import path from 'node:path'
 
-const runtimeManifestPath = 'assets/wpe-runtime/build-manifest.json'
+const runtimeRoot = process.env.WPE_VERIFY_RUNTIME || 'assets/wpe-runtime'
+const runtimeManifestPath = path.join(runtimeRoot, 'build-manifest.json')
 const revisionPath = 'wpe-drm/webkit-patches/revision'
 const seriesPath = 'wpe-drm/webkit-patches/series'
 
@@ -41,15 +43,22 @@ function verifyArtifacts(manifest) {
 }
 
 const runtimeManifest = JSON.parse(fs.readFileSync(runtimeManifestPath, 'utf8'))
-assert.equal(runtimeManifest.schema, 1)
+assert.ok([1, 2].includes(runtimeManifest.schema))
+if (runtimeManifest.schema === 2) {
+  assert.ok(runtimeManifest.toolchain?.version, 'missing actual toolchain provenance')
+  assert.ok(Object.keys(runtimeManifest.source_inputs || {}).length, 'missing source inputs')
+  for (const [path, expected] of Object.entries(runtimeManifest.source_inputs)) {
+    assert.equal(sha256File(path), expected, `source changed since native build: ${path}`)
+  }
+}
 assert.equal(runtimeManifest.webkit_revision, fs.readFileSync(revisionPath, 'utf8').trim())
 assert.equal(runtimeManifest.patch_series_sha256, patchSeriesHash())
 verifyArtifacts(Object.fromEntries(Object.entries(runtimeManifest).map(([key, value]) => {
   if (key !== 'artifacts') return [key, value]
-  return [key, Object.fromEntries(Object.entries(value).map(([path, hash]) => [`assets/wpe-runtime/${path}`, hash]))]
+  return [key, Object.fromEntries(Object.entries(value).map(([file, hash]) => [path.join(runtimeRoot, file), hash]))]
 })))
 
-if (fs.existsSync('release-manifest.json')) {
+if (!process.argv.includes('--runtime-only') && fs.existsSync('release-manifest.json')) {
   const releaseManifest = JSON.parse(fs.readFileSync('release-manifest.json', 'utf8'))
   assert.equal(releaseManifest.schema, 1)
   assert.equal(releaseManifest.webkit_revision, runtimeManifest.webkit_revision)

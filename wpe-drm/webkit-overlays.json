@@ -1,0 +1,48 @@
+{
+  "wpe-drm/WPEDRM.cpp": "Source/WebKit/WPEPlatform/wpe/drm/WPEDRM.cpp",
+  "wpe-drm/WPEDRM.h": "Source/WebKit/WPEPlatform/wpe/drm/WPEDRM.h",
+  "wpe-drm/WPEDisplayDRM.cpp": "Source/WebKit/WPEPlatform/wpe/drm/WPEDisplayDRM.cpp",
+  "wpe-drm/WPEDisplayDRMPrivate.h": "Source/WebKit/WPEPlatform/wpe/drm/WPEDisplayDRMPrivate.h",
+  "wpe-drm/WPEToplevelDRM.cpp": "Source/WebKit/WPEPlatform/wpe/drm/WPEToplevelDRM.cpp",
+  "wpe-drm/WPEViewDRM.cpp": "Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp",
+  "wpe-drm/GStreamerHolePunchQuirkRockchip.cpp": "Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.cpp",
+  "wpe-drm/GStreamerHolePunchQuirkRockchip.h": "Source/WebCore/platform/gstreamer/GStreamerHolePunchQuirkRockchip.h",
+  "wpe-drm/DRMRenderingIncludes.h": "Source/WebKit/WPEPlatform/wpe/drm/DRMRenderingIncludes.h",
+  "wpe-drm/RockchipRGA.h": "Source/WebKit/WPEPlatform/wpe/drm/RockchipRGA.h",
+  "wpe-drm/DRMGeometry.h": "Source/WebKit/WPEPlatform/wpe/drm/DRMGeometry.h",
+  "wpe-drm/DRMGeometry.cpp": "Source/WebKit/WPEPlatform/wpe/drm/DRMGeometry.cpp",
+  "wpe-drm/ChromeRenderer.h": "Source/WebKit/WPEPlatform/wpe/drm/ChromeRenderer.h",
+  "wpe-drm/ChromeRenderer.cpp": "Source/WebKit/WPEPlatform/wpe/drm/ChromeRenderer.cpp",
+  "wpe-drm/DRMScanoutBuffer.h": "Source/WebKit/WPEPlatform/wpe/drm/DRMScanoutBuffer.h",
+  "wpe-drm/DRMScanoutBuffer.cpp": "Source/WebKit/WPEPlatform/wpe/drm/DRMScanoutBuffer.cpp",
+  "wpe-drm/DRMFrameQueue.h": "Source/WebKit/WPEPlatform/wpe/drm/DRMFrameQueue.h",
+  "wpe-drm/VideoOverlay.cpp": "Source/WebKit/WPEPlatform/wpe/drm/VideoOverlay.cpp",
+  "wpe-drm/DMABufCPUAccess.h": "Source/WebKit/WPEPlatform/wpe/drm/DMABufCPUAccess.h",
+  "wpe-drm/RenderingFenceRetirement.h": [
+    "Source/WebKit/WPEPlatform/wpe/drm/RenderingFenceRetirement.h",
+    "Source/WebCore/platform/graphics/skia/RenderingFenceRetirement.h"
+  ],
+  "wpe-drm/DRMFrameLifecycle.h": "Source/WebKit/WPEPlatform/wpe/drm/DRMFrameLifecycle.h",
+  "wpe-drm/FrameTrace.h": "Source/WebKit/WPEPlatform/wpe/drm/FrameTrace.h",
+  "wpe-drm/VideoOverlayWire.h": [
+    "Source/WebKit/WPEPlatform/wpe/drm/VideoOverlayWire.h",
+    "Source/WebCore/platform/gstreamer/VideoOverlayWire.h"
+  ],
+  "wpe-drm/ChromeMotionState.h": "Source/WebKit/WPEPlatform/wpe/drm/ChromeMotionState.h",
+  "wpe-drm/VideoReleaseQueue.h": "Source/WebKit/WPEPlatform/wpe/drm/VideoReleaseQueue.h",
+  "wpe-drm/RenderingFenceWait.h": [
+    "Source/WebKit/WPEPlatform/wpe/drm/RenderingFenceWait.h",
+    "Source/WebCore/platform/graphics/skia/RenderingFenceWait.h"
+  ],
+  "wpe-drm/DRMFramePixels.h": "Source/WebKit/WPEPlatform/wpe/drm/DRMFramePixels.h",
+  "wpe-drm/GPUFrameValidity.h": "Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/GPUFrameValidity.h",
+  "wpe-drm/NativeScrollGestureState.h": "Source/WebKit/UIProcess/API/wpe/NativeScrollGestureState.h",
+  "wpe-drm/NativeTouchGestureState.h": "Source/WebKit/UIProcess/API/wpe/NativeTouchGestureState.h",
+  "wpe-drm/MemoryReliefCadence.h": "Source/WTF/wtf/MemoryReliefCadence.h",
+  "wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.h": "Source/ThirdParty/ANGLE/third_party/zlib/google/compression_utils_portable.h",
+  "wpe-drm/webkit-vendor/angle-zlib/compression_utils_portable.cc": "Source/ThirdParty/ANGLE/third_party/zlib/google/compression_utils_portable.cc",
+  "wpe-drm/ChromeSnapshot.h": "Source/WebKit/WPEPlatform/wpe/drm/ChromeSnapshot.h",
+  "wpe-drm/RollingFrameTimings.h": "Source/WebKit/WPEPlatform/wpe/drm/RollingFrameTimings.h",
+  "wpe-drm/DRMFrameQueue.cpp": "Source/WebKit/WPEPlatform/wpe/drm/DRMFrameQueue.cpp",
+  "wpe-drm/TilePrefetchBudget.h": "Source/WebCore/platform/graphics/texmap/coordinated/TilePrefetchBudget.h"
+}

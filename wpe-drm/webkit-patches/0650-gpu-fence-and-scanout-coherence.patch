@@ -1,0 +1,18 @@
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index 483cfc1..f8f8010 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -310,8 +310,11 @@ void AcceleratedSurface::RenderTargetShareableBuffer::sync(bool useExplicitSync)
+         m_renderingFenceFD = fence->exportFD();
+         if (!m_renderingFenceFD)
+             fence->clientWait();
+-    } else if (!m_surface->useSkia())
+-        glFlush();
++    } else {
++        // Without an exportable or client-waitable fence the consumer cannot
++        // know when GPU writes are complete. Flush alone is not completion.
++        glFinish();
++    }
+ }
+ 
+ void AcceleratedSurface::RenderTargetShareableBuffer::setReleaseFenceFD(UnixFileDescriptor&& releaseFence)

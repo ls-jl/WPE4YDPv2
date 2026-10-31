@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Sourced by the native build; media inputs are independent of launcher/UI code.
+
+cat >"$WORK/bin/aarch64-cc" <<EOF
+#!/bin/sh
+exec "$WPE_CLANG" --target=aarch64-buildroot-linux-gnu --gcc-toolchain="$BR_TOOLCHAIN" \
+  -B"$BR_TOOLCHAIN/bin" -B"$BR_TOOLCHAIN/aarch64-buildroot-linux-gnu/bin" \
+  --sysroot="$BR_SYSROOT" "\$@"
+EOF
+cat >"$WORK/bin/aarch64-cxx" <<EOF
+#!/bin/sh
+exec "$WPE_CLANGXX" --target=aarch64-buildroot-linux-gnu --gcc-toolchain="$BR_TOOLCHAIN" \
+  -B"$BR_TOOLCHAIN/bin" -B"$BR_TOOLCHAIN/aarch64-buildroot-linux-gnu/bin" \
+  --sysroot="$BR_SYSROOT" "\$@"
+EOF
+cat >"$WORK/bin/aarch64-deb12-cc" <<EOF
+#!/bin/sh
+exec "$WPE_CLANG" --target=aarch64-buildroot-linux-gnu --gcc-toolchain="$BR_TOOLCHAIN" \
+  -B"$BR_TOOLCHAIN/bin" -B"$BR_TOOLCHAIN/aarch64-buildroot-linux-gnu/bin" \
+  --sysroot="$DEB_SYSROOT" "\$@"
+EOF
+chmod 755 "$WORK/bin/aarch64-cc" "$WORK/bin/aarch64-cxx" "$WORK/bin/aarch64-deb12-cc"
+
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig:$FULL_PREFIX/lib/pkgconfig:$FULL_PREFIX/lib/aarch64-linux-gnu/pkgconfig:$FULL_PREFIX/share/pkgconfig"
+export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+unset PKG_CONFIG_SYSROOT_DIR
+export PATH="$WORK/bin:$PATH"
+
+download() {
+  local url="$1" output="$2"
+  if [ ! -s "$output" ]; then
+    curl -fL --retry 5 --retry-delay 2 "$url" -o "$output"
+  fi
+}
+
+download "https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz" \
+  "$DOWNLOADS/openssl-3.5.7.tar.gz"
+download "https://github.com/cisco/libsrtp/archive/refs/tags/v2.8.0.tar.gz" \
+  "$DOWNLOADS/libsrtp-2.8.0.tar.gz"
+download "https://code.videolan.org/videolan/dav1d/-/archive/1.5.1/dav1d-1.5.1.tar.gz" \
+  "$DOWNLOADS/dav1d-1.5.1.tar.gz"
+download "https://codeload.github.com/AOMediaCodec/libavif/tar.gz/refs/tags/v1.1.1" \
+  "$DOWNLOADS/libavif-1.1.1.tar.gz"
+
+GST_BAD_SOURCE="$WPE_SOURCE_ROOT/gst-plugins-bad-1.22.12"
+GST_WEBRTC_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0001-webrtcbin-update-remote-offer-transceivers.patch"
+GST_ICE_ROLE_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0002-webrtcbin-preserve-ice-controller.patch"
+GST_DTLS_MTU_PATCH="$PROJECT_ROOT/wpe-drm/gstreamer-patches/0003-dtls-bio-query-mtu-1200.patch"
+
+apply_patch_once() {
+  local source="$1" patch_file="$2"
+  if git -C "$source" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    return 0
+  fi
+  if git -C "$source" apply --check "$patch_file" >/dev/null 2>&1; then
+    git -C "$source" apply "$patch_file"
+    return 0
+  fi
+  echo "Source does not match clean or fully patched state: $patch_file" >&2
+  return 1
+}
+if [ ! -f "$PREFIX/lib/libcrypto.so.3" ]; then
+  rm -rf "$WORK/openssl-3.5.7"
+  tar -xzf "$DOWNLOADS/openssl-3.5.7.tar.gz" -C "$WORK"
+  pushd "$WORK/openssl-3.5.7" >/dev/null
+  CC="$WORK/bin/aarch64-cc" \
+  AR="$BR_TOOLCHAIN/bin/aarch64-buildroot-linux-gnu-ar" \
+  RANLIB="$BR_TOOLCHAIN/bin/aarch64-buildroot-linux-gnu-ranlib" \
+    ./Configure linux-aarch64 --prefix="$PREFIX" --libdir=lib shared \
+      no-tests no-docs no-apps
+  make -j"$JOBS"
+  make install_sw
+  popd >/dev/null
+fi
+
+if [ ! -f "$PREFIX/lib/libsrtp2.so" ]; then
+  rm -rf "$WORK/libsrtp-2.8.0" "$WORK/libsrtp-build"
+  tar -xzf "$DOWNLOADS/libsrtp-2.8.0.tar.gz" -C "$WORK"
+  cmake -S "$WORK/libsrtp-2.8.0" -B "$WORK/libsrtp-build" -GNinja \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_C_COMPILER="$WORK/bin/aarch64-cc" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -DENABLE_OPENSSL=ON \
+    -DOPENSSL_ROOT_DIR="$PREFIX" \
+    -DTEST_APPS=OFF
+  ninja -C "$WORK/libsrtp-build" -j"$JOBS" install
+fi
+cat >"$PREFIX/lib/pkgconfig/libsrtp2.pc" <<EOF
+prefix=$PREFIX
+exec_prefix=\${prefix}
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: libsrtp2
+Description: Secure RTP library
+Version: 2.8.0
+Requires.private: openssl
+Libs: -L\${libdir} -lsrtp2
+Cflags: -I\${includedir}
+EOF
+
+meson_build() {
+  local name="$1" source="$2"
+  shift 2
+  local build="$WORK/$name"
+  rm -rf "$build"
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" meson setup "$build" "$source" \
+    --cross-file "$CROSS_FILE" --prefix="$PREFIX" --libdir=lib \
+    --buildtype=release -Dauto_features=disabled "$@"
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" ninja -C "$build" -j"$JOBS" install
+}
+
+if [ ! -f "$PREFIX/lib/libdav1d.so" ]; then
+  rm -rf "$WORK/dav1d-1.5.1"
+  tar -xzf "$DOWNLOADS/dav1d-1.5.1.tar.gz" -C "$WORK"
+  meson_build dav1d "$WORK/dav1d-1.5.1" \
+    -Denable_tools=false -Denable_tests=false -Denable_examples=false
+fi
+
+if [ ! -f "$PREFIX/lib/libavif.so" ]; then
+  rm -rf "$WORK/libavif-1.1.1" "$WORK/libavif-build"
+  tar -xzf "$DOWNLOADS/libavif-1.1.1.tar.gz" -C "$WORK"
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cmake \
+    -S "$WORK/libavif-1.1.1" -B "$WORK/libavif-build" -GNinja \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_C_COMPILER="$WORK/bin/aarch64-cc" \
+    -DCMAKE_CXX_COMPILER="$WORK/bin/aarch64-cxx" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -DAVIF_CODEC_DAV1D=SYSTEM \
+    -DAVIF_LIBYUV=OFF \
+    -DAVIF_BUILD_APPS=OFF \
+    -DAVIF_BUILD_TESTS=OFF \
+    -DAVIF_ENABLE_WERROR=OFF
+  PKG_CONFIG_PATH="$PKG_CONFIG_PATH" ninja -C "$WORK/libavif-build" \
+    -j"$JOBS" install
+fi
+
+if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstnice.so" ]; then
+  meson_build libnice "$WPE_SOURCE_ROOT/libnice-0.1.22" \
+    -Dgstreamer=enabled -Dcrypto-library=openssl -Dgupnp=disabled \
+    -Dexamples=disabled -Dtests=disabled -Dgtk_doc=disabled -Dintrospection=disabled
+fi
+
+if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstrtp.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstrtpmanager.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstinterleave.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdeinterlace.so" ]; then
+  meson_build gst-good "$WPE_SOURCE_ROOT/gst-plugins-good-1.22.12" \
+    -Drtp=enabled -Drtpmanager=enabled -Dinterleave=enabled \
+    -Ddeinterlace=enabled \
+    -Dexamples=disabled -Dtests=disabled
+fi
+
+if [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstdtls.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstsctp.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstsrtp.so" ] || \
+  [ ! -f "$PREFIX/lib/gstreamer-1.0/libgstwebrtc.so" ] || \
+  [ "${FORCE_REBUILD_GST_BAD:-0}" = 1 ]; then
+  apply_patch_once "$GST_BAD_SOURCE" "$GST_WEBRTC_PATCH"
+  apply_patch_once "$GST_BAD_SOURCE" "$GST_ICE_ROLE_PATCH"
+  apply_patch_once "$GST_BAD_SOURCE" "$GST_DTLS_MTU_PATCH"
+  if grep -qE 'Keep the cloud-game A/B|RED is a redundancy wrapper' \
+      "$GST_BAD_SOURCE/ext/webrtc/gstwebrtcbin.c"; then
+    echo "Refusing untracked cloud codec filtering in gstwebrtcbin.c" >&2
+    exit 1
+  fi
+  meson_build gst-bad "$GST_BAD_SOURCE" \
+    -Ddtls=enabled -Dsctp=enabled -Dsrtp=enabled -Dwebrtc=enabled \
+    -Dsctp-internal-usrsctp=enabled -Dexamples=disabled -Dtests=disabled
+fi
+
+node "$PROJECT_ROOT/scripts/sdk_receipt.mjs" record

@@ -1,0 +1,208 @@
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
+index a9745db..b6623c3 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.cpp
+@@ -30,7 +30,11 @@
+ #include "BitmapTexturePool.h"
+ #include "CoordinatedTileBuffer.h"
+ #include "FontRenderOptions.h"
++#include "GLFence.h"
+ #include "PlatformDisplay.h"
++#if USE(GLIB) && OS(UNIX)
++#include "RenderingFenceRetirement.h"
++#endif
+ #include "SkiaPaintingEngine.h"
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkColorSpace.h>
+@@ -47,6 +51,54 @@ namespace WebCore {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaBackingStore);
+ 
++class SkiaBackingStore::PendingGPUReads {
++    WTF_MAKE_TZONE_ALLOCATED(PendingGPUReads);
++public:
++    ~PendingGPUReads()
++    {
++#if USE(GLIB) && OS(UNIX)
++        if (!m_retirement.finish(2000))
++            g_error("Skia tile upload teardown: GPU read fence did not complete");
++#endif
++    }
++
++    void retain(Vector<Ref<CoordinatedTileBuffer>>&& buffers)
++    {
++        if (buffers.isEmpty())
++            return;
++#if USE(GLIB) && OS(UNIX)
++        auto fence = GLFence::createExportable(PlatformDisplay::sharedDisplay().glDisplay());
++        auto fd = fence ? fence->exportFD() : WTF::UnixFileDescriptor { };
++        if (fd) {
++            struct Batch { Vector<Ref<CoordinatedTileBuffer>> buffers; };
++            auto* batch = new Batch { WTF::move(buffers) };
++            int rawFD = fd.release();
++            auto enqueue = [&] {
++                return m_retirement.retain(rawFD, batch,
++                    +[](void* data) { static_cast<Batch*>(data)->buffers.clear(); },
++                    +[](void* data) { delete static_cast<Batch*>(data); },
++                    g_main_context_get_thread_default());
++            };
++            if (!enqueue() && (!m_retirement.finish(2000) || !enqueue()))
++                g_error("Skia tile upload retention exhausted; refusing unsafe texture reuse");
++            return;
++        }
++#endif
++        // Without exportable fences, complete GL reads before releasing pool references.
++        glFinish();
++    }
++
++private:
++#if USE(GLIB) && OS(UNIX)
++    WPE::DRM::RenderingFenceRetirement m_retirement;
++#endif
++};
++
++WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaBackingStore::PendingGPUReads);
++
++SkiaBackingStore::SkiaBackingStore() = default;
++SkiaBackingStore::~SkiaBackingStore() = default;
++
+ static bool useSkiaCPURasterCompositorForBackingStore()
+ {
+     const char* value = getenv("WEBKIT_SKIA_CPU_COMPOSITOR");
+@@ -79,8 +131,14 @@ void SkiaBackingStore::processPendingTileUpdates()
+     if (!m_hasPendingTileUpdates)
+         return;
+ 
++    Vector<Ref<CoordinatedTileBuffer>> pendingGPUReads;
+     for (auto& tile : m_tiles.values())
+-        tile.processPendingUpdateIfNeeded();
++        tile.processPendingUpdateIfNeeded(pendingGPUReads);
++    if (!pendingGPUReads.isEmpty()) {
++        if (!m_gpuReads)
++            m_gpuReads = makeUnique<PendingGPUReads>();
++        m_gpuReads->retain(WTF::move(pendingGPUReads));
++    }
+ 
+     m_hasPendingTileUpdates = false;
+ }
+@@ -142,10 +200,10 @@ void SkiaBackingStore::Tile::scheduleUpdate(const IntRect& dirtyRect, const IntR
+     m_pendingUpdates.append({ tileRect, dirtyRect, Ref { buffer } });
+ }
+ 
+-void SkiaBackingStore::Tile::processPendingUpdateIfNeeded()
++void SkiaBackingStore::Tile::processPendingUpdateIfNeeded(Vector<Ref<CoordinatedTileBuffer>>& pendingGPUReads)
+ {
+     for (auto& pendingUpdate : m_pendingUpdates)
+-        update(pendingUpdate.dirtyRect, pendingUpdate.tileRect, pendingUpdate.buffer.get());
++        update(pendingUpdate.dirtyRect, pendingUpdate.tileRect, pendingUpdate.buffer.get(), pendingGPUReads);
+     m_pendingUpdates.clear();
+ }
+ 
+@@ -176,7 +234,7 @@ void SkiaBackingStore::Tile::ensureTexture(const IntSize& size, CoordinatedTileB
+     }
+ }
+ 
+-void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer& buffer)
++void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer& buffer, Vector<Ref<CoordinatedTileBuffer>>& pendingGPUReads)
+ {
+     WTFBeginSignpost(this, SkiaBackingStoreTileUpdate, "rect %ix%i+%i+%i %s", tileRect.x(), tileRect.y(), tileRect.width(), tileRect.height(), buffer.isBackedByOpenGL() ? "GPUToGPU" : useSkiaCPURasterCompositorForBackingStore() ? "CPUToCPU" : "CPUToGPU");
+ 
+@@ -227,6 +285,9 @@ void SkiaBackingStore::Tile::update(const IntRect& dirtyRect, const IntRect& til
+             } else {
+                 ensureTexture(tileRect.size(), buffer);
+                 m_texture->copyFromExternalTexture(texture->id(), dirtyRect, { });
++                // A server wait orders the producer write, not this consumer read.
++                // Keep the source out of the shared pool until the copy fence signals.
++                pendingGPUReads.append(Ref { buffer });
+             }
+         }
+     } else {
+diff --git a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h
+index 36ea470..8f00144 100644
+--- a/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h
++++ b/Source/WebCore/platform/graphics/skia/SkiaBackingStore.h
+@@ -34,6 +34,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <wtf/HashMap.h>
+ #include <wtf/Noncopyable.h>
++#include <memory>
+ 
+ namespace WebCore {
+ class BitmapTexture;
+@@ -42,8 +43,8 @@ class CoordinatedTileBuffer;
+ class SkiaBackingStore {
+     WTF_MAKE_TZONE_ALLOCATED(SkiaBackingStore);
+ public:
+-    SkiaBackingStore() = default;
+-    ~SkiaBackingStore() = default;
++    SkiaBackingStore();
++    ~SkiaBackingStore();
+ 
+     float scale() const { return m_scale; }
+     bool hasPendingTileUpdates() const { return m_hasPendingTileUpdates; }
+@@ -71,14 +72,14 @@ private:
+         ~Tile() = default;
+ 
+         void scheduleUpdate(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer&);
+-        void processPendingUpdateIfNeeded();
++        void processPendingUpdateIfNeeded(Vector<Ref<CoordinatedTileBuffer>>&);
+ 
+         const FloatRect& rect() const LIFETIME_BOUND { return m_rect; }
+         sk_sp<SkImage> image() const;
+ 
+     private:
+         void ensureTexture(const IntSize&, CoordinatedTileBuffer&);
+-        void update(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer&);
++        void update(const IntRect& dirtyRect, const IntRect& tileRect, CoordinatedTileBuffer&, Vector<Ref<CoordinatedTileBuffer>>&);
+ 
+         struct Update {
+             IntRect tileRect;
+@@ -98,6 +99,8 @@ private:
+     FloatSize m_size;
+     float m_scale { 1. };
+     bool m_hasPendingTileUpdates { false };
++    class PendingGPUReads;
++    std::unique_ptr<PendingGPUReads> m_gpuReads;
+ };
+ 
+ } // namespace WebCore
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index 6751678..0748e6f 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -1280,7 +1280,7 @@ void AcceleratedSurface::clear(const OptionSet<WebCore::CompositionReason>& reas
+ 
+     if (m_useSkia) {
+         if (auto* canvas = this->canvas()) {
+-            if (m_targetRequiresFullRepaint) {
++            if (usesGL() || m_targetRequiresFullRepaint) {
+                 if (backgroundColor && !backgroundColor->isOpaque())
+                     canvas->clear(SK_ColorTRANSPARENT);
+                 else
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+index 6ff01c1..dc34bab 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -390,6 +390,11 @@ void ThreadedCompositor::paintToSkiaCanvas(const TransformationMatrix& matrix, c
+     if (!canvas)
+         return;
+ 
++    if (m_surface->usesGL()) {
++        // Tile upload code uses raw GL. Do not reuse Ganesh's cached GL bindings.
++        PlatformDisplay::sharedDisplay().skiaGrContext()->resetContext();
++    }
++
+     auto& rootLayer = m_sceneState->rootLayer().ensureSkiaTarget();
+     rootLayer.setTransform(matrix);
+ 
+@@ -435,6 +440,10 @@ void ThreadedCompositor::paintToSkiaCanvas(const TransformationMatrix& matrix, c
+         if (!frameDamage->isEmpty())
+             m_surface->setFrameDamage(WTF::move(*frameDamage));
+     }
++    // Skia paints the complete layer tree, not a damage-clipped subset. Clearing
++    // its GPU target is therefore cheap and must also publish full surface damage.
++    if (m_surface->usesGL())
++        m_surface->setFrameDamage(Damage(size, Damage::Mode::Full));
+ #endif
+ 
+ #if ENABLE(DAMAGE_TRACKING)

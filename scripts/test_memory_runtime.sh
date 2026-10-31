@@ -43,10 +43,35 @@ run_case large 640 'V:40M,A:8M' 90
 write_meminfo 1024000 307200 524288 393216
 run_case balanced 512 'V:32M,A:6M' 96
 
+write_meminfo 1024000 307200 524284 393216
+run_case balanced 512 'V:32M,A:6M' 96
+
 write_meminfo 1024000 131072 524288 65536
+run_case conservative 448 'V:24M,A:4M' 80
+
+write_meminfo 1024000 454888 524284 254460
+run_case balanced 512 'V:32M,A:6M' 96
+
+write_meminfo 1024000 307200 524284 254460
 run_case conservative 448 'V:24M,A:4M' 80
 
 write_meminfo 1024000 307200 524288 393216
 run_case conservative 400 'V:24M,A:4M' 80 WPE_WEB_PROCESS_MEMORY_LIMIT_MB=400
 
-echo 'memory runtime fixtures passed: 4'
+echo 'memory runtime fixtures passed: 7'
+
+for name in WPE_CLOUD_AUTOSTART WPE_CLOUDGAME_ALLOW_EXPIRED_TLS; do
+    assignment=$(awk -v name="$name" '$0 ~ "^export " name "=" { print; exit }' "$ROOT/wpe-drm/run.sh")
+    [ -n "$assignment" ] || exit 1
+    actual=$(env -i PATH="$PATH" sh -c "$assignment; printenv $name")
+    [ "$actual" = 0 ] || { echo "unsafe default: $name=$actual" >&2; exit 1; }
+done
+if grep -Eq 'amixer.*unmute' "$ROOT/wpe-drm/run.sh"; then
+    echo 'browser must not override system mute' >&2
+    exit 1
+fi
+if grep -Eq '/proc/sys/vm/(drop_caches|swappiness)' "$ROOT/wpe-drm/run.sh"; then
+    echo 'production supervisor must not change system VM settings' >&2
+    exit 1
+fi
+echo 'runtime safety default fixtures passed'

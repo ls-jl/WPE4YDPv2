@@ -1,12 +1,15 @@
 #include "browser-profile-store.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <glib/gstdio.h>
 #include <math.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <time.h>
+#include <unistd.h>
 
 #define STORE_ERROR browser_profile_store_error_quark()
 
@@ -14,6 +17,7 @@ struct BrowserProfileStore {
     sqlite3 *database;
     char *database_path;
     char *profiles_directory;
+    int lock_fd;
 };
 
 static GQuark browser_profile_store_error_quark(void)
@@ -336,11 +340,33 @@ static gboolean set_default_settings(BrowserProfileStore *store, int64_t profile
 
 static gboolean create_default_profile(BrowserProfileStore *store, int64_t *profile_id, GError **error)
 {
+    /* A recovered database must never reuse another profile's site data. */
+    int64_t next_id = 1;
+    GDir *directory = g_dir_open(store->profiles_directory, 0, error);
+    if (!directory)
+        return FALSE;
+    const char *name;
+    while ((name = g_dir_read_name(directory))) {
+        if (name[0] != 'p' || !g_ascii_isdigit(name[1]))
+            continue;
+        char *end = NULL;
+        guint64 id = g_ascii_strtoull(name + 1, &end, 10);
+        if (!*end && id >= (guint64)next_id) {
+            if (id >= G_MAXINT64 - 1) {
+                g_dir_close(directory);
+                g_set_error_literal(error, STORE_ERROR, EOVERFLOW, "Profile directory ID overflow");
+                return FALSE;
+            }
+            next_id = (int64_t)id + 1;
+        }
+    }
+    g_dir_close(directory);
     sqlite3_stmt *statement = NULL;
     if (!prepare(store->database,
-                 "INSERT INTO profiles(name,is_default,created_at,last_used_at) "
-                 "VALUES('DEFAULT',1,strftime('%s','now'),strftime('%s','now'))", &statement, error))
+                 "INSERT INTO profiles(id,name,is_default,created_at,last_used_at) "
+                 "VALUES(?1,'DEFAULT',1,strftime('%s','now'),strftime('%s','now'))", &statement, error))
         return FALSE;
+    sqlite3_bind_int64(statement, 1, next_id);
     gboolean success = step_done(statement, error);
     sqlite3_finalize(statement);
     if (!success)
@@ -362,23 +388,125 @@ static gboolean database_has_profiles(BrowserProfileStore *store)
     return present;
 }
 
-static gboolean quick_check(sqlite3 *database)
+static int quick_check(sqlite3 *database)
 {
     sqlite3_stmt *statement = NULL;
-    if (sqlite3_prepare_v2(database, "PRAGMA quick_check(1)", -1, &statement, NULL) != SQLITE_OK)
-        return FALSE;
-    gboolean valid = FALSE;
-    if (sqlite3_step(statement) == SQLITE_ROW) {
+    int result = sqlite3_prepare_v2(database, "PRAGMA quick_check(1)", -1, &statement, NULL);
+    if (result != SQLITE_OK)
+        return result;
+    result = sqlite3_step(statement);
+    if (result == SQLITE_ROW) {
         const char *value = (const char *)sqlite3_column_text(statement, 0);
-        valid = value && !strcmp(value, "ok");
+        result = value && !strcmp(value, "ok") ? SQLITE_OK : SQLITE_CORRUPT;
     }
     sqlite3_finalize(statement);
-    return valid;
+    return result;
 }
 
-static sqlite3 *open_database_with_recovery(const char *path, gboolean *fresh, GError **error)
+static gboolean copy_recovery_file(const char *source, const char *target, GError **error)
 {
+    int input = g_open(source, O_RDONLY, 0);
+    if (input < 0) {
+        if (errno == ENOENT)
+            return TRUE;
+        g_set_error(error, STORE_ERROR, errno, "Recovery source open failed: %s", g_strerror(errno));
+        return FALSE;
+    }
+    int output = g_open(target, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    gboolean success = output >= 0;
+    int saved_errno = errno;
+    char buffer[16384];
+    while (success) {
+        ssize_t count = read(input, buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (!count)
+            break;
+        if (count < 0) {
+            saved_errno = errno;
+            success = FALSE;
+            break;
+        }
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(output, buffer + offset, (size_t)(count - offset));
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0) {
+                saved_errno = written < 0 ? errno : EIO;
+                success = FALSE;
+                break;
+            }
+            offset += written;
+        }
+    }
+    if (success && fsync(output)) {
+        saved_errno = errno;
+        success = FALSE;
+    }
+    close(input);
+    if (output >= 0)
+        close(output);
+    if (!success)
+        g_set_error(error, STORE_ERROR, saved_errno, "Recovery backup failed: %s", g_strerror(saved_errno));
+    return success;
+}
+
+static void discard_integrity_snapshot(char *snapshot)
+{
+    if (!snapshot)
+        return;
+    const char *names[] = { "browser.sqlite3", "browser.sqlite3-wal", "browser.sqlite3-shm" };
+    for (guint i = 0; i < G_N_ELEMENTS(names); ++i) {
+        char *file = g_build_filename(snapshot, names[i], NULL);
+        g_unlink(file);
+        g_free(file);
+    }
+    g_rmdir(snapshot);
+    g_free(snapshot);
+}
+
+static char *snapshot_before_integrity_check(const char *path, GError **error)
+{
+    char *backup = g_strconcat(path, ".integrity-XXXXXX", NULL);
+    if (!g_mkdtemp(backup)) {
+        g_set_error(error, STORE_ERROR, errno, "Recovery directory failed: %s", g_strerror(errno));
+        g_free(backup);
+        return NULL;
+    }
+    const char *suffixes[] = { "", "-wal", "-shm" };
+    for (guint i = 0; i < G_N_ELEMENTS(suffixes); ++i) {
+        char *source = g_strconcat(path, suffixes[i], NULL);
+        char *target = g_strdup_printf("%s/browser.sqlite3%s", backup, suffixes[i]);
+        gboolean success = copy_recovery_file(source, target, error);
+        g_free(source);
+        g_free(target);
+        if (!success) {
+            discard_integrity_snapshot(backup);
+            return NULL;
+        }
+    }
+    int backup_fd = g_open(backup, O_RDONLY, 0);
+    if (backup_fd < 0 || fsync(backup_fd)) {
+        g_set_error(error, STORE_ERROR, errno, "Recovery directory sync failed: %s", g_strerror(errno));
+        if (backup_fd >= 0) close(backup_fd);
+        discard_integrity_snapshot(backup);
+        return NULL;
+    }
+    close(backup_fd);
+    return backup;
+}
+
+static sqlite3 *open_database_with_recovery(const char *path, gboolean *fresh,
+                                           gboolean *recovered, GError **error)
+{
+    *recovered = FALSE;
     *fresh = !g_file_test(path, G_FILE_TEST_EXISTS);
+    /* Even quick_check may reconstruct SHM. Capture evidence before SQLite
+     * opens the files, once per store startup under our ownership lock. */
+    char *snapshot = *fresh ? NULL : snapshot_before_integrity_check(path, error);
+    if (!*fresh && !snapshot)
+        return NULL;
     sqlite3 *database = NULL;
     int result = sqlite3_open_v2(path, &database,
                                  SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
@@ -386,27 +514,50 @@ static sqlite3 *open_database_with_recovery(const char *path, gboolean *fresh, G
     if (result != SQLITE_OK) {
         set_sqlite_error(error, database, "sqlite3_open_v2", result);
         sqlite3_close(database);
+        discard_integrity_snapshot(snapshot);
         return NULL;
     }
-    if (*fresh || quick_check(database))
+    sqlite3_busy_timeout(database, 2000);
+#ifdef SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
+    sqlite3_db_config(database, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, NULL);
+#endif
+    int check = *fresh ? SQLITE_OK : quick_check(database);
+    if (check == SQLITE_OK) {
+        discard_integrity_snapshot(snapshot);
         return database;
-
-    sqlite3_close(database);
-    char *backup = g_strdup_printf("%s.corrupt-%" G_GINT64_FORMAT, path, (gint64)time(NULL));
-    if (g_rename(path, backup) != 0) {
-        g_set_error(error, STORE_ERROR, errno, "Corrupt database rename failed: %s", g_strerror(errno));
+    }
+    if ((check & 0xff) != SQLITE_CORRUPT && (check & 0xff) != SQLITE_NOTADB) {
+        set_sqlite_error(error, database, "database integrity check", check);
+        sqlite3_close(database);
+        discard_integrity_snapshot(snapshot);
+        return NULL;
+    }
+    char *backup = g_strdup_printf("%s.corrupt-%s", path, strrchr(snapshot, '-') + 1);
+    if (g_rename(snapshot, backup)) {
+        g_set_error(error, STORE_ERROR, errno, "Recovery snapshot promotion failed: %s", g_strerror(errno));
+        sqlite3_close(database);
+        g_free(snapshot);
         g_free(backup);
         return NULL;
     }
-    char *wal = g_strconcat(path, "-wal", NULL);
-    char *shm = g_strconcat(path, "-shm", NULL);
-    g_unlink(wal);
-    g_unlink(shm);
-    g_free(wal);
-    g_free(shm);
+    g_free(snapshot);
+    sqlite3_close(database);
+    /* Keep the original DB until its sidecars are safely backed up and removed. */
+    const char *suffixes[] = { "", "-wal", "-shm" };
+    for (int i = 2; i >= 0; --i) {
+        char *source = g_strconcat(path, suffixes[i], NULL);
+        int removed = g_unlink(source);
+        g_free(source);
+        if (removed && errno != ENOENT) {
+            g_set_error(error, STORE_ERROR, errno, "Recovery replacement failed: %s", g_strerror(errno));
+            g_free(backup);
+            return NULL;
+        }
+    }
     g_warning("Browser database was corrupt; preserved as %s", backup);
     g_free(backup);
     *fresh = TRUE;
+    *recovered = TRUE;
     result = sqlite3_open_v2(path, &database,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
                              NULL);
@@ -600,13 +751,26 @@ BrowserProfileStore *browser_profile_store_open(const char *database_path,
     chmod(profiles_directory, 0700);
     g_free(database_directory);
 
-    gboolean fresh = FALSE;
-    sqlite3 *database = open_database_with_recovery(database_path, &fresh, error);
-    if (!database)
+    char *lock_path = g_strconcat(database_path, ".lock", NULL);
+    int lock_fd = g_open(lock_path, O_RDWR | O_CREAT, 0600);
+    g_free(lock_path);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB)) {
+        g_set_error_literal(error, STORE_ERROR, SQLITE_BUSY, "Browser database is owned by another session or lock is inaccessible");
+        if (lock_fd >= 0) close(lock_fd);
         return NULL;
+    }
+    fcntl(lock_fd, F_SETFD, FD_CLOEXEC);
+    gboolean fresh = FALSE;
+    gboolean recovered = FALSE;
+    sqlite3 *database = open_database_with_recovery(database_path, &fresh, &recovered, error);
+    if (!database) {
+        close(lock_fd);
+        return NULL;
+    }
 
     BrowserProfileStore *store = g_new0(BrowserProfileStore, 1);
     store->database = database;
+    store->lock_fd = lock_fd;
     store->database_path = g_strdup(database_path);
     store->profiles_directory = g_strdup(profiles_directory);
     if (!initialize_schema(store, error)) {
@@ -637,6 +801,10 @@ BrowserProfileStore *browser_profile_store_open(const char *database_path,
         browser_profile_store_close(store);
         return NULL;
     }
+    if (recovered && !set_meta(store, "legacy_migrated", "1", error)) {
+        browser_profile_store_close(store);
+        return NULL;
+    }
     if (!migrate_legacy_state(store, default_profile_id, legacy_state_path,
                               legacy_runtime_path, error)) {
         browser_profile_store_close(store);
@@ -654,6 +822,7 @@ void browser_profile_store_close(BrowserProfileStore *store)
         return;
     if (store->database)
         sqlite3_close(store->database);
+    close(store->lock_fd);
     g_free(store->database_path);
     g_free(store->profiles_directory);
     g_free(store);

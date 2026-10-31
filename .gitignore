@@ -12,6 +12,8 @@ node_modules/
 dist/
 build/
 build-jsapi-host/
+tools/diagnostics/dmabuf_dump
+tools/diagnostics/evdev_touch_injector
 
 # MiniApp packaged artifacts
 # *.amr 打包产物经 Git LFS 入库（见 .gitattributes）
@@ -41,6 +43,9 @@ libs/libjsapi_browser_12345.so
 # Generated from wpe-drm/run.sh by scripts/sync_generated.sh.
 assets/wpe-runtime/run.sh
 assets/wpe-runtime/runtime/
+assets/wpe-runtime/.source-inputs.json
+assets/wpe-runtime/.wpe-bundle-staging
+assets/wpe-runtime/lib/gstreamer-1.0/include/
 
 # Local-only proprietary Mali runtime. Keep source, staging logic and docs,
 # but never publish vendor blobs or device-specific kernel modules.

@@ -1,0 +1,45 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU tile ownership running</title>
+<style>
+  html, body { margin: 0; background: #173752; color: #fff; font: 14px sans-serif; }
+  .row { height: 64px; display: grid; grid-template-columns: repeat(4, 1fr); }
+  .cell { box-sizing: border-box; padding: 8px 2px; border: 1px solid #102735; overflow: hidden; }
+  #glass { position: fixed; top: 80px; left: 12px; width: 120px; height: 32px;
+    background: rgba(244, 47, 92, .45); will-change: transform; }
+</style>
+<main id="rows"></main><div id="glass"></div>
+<script>
+  const cells = [];
+  const colors = ['#194f64', '#28553b', '#623d67', '#674b29'];
+  for (let row = 0; row < 100; row++) {
+    const element = document.createElement('div');
+    element.className = 'row';
+    for (let column = 0; column < 4; column++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.style.background = colors[column];
+      cell.textContent = 'R' + row + ' C' + column;
+      element.appendChild(cell);
+      cells.push(cell);
+    }
+    rows.appendChild(element);
+  }
+  let frame = 0;
+  function tick() {
+    frame++;
+    const extent = document.documentElement.scrollHeight - innerHeight;
+    scrollTo(0, Math.abs((frame * 23 % (extent * 2)) - extent));
+    const first = Math.floor(scrollY / 64) * 4;
+    const last = Math.min(cells.length, first + (Math.ceil(innerHeight / 64) + 2) * 4);
+    for (let i = first; i < last; i++) {
+      cells[i].textContent = 'R' + Math.floor(i / 4) + ' F' + frame;
+      // Alternate partial text updates and whole-tile background invalidation.
+      if (!(frame % 30)) cells[i].style.background = colors[(i + frame / 30) % 4];
+    }
+    glass.style.transform = 'translateX(' + Math.round(Math.sin(frame / 12) * 10) + 'px)';
+    if (frame < 600) requestAnimationFrame(tick);
+    else document.title = 'GPU tile ownership frozen frame 600';
+  }
+  requestAnimationFrame(tick);
+</script>

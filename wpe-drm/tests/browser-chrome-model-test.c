@@ -18,6 +18,7 @@ static void test_panel_definitions(void)
     }
 
     g_assert_cmpint(chrome_panel_from_name("unknown"), ==, CHROME_PANEL_NONE);
+    g_assert_cmpuint(chrome_panel_default_line_count(CHROME_PANEL_ABOUT), ==, 6);
     g_assert_cmpint(chrome_panel_parent(CHROME_PANEL_APPEARANCE), ==,
                     CHROME_PANEL_SETTINGS);
     g_assert_cmpuint(chrome_panel_default_line_count(
@@ -91,11 +92,33 @@ static void test_menu_grid_geometry(void)
     g_assert_cmpint(one_page.page_count, ==, 1);
 }
 
+static void test_panel_geometry(void)
+{
+    ChromeTabsGeometry tabs = browser_chrome_tabs_geometry(960, 266, 44, 8, 48);
+    g_assert_cmpint(tabs.panel_x, ==, 480);
+    g_assert_cmpint(tabs.panel_width, ==, 480);
+    g_assert_cmpint(tabs.list_top, ==, 44);
+    g_assert_cmpfloat(tabs.max_scroll, ==, 162);
+    ChromeMenuGeometry menu = browser_chrome_menu_geometry(960, 266, 44, 7);
+    g_assert_cmpint(menu.panel_x, ==, 320);
+    g_assert_cmpint(menu.panel_width, ==, 640);
+    g_assert_cmpint(menu.columns, ==, 3);
+    g_assert_cmpfloat(menu.max_scroll, ==, 640);
+    menu = browser_chrome_menu_geometry(266, 960, 80, 7);
+    g_assert_cmpint(menu.columns, ==, 2);
+    g_assert_cmpint(menu.rows, ==, 3);
+    g_assert_cmpint(menu.panel_y, ==, 80);
+    ChromeListGeometry list = browser_chrome_list_geometry(960, 266, 44, 8, 48, 32);
+    g_assert_cmpint(list.list_top, ==, 76);
+    g_assert_cmpfloat(list.max_scroll, ==, 194);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/browser/chrome/panel-definitions", test_panel_definitions);
     g_test_add_func("/browser/chrome/toolbar-geometry", test_toolbar_geometry);
     g_test_add_func("/browser/chrome/menu-grid-geometry", test_menu_grid_geometry);
+    g_test_add_func("/browser/chrome/panel-geometry", test_panel_geometry);
     return g_test_run();
 }

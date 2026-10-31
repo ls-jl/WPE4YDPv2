@@ -27,6 +27,7 @@ static const BrowserTranslation translations[] = {
     { "privacy_data", "隐私与数据", "PRIVACY & DATA" },
     { "language", "语言", "LANGUAGE" },
     { "about", "关于", "ABOUT" },
+    { "project_website", "项目主页（源码与更新）", "PROJECT WEBSITE" },
     { "theme", "主题", "THEME" },
     { "toolbar_auto_hide", "工具栏自动隐藏", "TOOLBAR AUTO-HIDE" },
     { "toolbar_gesture_in_immersive", "全屏/游戏双指三击", "TWO-FINGER TRIPLE TAP IN FULLSCREEN" },

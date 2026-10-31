@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 AMR="8001779591038449.1_0_0.amr"
+node scripts/verify_public_archive.mjs "$AMR"
 JSAPI="libs/arm64-orange/libjsapi_browser.so"
 LAUNCHER="assets/wpe-runtime/wpe-drm-minimal"
 WEBKIT="assets/wpe-runtime/lib/libWPEWebKit-2.0.so.1"

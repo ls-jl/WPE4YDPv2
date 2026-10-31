@@ -248,6 +248,13 @@ GPU profile 使用包内 `gpu/mali/lib`，通过 `libwpe-mali-gbm-compat.so` 补
 自带的新 `libdrm.so.2`。首帧 12 秒超时或首帧前 WebProcess 崩溃时，`auto`
 只重启一次 CPU profile；Home/SIGTERM 不触发回退。
 
+GPU profile 的兼容配置使用 `WEBKIT_SKIA_ENABLE_CPU_RENDERING=1`、
+`WEBKIT_SKIA_CPU_PAINTING_THREADS=3`、`WEBKIT_SKIA_GPU_PAINTING_THREADS=0`，
+网页图块在 CPU 光栅化后上传给 Mali 合成；`WEBKIT_SKIA_CPU_COMPOSITOR=0`
+与 `WEBKIT_WEBGL_DISABLE_GBM=0` 保持 GPU compositor 和 WebGL。内部 tile
+不强制 linear texture，最终 scanout 仍要求 `AR24:0:scanout`。这与下面的
+纯 CPU raster SHM profile 不同，视频 VPU/overlay 链路不变。
+
 CPU profile 设置：
 
 ```sh
@@ -306,7 +313,7 @@ WPE_PANEL_SIZE=${WPE_PANEL_SIZE:-960x266}
 WPE_VIEWPORT=${WPE_VIEWPORT:-$WPE_PANEL_SIZE}
 WPE_DRM_MODE=${WPE_DRM_MODE:-480x960}
 WPE_DRM_FIT=${WPE_DRM_FIT:-panel-native}
-WPE_CHROME_LAYOUT=${WPE_CHROME_LAYOUT:-inset}
+WPE_CHROME_LAYOUT=resize
 WPE_RAW_TOUCH=${WPE_RAW_TOUCH:-1}
 WPE_TOUCH_DEVICE=<JSAPI 从 cfg.json 解析出的 device.tp>
 WPE_TOUCH_NATIVE_SCROLL=${WPE_TOUCH_NATIVE_SCROLL:-1}
@@ -367,7 +374,7 @@ WPE 主程序启动后会执行：
 - 对底层 `WPEView` 调用 `wpe_view_resized()`
 - 使用 `apply_viewport(..., "env")` 应用布局尺寸
 
-默认 `WPE_CHROME_LAYOUT=inset` 时，toolbar 显示/隐藏不会频繁触发 WebKit resize/reflow。`WPE_CHROME_LAYOUT=resize` 只作为调试开关保留，用来对比旧的 WebView 高度重排路径。
+工具栏使用真实 `resize` 布局：横屏保留 44px，竖屏保留 80px。展开时先调整内容区，收起时在动画终点恢复全高；动画和菜单拖动不重复发送同尺寸 resize。旧 inset 布局已删除。
 
 ### 5.4 framebuffer
 

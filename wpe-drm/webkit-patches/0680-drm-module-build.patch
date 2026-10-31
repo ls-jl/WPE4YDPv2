@@ -1,0 +1,13 @@
+--- a/Source/WebKit/WPEPlatform/wpe/drm/CMakeLists.txt
++++ b/Source/WebKit/WPEPlatform/wpe/drm/CMakeLists.txt
+@@ -13,5 +13,10 @@ set(WPEPlatformDRM_SOURCES
+     ${WEBKIT_DIR}/WPEPlatform/wpe/drm/WPEToplevelDRM.cpp
+     ${WEBKIT_DIR}/WPEPlatform/wpe/drm/WPEViewDRM.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/drm/DRMGeometry.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/drm/DRMScanoutBuffer.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/drm/DRMFrameQueue.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/drm/ChromeRenderer.cpp
++    ${WEBKIT_DIR}/WPEPlatform/wpe/drm/VideoOverlay.cpp
+ )
+ 
+ set(WPEPlatformDRM_INSTALLED_HEADERS

@@ -40,29 +40,6 @@ LAUNCHER_ELF="$STAGE/wpe-drm-minimal"
 test -f "$WEBKIT_ELF"
 test -f "$LAUNCHER_ELF"
 
-cat > "$OUTPUT.tmp" <<EOF
-{
-  "schema": 1,
-  "webkit_revision": "$REVISION",
-  "patch_series_sha256": "$SERIES_HASH",
-  "build_flags": {
-    "ENABLE_WEB_RTC": true,
-    "USE_GSTREAMER_WEBRTC": true,
-    "ENABLE_MEDIA_STREAM": true,
-    "ENABLE_VIDEO": true,
-    "ENABLE_WEBGL": true,
-    "USE_AVIF": true,
-    "USE_JPEGXL": false,
-    "USE_GBM": true,
-    "USE_SKIA": true,
-    "ENABLE_GPU_PROCESS": false
-  },
-  "artifacts": {
-    "lib/libWPEWebKit-2.0.so.1": "$(hash_file "$WEBKIT_ELF")",
-    "wpe-drm-minimal": "$(hash_file "$LAUNCHER_ELF")"
-  }
-}
-EOF
-mv "$OUTPUT.tmp" "$OUTPUT"
-chmod 600 "$OUTPUT"
-echo "Build manifest: $OUTPUT"
+PROJECT_ROOT="$ROOT" node "$ROOT/scripts/write_build_manifest.mjs" \
+  "$OUTPUT" "$STAGE" "${WEBKIT_BUILD:?WEBKIT_BUILD is required}/CMakeCache.txt" \
+  "$REVISION" "$SERIES_HASH"

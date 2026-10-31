@@ -128,12 +128,15 @@ export default {
       this.keyboardBridge.reconcileActiveRequest()
       if (!this.browser.leaving) {
         this.browserLifecycle.start()
+      } else {
+        this.browserLifecycle.scheduleReturn()
       }
     },
     onHide() {
       console.warn('wpe frame onHide')
       this.ensureControllers()
       this.pageVisible = false
+      this.browserLifecycle.cancelPendingStart()
       if (this.keyboardBridge.onPageHide()) {
         console.warn('wpe frame onHide ignored while keyboard active')
         return

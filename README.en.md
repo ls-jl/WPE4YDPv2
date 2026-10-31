@@ -13,12 +13,13 @@ The MiniApp is only responsible for the launcher page, lifecycle management, the
 
 - **Fully self-contained in-package runtime**: WebKit, Mesa software rendering, GStreamer, OpenSSL, libnice, libsrtp, MPP decoding, ALSA, fonts, and CA certificates are bundled. Local builds may additionally stage the Mali G52 runtime and kernel modules.
 - **GPU auto-detection with strict CPU fallback**: `WPE_GPU_MODE=auto` validates Mali EGL/GLES, linear DMA-BUF export and mapping, and DRM framebuffer creation. Any failure falls back to Skia CPU plus dma-heap/SHM.
+- **GPU compatibility profile**: three Skia CPU workers raster webpage tiles; Mali still performs final composition and WebGL, while video retains the VPU overlay path. This avoids persistent missing tiles seen during rapid round-trip scrolling. It does not disable the GPU or imply that all 2D Canvas painting is GPU accelerated.
 - **RGA page-rotation fast path**: on rotated devices, the bundled `librga.so.2` writes WebKit DMABufs directly into DRM dumb scanout buffers, avoiding a per-frame CPU map/read/rotate of Mali buffers. The prior CPU path remains an automatic fallback.
 - **KMS overlay direct video output (hole-punch)**: `mppvideodec` VPU hardware decoding + RGA hardware pre-rotation output NV12 dmabuf, delivered to the UI process via a unix socket and placed on an idle Esmart overlay plane for direct scan-out.
 - **WebRTC cloud-gaming path**: WebKit uses the GStreamer PeerConnection backend with bundled ICE/DTLS/SRTP/SCTP/RTP/Opus support. Remote media and DataChannels are allowed while microphone, camera, and screen capture are denied. Cloud Genshin hosts automatically use native multi-touch `game` input.
 - **Kernel deeply customized per device model**: `-mcpu=cortex-a53` + ThinLTO + **PGO** (profile-use from real-device workload sampling on Douyin/Bilibili/Baidu, etc.); trimmed SAMPLING_PROFILER / REMOTE_INSPECTOR / WEBDRIVER / JAVASCRIPT_SHELL / PDFJS / MATHML / GPU_PROCESS and more.
 - **Low-memory self-protection**: startup headroom selects a unified `448/512/640MB` profile. The 1GB balanced profile reclaims at 40%/58% and terminates the WebProcess only at 96%, preventing premature termination while system headroom remains. A repeated limit breach shows a retry page instead of looping reloads.
-- **Low-risk memory policy**: global swappiness and `drop_caches` remain untouched by default. System-wide experiments are available only through explicit diagnostic switches.
+- **Low-risk memory policy**: the production supervisor never modifies global swappiness or `drop_caches`.
 - **Mobile UA + per-site profiles**: defaults to an Android Chrome UA; supports switching between desktop/mobile profiles per site.
 - **Persistent user profiles and cookies**: up to eight persistent profiles plus Guest. Cookies, LocalStorage, IndexedDB, service workers, cache, tabs, history, bookmarks, and site mode are isolated. Browser metadata uses SQLite WAL; each profile has its own WebKit SQLite CookieJar.
 - Native toolbar `resize` layout (a visible toolbar reserves a real WebView content inset), Chrome-style overflow menu, direct address editing, horizontal scrolling, system keyboard bridge, and `0°/90°/180°/270°` modes relative to the device-native orientation. All four modes reuse only the proven legacy `native` and `rotate270` page-layout templates; DRM output and touch rotations are applied independently after layout selection so a landscape viewport is never stretched into portrait.
@@ -51,15 +52,40 @@ npm run build          # produces 8001779591038449.1_0_0.amr
 npm test               # JS/native/SQLite/shell/runtime/patch-series checks
 ```
 
-`scripts/sync_generated.sh` is run automatically before the build to sync single-source files. **If packaging reports an xkb-related ENOENT after changing assets, clear the cache first**:
+The build now targets the local x86_64 Linux host. See `tools/MIGRATION_STATUS.md`
+for local rebuild records and remaining device validation. A successful build is not hardware acceptance.
 
 ```sh
-rm -rf .falcon_ .falcon_tmp && npm run build
+sudo bash scripts/install_host_deps.sh
+bash scripts/prepare_host_tools.sh
+source scripts/build-env.sh
+npm ci
+npm run setup:sdk              # first setup only; existing sysroots are preserved
+npm run setup:media
+npm run setup:abi
+npm run check:build
+npm run build:jsapi
+npm run build:runtime
+npm run build:gpu-helpers
+npm run stage:gpu
+npm run assemble:runtime
+bash scripts/promote_native.sh /srv/wpe-build/build/stage/bundle
+npm run build:cpu
+npm run build:gpu
 ```
 
-The WebKit core and `wpe-drm-minimal` are built on the ARM64 cross-compilation server. `scripts/build_webrtc_runtime_pve.sh` creates an isolated worktree at the recorded revision, replays `series`, and emits `build-manifest.json` with the revision, patch hash, build switches, and ELF SHA256 values. Do not patch a long-lived shared WebKit tree in place.
+SDK, downloads and build output default to `/srv/wpe-build`. Override
+`DICTPEN_ROOT/WPE_SDK_ROOT/WPE_BUILD_ROOT/WEBKIT_BASE/JOBS` as needed. Defaults are
+6 compile jobs, 1 link job and 2 ThinLTO workers. Legacy script names remain
+local compatibility entrypoints. Existing worktrees are never force-removed.
+Reuse requires matching replay inputs and source contents. Select fresh
+`WEBRTC_STAGE` and `WPE_BUNDLE_STAGE` paths for another artifact set.
 
-The only supported build checkout is `pve@192.168.100.118:/home/pve/web-browser-src`; the old Parallels builder is retired. After syncing the repository, run both builds on PVE with `PROJECT_ROOT=$PWD JOBS=72`.
+`build`/`build:cpu` use isolated package staging without private GPU assets;
+`build:gpu` writes only `.cache/releases/gpu/`. Packaging requires new native
+source/toolchain provenance, not a manually refreshed baseline manifest.
+Development builds are also isolated because the CLI removes the cwd AMR even
+in development mode. Native archive members are individually hash-checked.
 
 ## Running
 
@@ -134,9 +160,34 @@ The original code of this project (`src/`, `jsapi/`, `scripts/`, `tools/`, etc.)
 
 Files under `wpe-drm/` that are mirrored from the WPE WebKit project retain their original licenses (BSD-2-Clause / LGPL-2.0-or-later) and **are not covered by the root `LICENSE`**. See `wpe-drm/webkit-patches/README.md` for the complete list of third-party licenses and details.
 
-Proprietary Mali userspace blobs and kernel modules are local-only build inputs. They are explicitly ignored by Git and are not licensed for redistribution by this repository.
+The optional Mali userspace driver is pinned G52 g13p0 GBM with an ARM EULA
+expressly allowing conditional redistribution. See [source and license scope](licenses/mali/README.md).
+It is proprietary, not MIT; the runtime includes the complete EULA and notices.
+Firmware wrappers and `libmali_hook` are no longer used. Kernel modules are
+not covered by that grant, so GPU packages containing KOs remain local-only;
+the public CPU-only release policy is unchanged.
+
+In the browser, open Menu → Settings → About → Project Website to find and
+open `https://github.com/ls-jl/WPE4YDPv2`.
 
 ## Future Directions
+
+### Stability Refactor And Release Gate
+
+See `tools/STABILITY_REFACTOR_STATUS.md` for completed source fixes and pending
+device acceptance, and `tools/MIGRATION_STATUS.md` for the local ARM64 rebuild.
+
+`npm run verify:public` inspects AMR entries and rejects private Mali/KO assets
+and unsafe paths. Upload and public release-manifest generation enforce this
+gate. The historical GPU baseline remains a private rollback package; history
+is not rewritten here. The root AMR is now the CPU build and GPU packages stay
+under `.cache/releases/gpu/`. Ignoring source blob directories alone does not
+prevent their inclusion in an archive.
+
+Cloud auto-click and expired-certificate exceptions now default to off. Explicit
+diagnostic overrides remain `WPE_CLOUD_AUTOSTART=1` and
+`WPE_CLOUDGAME_ALLOW_EXPIRED_TLS=1`; the latter weakens security and is not a
+release default. Startup no longer unmutes the system mixer.
 
 - Video overlay phase two: CPU NV12 rotation fallback for scenarios without RGA; in-fence sync when the plane is idle.
 - Runtime slimming baseline and whitelist policy: see `tools/RUNTIME_INVENTORY.md`.

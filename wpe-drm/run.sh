@@ -56,11 +56,7 @@ else
 fi
 
 # 浏览器音频走系统 ALSA（RK817 codec，/etc/asound.conf 路由到 speaker）。
-# 启动前尽力解除静音，失败不阻塞。
-if command -v amixer >/dev/null 2>&1; then
-    env -u LD_LIBRARY_PATH amixer sset Master unmute >/dev/null 2>&1 || true
-    env -u LD_LIBRARY_PATH amixer sset Playback unmute >/dev/null 2>&1 || true
-fi
+# 不改变用户的音量或静音选择。
 export GIO_MODULE_DIR="$DIR/lib/gio/modules"
 export GIO_EXTRA_MODULES="$DIR/lib/gio/modules"
 export G_TLS_CA_FILE="${G_TLS_CA_FILE:-$DIR/etc/ssl/certs/ca-certificates.crt}"
@@ -138,7 +134,6 @@ export JSC_thresholdForOptimizeAfterWarmUp="${JSC_thresholdForOptimizeAfterWarmU
 export WPE_TOUCH_HORIZONTAL_SCROLL="${WPE_TOUCH_HORIZONTAL_SCROLL:-1}"
 export WPE_DRM_MAX_FPS="${WPE_DRM_MAX_FPS:-0}"
 export WPE_DRM_FENCE_TIMEOUT_MS="${WPE_DRM_FENCE_TIMEOUT_MS:-2000}"
-export WPE_DRM_PARTIAL_COPY="${WPE_DRM_PARTIAL_COPY:-0}"
 # Use the packaged Rockchip RGA for rotated Mali frames. In auto mode any
 # import/rotation failure falls back to the existing CPU copy path.
 export WPE_DRM_RGA_ROTATION="${WPE_DRM_RGA_ROTATION:-auto}"
@@ -151,8 +146,8 @@ export WPE_WEBRTC="${WPE_WEBRTC:-1}"
 export WPE_WEBRTC_CAPTURE="${WPE_WEBRTC_CAPTURE:-deny}"
 # 云原神的信令 WSS 当前在 *.mhystatic.com:5443 返回已过期证书。
 # WebKit 内核只对该域名后缀、该端口且错误仅为 EXPIRED 时放行；
-# 未知 CA、域名不匹配及其他 TLS 错误继续拒绝。设为 0 可完全关闭例外。
-export WPE_CLOUDGAME_ALLOW_EXPIRED_TLS="${WPE_CLOUDGAME_ALLOW_EXPIRED_TLS:-1}"
+# 默认严格校验。仅显式诊断时设为 1；其他 TLS 错误始终拒绝。
+export WPE_CLOUDGAME_ALLOW_EXPIRED_TLS="${WPE_CLOUDGAME_ALLOW_EXPIRED_TLS:-0}"
 
 # 视频 KMS overlay 直出（hole-punch）：mppvideodec 解码 NV12 dmabuf 经 RGA
 # 预旋转后直接放 DRM overlay plane，跳过软件颜色转换与 Skia 合成。
@@ -173,24 +168,6 @@ case "$WPE_OOM_SCORE_ADJ" in
     *) echo "WPE warn: invalid WPE_OOM_SCORE_ADJ=$WPE_OOM_SCORE_ADJ; keeping system default" ;;
 esac
 
-# 全局 VM 调优默认关闭。高 swappiness 在 512MB swap 已满的设备上会放大交互
-# 延迟；drop_caches 也会让浏览器首屏重新产生大量 I/O。仅保留显式诊断开关。
-if [ "${WPE_DROP_CACHES:-0}" = "1" ]; then
-    sync 2>/dev/null || true
-    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-fi
-WPE_SAVED_SWAPPINESS=""
-if [ -n "${WPE_SWAPPINESS:-}" ]; then
-    WPE_SAVED_SWAPPINESS="$(cat /proc/sys/vm/swappiness 2>/dev/null)"
-    if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
-        echo "$WPE_SWAPPINESS" > /proc/sys/vm/swappiness 2>/dev/null || WPE_SAVED_SWAPPINESS=""
-    fi
-fi
-restore_swappiness() {
-    if [ -n "$WPE_SAVED_SWAPPINESS" ]; then
-        echo "$WPE_SAVED_SWAPPINESS" > /proc/sys/vm/swappiness 2>/dev/null || true
-    fi
-}
 export WPE_CHROME_ENABLED="${WPE_CHROME_ENABLED:-1}"
 export WPE_CHROME_HEIGHT="${WPE_CHROME_HEIGHT:-44}"
 export WPE_CHROME_PORTRAIT_HEIGHT="${WPE_CHROME_PORTRAIT_HEIGHT:-80}"
@@ -206,14 +183,7 @@ export WPE_CHROME_GESTURE_QUIET_MS="${WPE_CHROME_GESTURE_QUIET_MS:-500}"
 export WPE_CHROME_HIDE_DOWN_PX="${WPE_CHROME_HIDE_DOWN_PX:-96}"
 export WPE_CHROME_SHOW_UP_PX="${WPE_CHROME_SHOW_UP_PX:-180}"
 export WPE_CHROME_SHOW_UP_MIN_VELOCITY="${WPE_CHROME_SHOW_UP_MIN_VELOCITY:-700}"
-WPE_CHROME_LAYOUT="${WPE_CHROME_LAYOUT:-resize}"
-# Older JSAPI builds injected the legacy overlay value before exec. Migrate it
-# at the package entry point so a stale bridge cannot cover page content.
-if [ "$WPE_CHROME_LAYOUT" = "inset" ]; then
-    echo "WPE chrome: legacy layout=inset migrated to resize"
-    WPE_CHROME_LAYOUT=resize
-fi
-export WPE_CHROME_LAYOUT
+export WPE_CHROME_LAYOUT=resize
 export WPE_CHROME_STATE="${WPE_CHROME_STATE:-$VAR_DIR/browser-state.ini}"
 export WPE_CHROME_RENDER_STATE="${WPE_CHROME_RENDER_STATE:-$VAR_DIR/chrome-render-state.ini}"
 export WPE_BROWSER_DB="${WPE_BROWSER_DB:-$VAR_DIR/browser.sqlite3}"
@@ -392,7 +362,7 @@ export WPE_TOUCH_SCROLL_INTERVAL_MS="${WPE_TOUCH_SCROLL_INTERVAL_MS:-16}"
 export WPE_TOUCH_SCROLL_STOP_DELAY_MS="${WPE_TOUCH_SCROLL_STOP_DELAY_MS:-80}"
 export WPE_INPUT_PROFILE="${WPE_INPUT_PROFILE:-auto}"
 export WPE_GAME_HOSTS="${WPE_GAME_HOSTS:-ys.mihoyo.com,cloudgame.mihoyo.com}"
-export WPE_CLOUD_AUTOSTART="${WPE_CLOUD_AUTOSTART:-1}"
+export WPE_CLOUD_AUTOSTART="${WPE_CLOUD_AUTOSTART:-0}"
 export WPE_DEFAULT_URL="${WPE_DEFAULT_URL:-https://m.baidu.com/}"
 URL="${1:-$WPE_DEFAULT_URL}"
 DRM="${2:-/dev/dri/card0}"
@@ -403,7 +373,6 @@ export WPE_DRM_VIEWPORT="$VIEWPORT"
 export WPE_DRM_ROTATION="$ROTATION"
 export WPE_PANEL_ROTATION="${WPE_PANEL_ROTATION:-$ROTATION}"
 export WPE_TOUCH_ROTATION="${WPE_TOUCH_ROTATION:-$WPE_PANEL_ROTATION}"
-export WPE_DRM_ROTATION_FILE="${WPE_DRM_ROTATION_FILE:-$VAR_DIR/rotation}"
 if [ -z "$WPE_DRM_DMA_HEAP" ]; then
     case "$ROTATION" in
         0|360|-0) WPE_DRM_DMA_HEAP=/dev/dma_heap/system-uncached ;;
@@ -454,7 +423,6 @@ cleanup_runtime() {
         KEEP_PID=
     fi
     cleanup_gpu_modules
-    restore_swappiness
 }
 
 on_terminate() {
@@ -497,10 +465,6 @@ run_profile_switch_loop() {
             return "$BROWSER_STATUS"
         fi
         PROFILE_SWITCH_COUNT=$((PROFILE_SWITCH_COUNT + 1))
-        if [ "$PROFILE_SWITCH_COUNT" -gt 32 ]; then
-            echo "WPE profile switch aborted: restart limit exceeded"
-            return 76
-        fi
         if [ ! -f "$WPE_PROFILE_SWITCH_FILE" ]; then
             echo "WPE profile switch failed: request file missing"
             return 76
@@ -521,7 +485,6 @@ run_profile_switch_loop() {
 
 trap cleanup_runtime EXIT
 trap on_terminate INT TERM
-printf '%s\n' "$ROTATION" >"$WPE_DRM_ROTATION_FILE" 2>/dev/null || true
 
 if command -v hal-screen >/dev/null 2>&1; then
     env -u LD_LIBRARY_PATH -u LD_PRELOAD hal-screen on >/dev/null 2>&1 || true
@@ -575,11 +538,6 @@ while :; do
         break
     fi
     GPU_RESTART_COUNT=$((GPU_RESTART_COUNT + 1))
-    if [ "$GPU_RESTART_COUNT" -gt 8 ]; then
-        echo "WPE GPU mode restart aborted: restart limit exceeded"
-        STATUS=76
-        break
-    fi
     cleanup_gpu_modules
     load_gpu_mode_preference
     echo "WPE GPU mode restart: mode=$GPU_MODE count=$GPU_RESTART_COUNT"

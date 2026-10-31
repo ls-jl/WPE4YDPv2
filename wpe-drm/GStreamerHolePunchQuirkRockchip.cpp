@@ -18,6 +18,7 @@
  */
 
 #include "config.h"
+#include "VideoOverlayWire.h"
 #include "GStreamerHolePunchQuirkRockchip.h"
 
 #if USE(GSTREAMER)
@@ -25,6 +26,7 @@
 #include "GStreamerCommon.h"
 #include "IntRect.h"
 #include <algorithm>
+#include <glib-unix.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
@@ -38,34 +40,6 @@
 #include <wtf/glib/GUniquePtr.h>
 
 namespace WebCore {
-
-// 线格式必须与 Source/WebKit/WPEPlatform/wpe/drm/WPEViewDRM.cpp 中的定义
-// 保持一字不差。
-enum : uint32_t {
-    VideoOverlayMessageFrame = 1,
-    VideoOverlayMessageRect = 2,
-    VideoOverlayMessageHide = 3,
-    VideoOverlayMessageRelease = 4,
-};
-
-struct VideoOverlayWireMessage {
-    uint32_t version;
-    uint32_t type;
-    uint64_t sequence;
-    uint32_t fourcc;
-    uint32_t width;
-    uint32_t height;
-    uint32_t planeCount;
-    uint32_t strides[3];
-    uint32_t offsets[3];
-    int32_t rectX;
-    int32_t rectY;
-    int32_t rectWidth;
-    int32_t rectHeight;
-    uint64_t modifier;
-};
-
-static constexpr uint32_t videoOverlayProtocolVersion = 2;
 
 #ifndef DRM_FORMAT_NV12
 #define DRM_FORMAT_NV12 0x3231564e // 'NV12' little-endian，避免引 drm_fourcc.h
@@ -98,12 +72,15 @@ public:
         Locker locker { m_lock };
         if (m_owner != owner)
             return;
-        sendSimpleMessageLocked(VideoOverlayMessageHide);
-        waitForReleaseAcksLocked(100);
-        m_inFlightSamples.clear();
-        closeLocked();
+        if (m_inFlightSamples.isEmpty())
+            closeLocked();
+        else {
+            m_close.request(m_nextSequence++);
+            sendSimpleMessageLocked(VideoOverlayMessageHide);
+        }
         m_owner = nullptr;
-        g_message("Rockchip video overlay: owner=%p released", owner);
+        g_message("Rockchip video overlay: owner=%p close_requested=%" G_GUINT64_FORMAT " retained=%zu",
+            owner, m_close.sequence(), m_inFlightSamples.size());
     }
 
     void setRectangle(RockchipVideoOverlaySinkContext* owner, const IntRect& rect)
@@ -147,6 +124,10 @@ public:
             return;
 
         Locker locker { m_lock };
+        if (m_close.pending()) {
+            m_droppedInFlight++;
+            return;
+        }
         if (m_owner != owner) {
             if (m_owner) {
                 if (!owner->loggedOwnerBusy) {
@@ -220,6 +201,10 @@ private:
     {
         if (m_socket >= 0)
             return true;
+        if (!m_inFlightSamples.isEmpty() || m_close.pending()) {
+            warnOnceLocked("disconnected scanout samples remain quarantined; channel restart requires teardown");
+            return false;
+        }
         // 连接失败退避 5 秒，避免逐帧重连刷日志。
         gint64 now = g_get_monotonic_time();
         if (m_lastConnectAttemptUS && now - m_lastConnectAttemptUS < 5 * G_USEC_PER_SEC)
@@ -243,7 +228,7 @@ private:
             warnOnceLocked("video overlay socket path is too long");
             return false;
         }
-        int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (fd < 0)
             return false;
         address.sun_family = AF_UNIX;
@@ -254,11 +239,20 @@ private:
             return false;
         }
         m_socket = fd;
+        m_ackSource = adoptGRef(g_unix_fd_source_new(fd,
+            static_cast<GIOCondition>(G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL)));
+        g_source_set_callback(m_ackSource.get(), G_SOURCE_FUNC(+[](int, GIOCondition, gpointer data) -> gboolean {
+            auto* channel = static_cast<RockchipVideoOverlayChannel*>(data);
+            Locker locker { channel->m_lock };
+            channel->drainReleaseAcksLocked();
+            return channel->m_socket >= 0 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
+        }), this, nullptr);
+        g_source_attach(m_ackSource.get(), g_main_context_default());
         g_message("Rockchip video overlay: connected to %s", path);
         return true;
     }
 
-    bool sendLocked(const VideoOverlayWireMessage& message, int dmabufFD)
+    bool sendPacketLocked(const VideoOverlayWireMessage& message, int dmabufFD)
     {
         if (m_socket < 0)
             return false;
@@ -277,10 +271,42 @@ private:
             cmsg->cmsg_len = CMSG_LEN(sizeof(int));
             memcpy(CMSG_DATA(cmsg), &dmabufFD, sizeof(int));
         }
-        if (sendmsg(m_socket, &msg, MSG_NOSIGNAL) < 0) {
-            g_warning("Rockchip video overlay: sendmsg failed: %s", g_strerror(errno));
-            closeLocked();
+        if (sendmsg(m_socket, &msg, MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                g_warning("Rockchip video overlay: sendmsg failed; retaining %zu samples: %s",
+                    m_inFlightSamples.size(), g_strerror(errno));
+                closeLocked();
+            }
             return false;
+        }
+        return true;
+    }
+
+    bool sendLocked(const VideoOverlayWireMessage& message, int dmabufFD)
+    {
+        if (sendPacketLocked(message, dmabufFD))
+            return true;
+        if (m_socket < 0 || message.type == VideoOverlayMessageFrame)
+            return false;
+        m_pendingControl = message;
+        m_hasPendingControl = true;
+        if (!m_writeSource) {
+            m_writeSource = adoptGRef(g_unix_fd_source_new(m_socket,
+                static_cast<GIOCondition>(G_IO_OUT | G_IO_ERR | G_IO_HUP | G_IO_NVAL)));
+            g_source_set_callback(m_writeSource.get(), G_SOURCE_FUNC(+[](int, GIOCondition, gpointer data) -> gboolean {
+                auto* channel = static_cast<RockchipVideoOverlayChannel*>(data);
+                Locker locker { channel->m_lock };
+                if (channel->m_hasPendingControl && channel->m_socket >= 0
+                    && !channel->sendPacketLocked(channel->m_pendingControl, -1))
+                    return channel->m_socket >= 0 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
+                channel->m_hasPendingControl = false;
+                if (channel->m_writeSource) {
+                    g_source_destroy(channel->m_writeSource.get());
+                    channel->m_writeSource = nullptr;
+                }
+                return G_SOURCE_REMOVE;
+            }), this, nullptr);
+            g_source_attach(m_writeSource.get(), g_main_context_default());
         }
         return true;
     }
@@ -299,8 +325,22 @@ private:
                     closeLocked();
                 return;
             }
-            if (message.version != videoOverlayProtocolVersion
-                || message.type != VideoOverlayMessageRelease || !message.sequence)
+            if (!videoOverlayWireValid(message, received) || !message.sequence)
+                continue;
+            if (message.type == VideoOverlayMessageCloseComplete) {
+                if (!m_close.acknowledge(message.sequence))
+                    continue;
+                if (!m_inFlightSamples.isEmpty()) {
+                    g_warning("Rockchip video overlay: close ACK preceded release ACKs; quarantining %zu samples", m_inFlightSamples.size());
+                    closeLocked();
+                    return;
+                }
+                g_message("Rockchip video overlay: close_complete=%" G_GUINT64_FORMAT, message.sequence);
+                m_close = { };
+                closeLocked();
+                return;
+            }
+            if (message.type != VideoOverlayMessageRelease)
                 continue;
             for (size_t index = 0; index < m_inFlightSamples.size(); ++index) {
                 if (m_inFlightSamples[index].sequence != message.sequence)
@@ -315,26 +355,12 @@ private:
         }
     }
 
-    void waitForReleaseAcksLocked(int timeoutMS)
-    {
-        if (m_socket < 0 || m_inFlightSamples.isEmpty())
-            return;
-        gint64 deadlineUS = g_get_monotonic_time() + timeoutMS * 1000;
-        while (!m_inFlightSamples.isEmpty() && g_get_monotonic_time() < deadlineUS) {
-            struct pollfd descriptor = { m_socket, POLLIN, 0 };
-            int remainingMS = std::max(1, static_cast<int>((deadlineUS - g_get_monotonic_time()) / 1000));
-            if (poll(&descriptor, 1, remainingMS) <= 0)
-                break;
-            drainReleaseAcksLocked();
-        }
-    }
-
     void logStatsLocked()
     {
         if (m_sentFrames < m_nextStatsFrame)
             return;
         double averageACKMS = m_ackedFrames ? m_ackLatencyTotalUS / 1000. / m_ackedFrames : 0.;
-        g_message("Rockchip video overlay v2: sent=%" G_GUINT64_FORMAT
+        g_message("Rockchip video overlay v3: sent=%" G_GUINT64_FORMAT
             " acked=%" G_GUINT64_FORMAT " inflight=%zu dropped=%" G_GUINT64_FORMAT
             " ack_avg_ms=%.2f ack_max_ms=%.2f",
             m_sentFrames, m_ackedFrames, m_inFlightSamples.size(), m_droppedInFlight,
@@ -347,22 +373,37 @@ private:
         VideoOverlayWireMessage message = { };
         message.version = videoOverlayProtocolVersion;
         message.type = type;
+        if (type == VideoOverlayMessageHide)
+            message.sequence = m_close.sequence();
         sendLocked(message, -1);
     }
 
     void closeLocked()
     {
+        if (m_ackSource) {
+            g_source_destroy(m_ackSource.get());
+            m_ackSource = nullptr;
+        }
+        if (m_writeSource) {
+            g_source_destroy(m_writeSource.get());
+            m_writeSource = nullptr;
+        }
         if (m_socket >= 0) {
             close(m_socket);
             m_socket = -1;
         }
-        // No release ACK can arrive after disconnect. Clearing retained
-        // samples also gives a later connection a fresh in-flight window.
-        m_inFlightSamples.clear();
+        // Disconnect is not proof that the consumer stopped scanout.
+        // Retained samples are bounded and cannot return to the decoder pool.
+        m_hasPendingControl = false;
     }
 
     Lock m_lock;
     int m_socket { -1 };
+    GRefPtr<GSource> m_ackSource;
+    GRefPtr<GSource> m_writeSource;
+    VideoCloseState m_close;
+    VideoOverlayWireMessage m_pendingControl;
+    bool m_hasPendingControl { false };
     RockchipVideoOverlaySinkContext* m_owner { nullptr };
     bool m_warned { false };
     gint64 m_lastConnectAttemptUS { 0 };

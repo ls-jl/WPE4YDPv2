@@ -1,12 +1,5 @@
 export class BasePage extends $falcon.Page {
   /**
-   * 构造函数,页面生命周期内只执行一次
-   */
-  constructor() {
-    super()
-  }
-
-  /**
    * 页面生命周期:首次启动
    * @param Object options 页面启动参数
    */
@@ -35,7 +28,7 @@ export class BasePage extends $falcon.Page {
     super.onShow()
 
     //onshow以后组件才创建,可以调用组件的方法
-    if (this.$root.onShow) {
+    if (this.$root && this.$root.onShow) {
       this.$root.onShow()
     }
   }
@@ -45,7 +38,7 @@ export class BasePage extends $falcon.Page {
    */
   onHide() {
     super.onHide()
-    if (this.$root.onHide) {
+    if (this.$root && this.$root.onHide) {
       this.$root.onHide()
     }
   }
@@ -55,7 +48,7 @@ export class BasePage extends $falcon.Page {
    */
   onUnload() {
     super.onUnload()
-    if (this.$root.onUnload) {
+    if (this.$root && this.$root.onUnload) {
       this.$root.onUnload()
     }
   }

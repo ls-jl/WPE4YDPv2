@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/JeffyCN/mirrors",
+  "revision": "34f626298b0e8f884545365b66bb47678266e8d7",
+  "path": "lib/aarch64-linux-gnu/libmali-bifrost-g52-g13p0-dummy-gbm.so",
+  "sha256": "123514cc2e91c52fdb3bf0ac544b0bd2ad2052d359e642ab2e88f5fda2415991",
+  "license": "ARM Mali Driver EULA LES-PRE-20769, 2015-11-25",
+  "notices": {
+    "END_USER_LICENCE_AGREEMENT.txt": "a78acc73de9909efb879800d4daa4640c4aaa55cd751238a133954aba15e4285",
+    "upstream-copyright": "a254205ab051a9a6cf952bf73d9f40715eb3bd2963d82ac462762e4dda1e8c77"
+  }
+}

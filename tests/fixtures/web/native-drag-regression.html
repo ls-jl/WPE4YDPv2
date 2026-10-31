@@ -1,0 +1,27 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tap=0 pad=0 y=0</title>
+<style>
+  body { margin:0; font:16px sans-serif; }
+  .stripe { height:64px; border-bottom:2px solid black; padding:8px; }
+  #tap { position:fixed; top:4px; left:24px; width:210px; height:28px; z-index:3; }
+  #edit { position:fixed; top:40px; left:24px; width:210px; height:28px; z-index:3; }
+  #pad { position:fixed; top:100px; left:0; width:100%; height:100px; background:#ffd75e; touch-action:none; z-index:3; }
+</style>
+<button id="tap">Tap</button><input id="edit" placeholder="Keyboard regression"><div id="pad">Prevented touch drag</div>
+<script>
+  let taps=0, moves=0;
+  const publish=()=>{document.title='tap='+taps+' pad='+moves+' y='+Math.round(scrollY);};
+  for(let i=0;i<100;i++) {
+    const row=document.createElement('div');
+    row.className='stripe';
+    row.style.background='hsl('+((i*47)%360)+',60%,78%)';
+    row.textContent='Row '+i;
+    document.body.appendChild(row);
+  }
+  tap.onclick=()=>{taps++;publish();};
+  pad.addEventListener('touchstart',e=>{e.preventDefault();},{passive:false});
+  pad.addEventListener('touchmove',e=>{e.preventDefault();moves++;publish();},{passive:false});
+  pad.addEventListener('touchend',e=>{e.preventDefault();publish();},{passive:false});
+  addEventListener('scroll',publish,{passive:true});
+</script>

@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-BUILD_ROOT="${JSAPI_BUILD_ROOT:-/home/pve/web-browser-jsapi-build}"
-TOOLCHAIN_ROOT="${JSAPI_TOOLCHAIN_ROOT:-/home/pve/wpe_lite/toolchains/aarch64--glibc--stable-2018.11-1}"
-JOBS="${JOBS:-72}"
+source "$(dirname "$0")/build-env.sh"
+BUILD_ROOT="$JSAPI_BUILD_ROOT"
+TOOLCHAIN_ROOT="$JSAPI_TOOLCHAIN_ROOT"
 CC="$TOOLCHAIN_ROOT/bin/aarch64-buildroot-linux-gnu-gcc"
 CXX="$TOOLCHAIN_ROOT/bin/aarch64-buildroot-linux-gnu-g++"
 OUTPUT="$BUILD_ROOT/build/libjsapi_browser.so"
-DESTINATION="$PROJECT_ROOT/libs/arm64-orange/libjsapi_browser.so"
+DESTINATION="${JSAPI_STAGE:-$WPE_BUILD_ROOT/stage/jsapi/libjsapi_browser.so}"
 
 for tool in "$CC" "$CXX"; do
     if [ ! -x "$tool" ]; then
-        echo "error: PVE AArch64 toolchain is missing: $tool" >&2
+        echo "error: local AArch64 toolchain is missing: $tool" >&2
         exit 1
     fi
 done
@@ -38,4 +37,6 @@ esac
 temporary="$DESTINATION.tmp.$$"
 install -m 0644 "$OUTPUT" "$temporary"
 mv -f "$temporary" "$DESTINATION"
+node "$PROJECT_ROOT/scripts/verify_elf_abi.mjs" "$DESTINATION"
+node "$PROJECT_ROOT/scripts/jsapi_manifest.mjs" write "$DESTINATION" "$(dirname "$DESTINATION")/build-manifest.json" "$CXX"
 sha256sum "$DESTINATION"

@@ -1,15 +1,6 @@
 import globalModule from 'global'
 import { parseTextEditResult } from './keyboard-event'
 
-let globalManager = null
-
-export function getGlobalModule() {
-  if (!globalManager) {
-    globalManager = new globalModule.Global()
-  }
-  return globalManager
-}
-
 function clampMaxlength(value) {
   let maxlength = value == null ? 100 : Number(value)
   if (!Number.isFinite(maxlength)) maxlength = 100
@@ -27,25 +18,37 @@ export class KeyboardSession {
     this.closeDelayMs = 350
     this.closedUuids = {}
     this.closeTimers = {}
+    this.resultTimers = new Set()
+    this.manager = null
+    this.disposed = false
+  }
+
+  getManager() {
+    if (!this.manager) this.manager = new globalModule.Global()
+    return this.manager
   }
 
   mount() {
     if (this.editFinished) return
-    const gm = getGlobalModule()
+    this.disposed = false
+    const gm = this.getManager()
     this.editFinished = (uuid, jsonData) => {
       if (!this.activeUuid || uuid !== this.activeUuid) {
         if (uuid) console.warn(`keyboard global result ignored uuid=${uuid} active=${this.activeUuid}`)
         return
       }
       const result = parseTextEditResult(jsonData)
-      setTimeout(() => {
-        if (!this.activeUuid || uuid !== this.activeUuid) return
+      if (!result.terminal) return
+      const timer = setTimeout(() => {
+        this.resultTimers.delete(timer)
+        if (this.disposed || !this.activeUuid || uuid !== this.activeUuid) return
         if (result.confirmed) {
           this.finish(result.found ? result.text : '')
         } else {
           this.cancel()
         }
       }, 0)
+      this.resultTimers.add(timer)
     }
     if (gm.textEditFinished && gm.textEditFinished.on) {
       gm.textEditFinished.on(this.editFinished)
@@ -56,19 +59,26 @@ export class KeyboardSession {
   }
 
   unmount() {
-    const gm = getGlobalModule()
-    if (gm.textEditFinished && gm.textEditFinished.off && this.editFinished) {
+    this.disposed = true
+    const gm = this.manager
+    if (gm && gm.textEditFinished && gm.textEditFinished.off && this.editFinished) {
       gm.textEditFinished.off(this.editFinished)
     }
     this.editFinished = null
+    this.resultTimers.forEach(timer => clearTimeout(timer))
+    this.resultTimers.clear()
     this.close()
+    Object.keys(this.closeTimers).forEach(uuid => this.closeUuid(uuid, 'unmount'))
+    this.manager = null
+    this.closedUuids = {}
   }
 
   open(options = {}) {
+    if (this.disposed) return ''
     if (this.activeUuid) return this.activeUuid
     this.stripNewlines = options.stripNewlines !== false
     this.closeDelayMs = options.closeDelayMs == null ? 350 : options.closeDelayMs
-    const gm = getGlobalModule()
+    const gm = this.getManager()
     if (!gm.startTextEdit) {
       console.warn('keyboard global startTextEdit unavailable')
       return ''
@@ -102,27 +112,27 @@ export class KeyboardSession {
   finish(text) {
     if (!this.activeUuid) return
     const uuid = this.activeUuid
+    this.activeUuid = ''
     const value = `${text || ''}`
     const cleaned = this.stripNewlines ? value.replace(/\n/g, '') : value
+    this.deferClose(uuid)
     try {
       if (this.onConfirm) this.onConfirm(cleaned)
     } catch (err) {
       console.warn(`keyboard confirm handler failed ${err}`)
     }
-    this.deferClose(uuid)
-    this.activeUuid = ''
   }
 
   cancel() {
     if (!this.activeUuid) return
     const uuid = this.activeUuid
+    this.activeUuid = ''
+    this.deferClose(uuid)
     try {
       if (this.onCancel) this.onCancel()
     } catch (err) {
       console.warn(`keyboard cancel handler failed ${err}`)
     }
-    this.deferClose(uuid)
-    this.activeUuid = ''
   }
 
   deferClose(uuid) {
@@ -140,8 +150,10 @@ export class KeyboardSession {
       delete this.closeTimers[uuid]
     }
     this.closedUuids[uuid] = true
-    setTimeout(() => { delete this.closedUuids[uuid] }, 60000)
-    const gm = getGlobalModule()
+    const closed = Object.keys(this.closedUuids)
+    if (closed.length > 128) delete this.closedUuids[closed[0]]
+    const gm = this.manager
+    if (!gm) return
     if (!gm.closeTextEdit) return
     try {
       gm.closeTextEdit(uuid)

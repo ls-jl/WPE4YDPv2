@@ -1,9 +1,10 @@
 diff --git a/ext/webrtc/gstwebrtcbin.c b/ext/webrtc/gstwebrtcbin.c
 --- a/ext/webrtc/gstwebrtcbin.c
 +++ b/ext/webrtc/gstwebrtcbin.c
-@@ -6021,5 +6021,85 @@ _update_transceivers_from_sdp (GstWebRTCBin * webrtc, SDPSource source,
+@@ -6023,6 +6023,86 @@ _update_transceivers_from_sdp (GstWebRTCBin * webrtc, SDPSource source,
    guint bundle_idx = 0;
    TransportStream *bundle_stream = NULL;
+ 
 +  /*
 +   * A remote Offer has no matching local description yet, so the normal
 +   * transceiver update below cannot compute a final direction. Associate its
@@ -87,9 +88,10 @@ diff --git a/ext/webrtc/gstwebrtcbin.c b/ext/webrtc/gstwebrtcbin.c
    /* FIXME: With some peers, it's possible we could have
     * multiple bundles to deal with, although I've never seen one yet */
    if (webrtc->bundle_policy != GST_WEBRTC_BUNDLE_POLICY_NONE)
-@@ -6486,4 +6566,16 @@ _set_description_task (GstWebRTCBin * webrtc, gpointer user_data)
+@@ -6486,5 +6566,17 @@ _set_description_task (GstWebRTCBin * webrtc, gpointer user_data)
      gst_webrtc_ice_set_is_controller (webrtc->priv->ice, ice_controller);
    }
+ 
 +  /*
 +   * Expose remote Offer transceivers before the application creates its local
 +   * Answer. Calling the full updater here takes the early-association branch
